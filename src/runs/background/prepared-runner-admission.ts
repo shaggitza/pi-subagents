@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
@@ -29,6 +29,7 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const TOKEN = /^[a-f0-9-]{36}$/;
 const MAX_FILE_BYTES = 16_384;
+const TOKEN_DIGEST_DOMAIN = "pi-subagents/prepared-runner-admission/v1/token";
 
 function fsyncDirectory(directory: string): void {
 	let descriptor: number | undefined;
@@ -55,6 +56,11 @@ function writeDurablePrivateJson(filePath: string, value: object): void {
 		if (descriptor !== undefined) fs.closeSync(descriptor);
 		fs.rmSync(temporary, { force: true });
 	}
+}
+
+export function computePreparedRunnerAdmissionTokenDigest(token: string): string {
+	if (!TOKEN.test(token)) throw new Error("Prepared runner admission token is invalid.");
+	return createHash("sha256").update(TOKEN_DIGEST_DOMAIN).update("\0").update(token).digest("hex");
 }
 
 export function createPreparedRunnerAdmission(runId: string, dispatchIdentityDigest: string): PreparedRunnerAdmissionV1 {
@@ -88,18 +94,7 @@ function boundedJson(filePath: string): unknown {
 	return JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
 }
 
-function exactAdmissionBase(value: Record<string, unknown>, expected: PreparedRunnerAdmissionV1): boolean {
-	return value.version === PREPARED_RUNNER_ADMISSION_VERSION
-		&& value.runId === expected.runId
-		&& value.dispatchIdentityDigest === expected.dispatchIdentityDigest
-		&& value.token === expected.token;
-}
-
-export function readPreparedRunnerAdmissionEvidence(
-	filePath: string,
-	expected: PreparedRunnerAdmissionV1,
-	expectedState: PreparedRunnerAdmissionEvidenceV1["state"],
-): PreparedRunnerAdmissionEvidenceV1 | undefined {
+function parsePreparedRunnerAdmissionEvidence(filePath: string): PreparedRunnerAdmissionEvidenceV1 | undefined {
 	let value: unknown;
 	try {
 		value = boundedJson(filePath);
@@ -110,11 +105,18 @@ export function readPreparedRunnerAdmissionEvidence(
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Prepared runner admission evidence is invalid.");
 	const record = value as Record<string, unknown>;
 	const keys = ["dispatchIdentityDigest", "observedAt", "pid", "runId", "runnerProcessInstanceId", "state", "token", "version"];
-	if (Object.keys(record).sort().join("\0") !== keys.sort().join("\0") || !exactAdmissionBase(record, expected)) {
+	if (Object.keys(record).sort().join("\0") !== keys.sort().join("\0")) {
 		throw new Error("Prepared runner admission evidence identity changed.");
 	}
 	if (
-		(record.state !== "ready" && record.state !== "accepted" && record.state !== "committed")
+		record.version !== PREPARED_RUNNER_ADMISSION_VERSION
+		|| typeof record.runId !== "string"
+		|| !SAFE_ID.test(record.runId)
+		|| typeof record.dispatchIdentityDigest !== "string"
+		|| !DIGEST.test(record.dispatchIdentityDigest)
+		|| typeof record.token !== "string"
+		|| !TOKEN.test(record.token)
+		|| (record.state !== "ready" && record.state !== "accepted" && record.state !== "committed")
 		|| typeof record.pid !== "number"
 		|| !Number.isSafeInteger(record.pid)
 		|| record.pid <= 0
@@ -126,8 +128,31 @@ export function readPreparedRunnerAdmissionEvidence(
 	) {
 		throw new Error("Prepared runner admission evidence is invalid.");
 	}
-	if (record.state !== expectedState) return undefined;
 	return Object.freeze(record as unknown as PreparedRunnerAdmissionEvidenceV1);
+}
+
+export function readPreparedRunnerAdmissionEvidenceForDispatch(
+	filePath: string,
+	expected: Pick<PreparedRunnerAdmissionV1, "runId" | "dispatchIdentityDigest">,
+): PreparedRunnerAdmissionEvidenceV1 | undefined {
+	const evidence = parsePreparedRunnerAdmissionEvidence(filePath);
+	if (!evidence) return undefined;
+	if (evidence.runId !== expected.runId || evidence.dispatchIdentityDigest !== expected.dispatchIdentityDigest) {
+		throw new Error("Prepared runner admission evidence identity changed.");
+	}
+	return evidence;
+}
+
+export function readPreparedRunnerAdmissionEvidence(
+	filePath: string,
+	expected: PreparedRunnerAdmissionV1,
+	expectedState: PreparedRunnerAdmissionEvidenceV1["state"],
+): PreparedRunnerAdmissionEvidenceV1 | undefined {
+	const evidence = readPreparedRunnerAdmissionEvidenceForDispatch(filePath, expected);
+	if (!evidence) return undefined;
+	if (evidence.token !== expected.token) throw new Error("Prepared runner admission evidence identity changed.");
+	if (evidence.state !== expectedState) return undefined;
+	return evidence;
 }
 
 export function writePreparedRunnerAdmissionEvidence(

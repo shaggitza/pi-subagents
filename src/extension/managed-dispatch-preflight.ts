@@ -44,6 +44,11 @@ export interface ManagedDispatchPreflightBridgeOptions {
 	resolveCapabilityCeiling?: typeof resolveCurrentSubagentCapabilityCeiling;
 }
 
+export type ManagedSpawnLaunchResolverOptions = Pick<
+	ManagedDispatchPreflightBridgeOptions,
+	"artifactDir" | "resolveContract" | "resolveCapabilityCeiling"
+>;
+
 const paramsValidator = Compile(SubagentParams);
 const SAFE_HOST_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/;
 
@@ -111,7 +116,7 @@ function failure(code: ManagedDispatchErrorCodeV1, message: string): ManagedPref
 	return { version: SUBAGENT_MANAGED_DISPATCH_VERSION, ok: false, code, message };
 }
 
-function assertManagedSpawnParams(request: JsonObject): SubagentParamsLike {
+export function assertManagedSpawnParams(request: JsonObject): SubagentParamsLike {
 	if (!paramsValidator.Check(request)) throw new TypeError("Executor request does not match the current subagent schema.");
 	const params = request as unknown as SubagentParamsLike;
 	if (params.action !== undefined || params.tasks !== undefined || params.chain !== undefined) {
@@ -162,9 +167,10 @@ function profileContent(contract: SubagentLaunchContract): JsonObject {
 	};
 }
 
-function hasCompleteManagedContractIdentity(contract: SubagentLaunchContract): boolean {
+export function hasCompleteManagedContractIdentity(contract: SubagentLaunchContract): boolean {
 	const attestations = contract.roots.attestations;
 	if (!contract.parentSessionIdentityDigest || !contract.agent.definitionDigest || !attestations) return false;
+	if (contract.skills.resolved.some((skill) => !skill.contentDigest || !/^[a-f0-9]{64}$/.test(skill.contentDigest))) return false;
 	for (const [name, root] of Object.entries(contract.roots)) {
 		if (name === "attestations" || name === "artifactPaths") continue;
 		if (typeof root === "string" && !attestations[name]) return false;
@@ -186,7 +192,7 @@ function hasCompleteManagedContractIdentity(contract: SubagentLaunchContract): b
 		&& typeof contract.roots.runnerAdmissionCommitPath === "string";
 }
 
-function deriveProfile(contract: SubagentLaunchContract): {
+export function deriveManagedSpawnProfile(contract: SubagentLaunchContract): {
 	profile: ManagedProfileIdentityV1;
 	profileIdentityDigest: string;
 } {
@@ -205,7 +211,7 @@ function launchContractInput(
 	ctx: ExtensionContext,
 	parentSessionId: string,
 	parentSessionFile: string,
-	options: ManagedDispatchPreflightBridgeOptions,
+	options: ManagedSpawnLaunchResolverOptions,
 ): SubagentLaunchContractInput {
 	return {
 		agent: params.agent!,
@@ -233,6 +239,38 @@ function launchContractInput(
 			ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId() ?? "",
 		),
 	};
+}
+
+export interface ResolvedManagedSpawnLaunchV1 {
+	readonly params: SubagentParamsLike;
+	readonly contract: SubagentLaunchContract;
+	readonly profile: ManagedProfileIdentityV1;
+	readonly profileIdentityDigest: string;
+}
+
+/** Recomputes host-owned managed spawn identity without claiming or launching an operation. */
+export async function resolveManagedSpawnLaunchV1(
+	request: JsonObject,
+	candidateRunId: string,
+	ctx: ExtensionContext,
+	parentSessionId: string,
+	parentSessionFile: string,
+	options: ManagedSpawnLaunchResolverOptions = {},
+): Promise<ResolvedManagedSpawnLaunchV1> {
+	const params = assertManagedSpawnParams(request);
+	if (!SAFE_HOST_ID.test(candidateRunId)) throw new TypeError("Managed candidate run identity is invalid.");
+	const contractResult = await (options.resolveContract ?? resolveSubagentLaunchContract)(
+		launchContractInput(params, candidateRunId, ctx, parentSessionId, parentSessionFile, options),
+	);
+	if (contractResult.ok === false) throw new TypeError("Managed launch contract preflight failed.");
+	if (contractResult.contract.diagnostics.some((diagnostic) => diagnostic.severity !== "warning")) {
+		throw new TypeError("Managed launch contract requires unavailable host state.");
+	}
+	if (!hasCompleteManagedContractIdentity(contractResult.contract)) {
+		throw new TypeError("Managed launch contract lacks complete parent, agent, or root identity.");
+	}
+	const { profile, profileIdentityDigest } = deriveManagedSpawnProfile(contractResult.contract);
+	return Object.freeze({ params, contract: contractResult.contract, profile, profileIdentityDigest });
 }
 
 async function preflight(
@@ -263,11 +301,14 @@ async function preflight(
 		return failure("unsupported_method", "Managed resume preflight is not available in this protocol increment.");
 	}
 	try {
-		const params = assertManagedSpawnParams(request.input.request);
 		const candidateRunId = (options.createRunId ?? randomUUID)();
-		if (!SAFE_HOST_ID.test(candidateRunId)) throw new TypeError("Managed candidate run identity is invalid.");
-		const contractResult = await (options.resolveContract ?? resolveSubagentLaunchContract)(
-			launchContractInput(params, candidateRunId, ctx, parentSessionId, parentSessionFile, options),
+		const resolved = await resolveManagedSpawnLaunchV1(
+			request.input.request,
+			candidateRunId,
+			ctx,
+			parentSessionId,
+			parentSessionFile,
+			options,
 		);
 		let currentSessionMatches = false;
 		try {
@@ -281,14 +322,6 @@ async function preflight(
 		if (!currentSessionMatches) {
 			return failure("no_active_session", "Managed preflight parent session changed before completion.");
 		}
-		if (contractResult.ok === false) return failure("invalid_request", "Managed launch contract preflight failed.");
-		if (contractResult.contract.diagnostics.some((diagnostic) => diagnostic.severity !== "warning")) {
-			return failure("unsupported_host", "Managed launch contract requires unavailable host state.");
-		}
-		if (!hasCompleteManagedContractIdentity(contractResult.contract)) {
-			return failure("unsupported_host", "Managed launch contract lacks complete parent, agent, or root identity.");
-		}
-		const { profile, profileIdentityDigest } = deriveProfile(contractResult.contract);
 		return {
 			version: SUBAGENT_MANAGED_DISPATCH_VERSION,
 			ok: true,
@@ -296,11 +329,11 @@ async function preflight(
 				version: SUBAGENT_MANAGED_DISPATCH_VERSION,
 				hostId: loadOrCreateManagedDispatchHostId(options.hostIdPath),
 			},
-			profile,
-			profileIdentityDigest,
-			parentSessionIdentityDigest: contractResult.contract.parentSessionIdentityDigest,
+			profile: resolved.profile,
+			profileIdentityDigest: resolved.profileIdentityDigest,
+			parentSessionIdentityDigest: resolved.contract.parentSessionIdentityDigest,
 			candidateRunId,
-			contractDigest: contractResult.contract.digest,
+			contractDigest: resolved.contract.digest,
 		};
 	} catch {
 		return failure("invalid_request", "Managed executor request or resolved launch profile is invalid.");

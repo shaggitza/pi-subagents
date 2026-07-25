@@ -96,7 +96,7 @@ export interface SubagentLaunchContractAgent {
 
 export interface SubagentLaunchContractSkills {
 	requested: string[];
-	resolved: Array<{ name: string; path: string; source: string }>;
+	resolved: Array<{ name: string; path: string; source: string; contentDigest?: string }>;
 	missing: string[];
 }
 
@@ -209,6 +209,10 @@ function digestContract(contract: Omit<SubagentLaunchContract, "digest">): strin
 
 function digestAgentDefinition(agent: AgentConfig): string {
 	return sha256StableJson(agent);
+}
+
+function digestManagedSkillContent(content: string): string {
+	return sha256StableJson({ domain: "pi-subagents/managed-dispatch/v1/skill-content", content });
 }
 
 function digestParentSessionIdentity(sessionId: string, sessionFile: string | null | undefined): string {
@@ -460,7 +464,12 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		inheritSkills: agent.inheritSkills,
 		skills: {
 			requested: requestedSkills,
-			resolved: resolvedSkills.resolved.map((skill) => ({ name: skill.name, path: skill.path, source: skill.source })),
+			resolved: resolvedSkills.resolved.map((skill) => ({
+			name: skill.name,
+			path: skill.path,
+			source: skill.source,
+			...(input.identityMode === "managed-v1" ? { contentDigest: digestManagedSkillContent(skill.content) } : {}),
+		})),
 			missing: resolvedSkills.missing,
 		},
 		tools: {

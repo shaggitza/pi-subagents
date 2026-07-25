@@ -149,7 +149,24 @@ describe("managed durable operation journal", () => {
 			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", { runId: "other-run" }),
 			"operation_conflict",
 		);
-		store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", { runId: "candidate-1" });
+		expectCode(
+			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", { runId: "candidate-1" }),
+			"invalid_state",
+		);
+		const runnerReady = store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", {
+			runId: "candidate-1",
+			runnerProcessInstanceId: "runner-instance-1",
+			runnerAdmissionTokenDigest: "d".repeat(64),
+		});
+		assert.equal(runnerReady.runnerProcessInstanceId, "runner-instance-1");
+		assert.equal(runnerReady.runnerAdmissionTokenDigest, "d".repeat(64));
+		expectCode(
+			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "accepted", {
+				runnerProcessInstanceId: "runner-instance-2",
+				runnerAdmissionTokenDigest: "d".repeat(64),
+			}),
+			"operation_conflict",
+		);
 		store.transition(parentDigest, "pi-signal", operationId(), digest, "accepted", { runId: "candidate-1" });
 		store.transition(parentDigest, "pi-signal", operationId(), digest, "uncertain");
 		store.transition(parentDigest, "pi-signal", operationId(), digest, "reconciling");

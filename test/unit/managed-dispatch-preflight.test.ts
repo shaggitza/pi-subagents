@@ -7,6 +7,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT,
 	managedDispatchReplyEvent,
+	type JsonObject,
 	type ManagedPreflightResultV1,
 } from "../../src/api/managed-dispatch.ts";
 import type { SubagentLaunchContract, SubagentLaunchContractInput } from "../../src/api/preflight.ts";
@@ -16,6 +17,7 @@ import { preparedRunnerAdmissionPaths } from "../../src/runs/background/prepared
 import {
 	loadOrCreateManagedDispatchHostId,
 	registerManagedDispatchPreflightBridge,
+	resolveManagedSpawnLaunchV1,
 } from "../../src/extension/managed-dispatch-preflight.ts";
 
 class TestEvents {
@@ -172,6 +174,30 @@ function nextReply(events: TestEvents, requestId: string): Promise<ManagedPrefli
 }
 
 describe("managed dispatch preflight bridge", () => {
+	it("recomputes a caller-supplied candidate through the shared non-launching resolver", async () => {
+		let observed: SubagentLaunchContractInput | undefined;
+		const resolved = await resolveManagedSpawnLaunchV1(
+			executorRequest() as JsonObject,
+			"candidate-shared-1",
+			context(),
+			"parent-session",
+			path.join(temporary, "parent.jsonl"),
+			{
+				resolveCapabilityCeiling: () => undefined,
+				resolveContract: async (input) => {
+					observed = input;
+					return { ok: true, contract: contract(input) };
+				},
+			},
+		);
+		assert.equal(resolved.params.agent, "worker");
+		assert.equal(resolved.contract.runId, "candidate-shared-1");
+		assert.equal(resolved.contract.parentSessionIdentityDigest, "c".repeat(64));
+		assert.match(resolved.profileIdentityDigest, /^[a-f0-9]{64}$/);
+		assert.equal(observed?.identityMode, "managed-v1");
+		assert.equal(fs.existsSync(path.join(temporary, "child-session")), false);
+	});
+
 	it("derives host-owned profile identity from an exact non-launching contract", async () => {
 		const events = new TestEvents();
 		const activeContext = context();

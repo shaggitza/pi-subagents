@@ -4,10 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
+	computePreparedRunnerAdmissionTokenDigest,
 	createPreparedRunnerAdmission,
 	preparedRunnerAdmissionPaths,
 	readPreparedRunnerAdmissionControl,
 	readPreparedRunnerAdmissionEvidence,
+	readPreparedRunnerAdmissionEvidenceForDispatch,
 	writePreparedRunnerAdmissionControl,
 	writePreparedRunnerAdmissionEvidence,
 } from "../../src/runs/background/prepared-runner-admission.ts";
@@ -29,6 +31,14 @@ describe("prepared runner admission", () => {
 		writePreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "ready", 123, "runner-1", 100);
 		const ready = readPreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "ready");
 		assert.equal(ready?.state, "ready");
+		assert.match(computePreparedRunnerAdmissionTokenDigest(admission.token), /^[a-f0-9]{64}$/);
+		assert.equal(
+			readPreparedRunnerAdmissionEvidenceForDispatch(paths.evidencePath, {
+				runId: admission.runId,
+				dispatchIdentityDigest: admission.dispatchIdentityDigest,
+			})?.token,
+			admission.token,
+		);
 		assert.equal(ready?.dispatchIdentityDigest, "a".repeat(64));
 		assert.equal(fs.statSync(paths.evidencePath).mode & 0o077, 0);
 

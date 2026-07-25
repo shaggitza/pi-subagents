@@ -123,6 +123,7 @@ Project prompt.
 			assert.equal(result.contract.thinking, "high");
 			assert.deepEqual(result.contract.skills.requested, ["project-skill"]);
 			assert.equal(result.contract.skills.resolved[0]?.name, "project-skill");
+			assert.match(result.contract.skills.resolved[0]?.contentDigest ?? "", /^[a-f0-9]{64}$/);
 			assert.deepEqual(result.contract.tools.effectiveAllowlist, ["read"]);
 			assert.deepEqual(result.contract.tools.capabilityAudit?.removedTools, ["write"]);
 			assert.equal(result.contract.tools.capabilityAudit?.removedExtensionCount, 1);
@@ -181,6 +182,25 @@ Project prompt.
 			assert.equal(repeated.ok, true);
 			assert.equal(repeated.contract.digest, result.contract.digest);
 			assert.match(result.contract.parentSessionIdentityDigest, /^[a-f0-9]{64}$/);
+			fs.appendFileSync(path.join(cwd, ".pi", "skills", "project-skill", "SKILL.md"), "\nChanged skill content.\n", "utf8");
+			clearSkillCache();
+			const changedSkill = await resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				task: "Inspect the repo",
+				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
+				sessionRoot,
+				availableModels: [
+					{ provider: "test", id: "primary", fullId: "test/primary" },
+					{ provider: "test", id: "fallback", fullId: "test/fallback" },
+				],
+				capabilityCeiling: ceiling,
+			});
+			assert.equal(changedSkill.ok, true);
+			assert.notEqual(changedSkill.contract.skills.resolved[0]?.contentDigest, result.contract.skills.resolved[0]?.contentDigest);
+			assert.notEqual(changedSkill.contract.digest, result.contract.digest);
 			const otherParent = await resolveSubagentLaunchContract({
 				agent: "worker",
 				cwd,

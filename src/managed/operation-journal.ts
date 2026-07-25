@@ -27,6 +27,8 @@ export interface ManagedOperationJournalRecordV1 {
 	expectedLaunch?: ManagedExpectedLaunchV1;
 	runId?: string;
 	sourceRunId?: string;
+	runnerProcessInstanceId?: string;
+	runnerAdmissionTokenDigest?: string;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -73,7 +75,7 @@ const states = (...values: ManagedOperationJournalStateV1[]): ReadonlySet<Manage
 const TRANSITIONS: Readonly<Record<ManagedOperationJournalStateV1, ReadonlySet<ManagedOperationJournalStateV1>>> = Object.freeze({
 	claimed: states("prepared", "failed-before-launch", "retired"),
 	prepared: states("dispatching", "failed-before-launch", "retired"),
-	dispatching: states("runner-ready", "accepted", "uncertain"),
+	dispatching: states("runner-ready", "uncertain"),
 	"runner-ready": states("accepted", "uncertain"),
 	accepted: states("terminal", "uncertain", "reconciling"),
 	terminal: states("retired"),
@@ -283,7 +285,7 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	const record = value as Record<string, unknown>;
 	const allowed = new Set([
 		"version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "method", "state",
-		"expectedLaunch", "runId", "sourceRunId", "createdAt", "updatedAt",
+		"expectedLaunch", "runId", "sourceRunId", "runnerProcessInstanceId", "runnerAdmissionTokenDigest", "createdAt", "updatedAt",
 	]);
 	if (Object.keys(record).some((key) => !allowed.has(key))) throw new ManagedOperationJournalError("corrupt", "Managed operation record has unknown fields.");
 	if (record.version !== MANAGED_OPERATION_JOURNAL_VERSION) throw new ManagedOperationJournalError("corrupt", "Managed operation record version is unsupported.");
@@ -309,6 +311,12 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	if (record.expectedLaunch !== undefined) parsed.expectedLaunch = parseExpectedLaunch(record.expectedLaunch);
 	if (record.runId !== undefined) parsed.runId = assertRunId(record.runId, "Managed run id");
 	if (record.sourceRunId !== undefined) parsed.sourceRunId = assertRunId(record.sourceRunId, "Managed source run id");
+	if (record.runnerProcessInstanceId !== undefined) {
+		parsed.runnerProcessInstanceId = assertRunId(record.runnerProcessInstanceId, "Managed runner process instance id");
+	}
+	if (record.runnerAdmissionTokenDigest !== undefined) {
+		parsed.runnerAdmissionTokenDigest = assertDigest(record.runnerAdmissionTokenDigest, "Managed runner admission token digest");
+	}
 	const launchMethod = parsed.method === "spawn" || parsed.method === "resume";
 	if (launchMethod && !parsed.expectedLaunch) {
 		throw new ManagedOperationJournalError("corrupt", "Managed launch operation lacks expected launch identity.");
@@ -333,6 +341,17 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	const runForbidden = ["claimed", "prepared", "failed-before-launch"].includes(parsed.state);
 	if ((runRequired && !parsed.runId) || (runForbidden && parsed.runId)) {
 		throw new ManagedOperationJournalError("corrupt", "Managed run identity is inconsistent with the operation state.");
+	}
+	const hasRunnerInstance = parsed.runnerProcessInstanceId !== undefined;
+	const hasAdmissionToken = parsed.runnerAdmissionTokenDigest !== undefined;
+	if (hasRunnerInstance !== hasAdmissionToken) {
+		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is incomplete.");
+	}
+	if (["runner-ready", "accepted"].includes(parsed.state) && !hasRunnerInstance) {
+		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is missing.");
+	}
+	if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasRunnerInstance) {
+		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is premature.");
 	}
 	return Object.freeze(parsed);
 }
@@ -534,7 +553,12 @@ export class ManagedOperationJournal {
 		operationIdInput: string,
 		requestDigestInput: string,
 		nextState: ManagedOperationJournalStateV1,
-		patch: { runId?: string; sourceRunId?: string } = {},
+		patch: {
+			runId?: string;
+			sourceRunId?: string;
+			runnerProcessInstanceId?: string;
+			runnerAdmissionTokenDigest?: string;
+		} = {},
 	): Readonly<ManagedOperationJournalRecordV1> {
 		this.#assertOpen();
 		const sessionDigest = assertDigest(parentSessionIdentityDigest, "Managed parent-session identity digest");
@@ -555,6 +579,12 @@ export class ManagedOperationJournal {
 		if (existing.requestDigest !== requestDigest) throw new ManagedOperationJournalError("operation_conflict", "Managed request digest does not match the durable operation.");
 		const patchedRunId = patch.runId !== undefined ? assertRunId(patch.runId, "Managed run id") : undefined;
 		const patchedSourceRunId = patch.sourceRunId !== undefined ? assertRunId(patch.sourceRunId, "Managed source run id") : undefined;
+		const patchedRunnerInstance = patch.runnerProcessInstanceId !== undefined
+			? assertRunId(patch.runnerProcessInstanceId, "Managed runner process instance id")
+			: undefined;
+		const patchedAdmissionTokenDigest = patch.runnerAdmissionTokenDigest !== undefined
+			? assertDigest(patch.runnerAdmissionTokenDigest, "Managed runner admission token digest")
+			: undefined;
 		if (patchedSourceRunId !== undefined && existing.method !== "resume") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed source run identity is valid only for resume operations.");
 		}
@@ -567,6 +597,17 @@ export class ManagedOperationJournal {
 		if (patchedSourceRunId !== undefined && existing.sourceRunId !== undefined && patchedSourceRunId !== existing.sourceRunId) {
 			throw new ManagedOperationJournalError("operation_conflict", "Managed source run identity is immutable.");
 		}
+		if (patchedRunnerInstance !== undefined && existing.runnerProcessInstanceId !== undefined
+			&& patchedRunnerInstance !== existing.runnerProcessInstanceId) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed runner process instance identity is immutable.");
+		}
+		if (patchedAdmissionTokenDigest !== undefined && existing.runnerAdmissionTokenDigest !== undefined
+			&& patchedAdmissionTokenDigest !== existing.runnerAdmissionTokenDigest) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed runner admission token identity is immutable.");
+		}
+		if ((patchedRunnerInstance === undefined) !== (patchedAdmissionTokenDigest === undefined)) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed runner admission correlation must be bound atomically.");
+		}
 		if (existing.state === nextState) {
 			if (patchedRunId !== undefined && existing.runId === undefined) {
 				throw new ManagedOperationJournalError("invalid_state", "Managed run identity was not durably bound with the state transition.");
@@ -574,11 +615,21 @@ export class ManagedOperationJournal {
 			return existing;
 		}
 		const effectiveRunId = existing.runId ?? patchedRunId;
+		const effectiveRunnerInstance = existing.runnerProcessInstanceId ?? patchedRunnerInstance;
+		const effectiveAdmissionTokenDigest = existing.runnerAdmissionTokenDigest ?? patchedAdmissionTokenDigest;
 		if (["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(nextState) && !effectiveRunId) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} requires a durable run identity.`);
 		}
 		if (["claimed", "prepared", "failed-before-launch"].includes(nextState) && effectiveRunId) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} cannot contain a run identity.`);
+		}
+		if (["runner-ready", "accepted"].includes(nextState)
+			&& (!effectiveRunnerInstance || !effectiveAdmissionTokenDigest)) {
+			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} requires runner admission correlation.`);
+		}
+		if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(nextState)
+			&& (effectiveRunnerInstance || effectiveAdmissionTokenDigest)) {
+			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} cannot contain runner admission correlation.`);
 		}
 		if (!TRANSITIONS[existing.state].has(nextState)) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed operation cannot transition from ${existing.state} to ${nextState}.`);
@@ -588,6 +639,8 @@ export class ManagedOperationJournal {
 			state: nextState,
 			...(patchedRunId !== undefined ? { runId: patchedRunId } : {}),
 			...(patchedSourceRunId !== undefined ? { sourceRunId: patchedSourceRunId } : {}),
+			...(patchedRunnerInstance !== undefined ? { runnerProcessInstanceId: patchedRunnerInstance } : {}),
+			...(patchedAdmissionTokenDigest !== undefined ? { runnerAdmissionTokenDigest: patchedAdmissionTokenDigest } : {}),
 			updatedAt: Math.max(existing.updatedAt, this.#now()),
 		};
 		const validatedRecord = parseRecord(record);
