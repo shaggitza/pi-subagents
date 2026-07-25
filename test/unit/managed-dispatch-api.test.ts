@@ -17,6 +17,8 @@ import {
 	computeManagedRequestDigest,
 	createManagedOperationId,
 	managedDispatchReplyEvent,
+	parseManagedMutationRequestV1,
+	parseManagedPreflightRequestV1,
 	type ManagedPreflightRequestV1,
 	type ManagedPreflightResultV1,
 } from "../../src/api/managed-dispatch.ts";
@@ -39,6 +41,7 @@ function expectedLaunch(overrides: Record<string, unknown> = {}): Record<string,
 		hostId: "host-1",
 		candidateRunId: "candidate-1",
 		profileIdentityDigest: "a".repeat(64),
+		parentSessionIdentityDigest: "e".repeat(64),
 		contractDigest: "b".repeat(64),
 		...overrides,
 	};
@@ -338,15 +341,28 @@ describe("managed-dispatch public protocol foundation", () => {
 			host: { version: 1, hostId: "host-1" },
 			profile: { version: 1, contentDigest: "c".repeat(64), root: { version: 1, realPath: "/repo" } },
 			profileIdentityDigest: "a".repeat(64),
+			parentSessionIdentityDigest: "e".repeat(64),
 			candidateRunId: "candidate-1",
 			contractDigest: "b".repeat(64),
 		};
-		assert.equal(preflight.consumerId, "pi-signal");
+		const parsed = parseManagedPreflightRequestV1(preflight);
+		assert.equal(parsed.consumerId, "pi-signal");
+		assert.equal(Object.isFrozen(parsed), true);
+		assert.equal(Object.isFrozen(parsed.input.request), true);
 		assert.equal(result.ok && result.profileIdentityDigest, "a".repeat(64));
+		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, method: "spawn" }));
+		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, extra: true }));
+		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, input: { kind: "spawn", request: {}, extra: true } }));
+		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, input: { kind: "resume", sourceRunId: "run", index: 0, request: [] } }));
 	});
 
 	it("hashes exact spawn identity while excluding transport requestId", () => {
 		const first = spawnRequest();
+		const parsed = parseManagedMutationRequestV1(first);
+		assert.equal(Object.isFrozen(parsed), true);
+		assert.equal(parsed.method, "spawn");
+		if (parsed.method !== "spawn") assert.fail("expected parsed spawn request");
+		assert.equal(Object.isFrozen(parsed.input.request), true);
 		const requestIdChanged = spawnRequest({ requestId: "transport-retry" });
 		const inputReordered = spawnRequest({
 			input: {
@@ -367,7 +383,14 @@ describe("managed-dispatch public protocol foundation", () => {
 		const operationChanged = spawnRequest({
 			managed: { version: 1, consumerId: "pi-signal", operationId: operationId(8) },
 		});
-		assert.equal(computeManagedRequestDigest(first), "d56ca3a6832fe9de4c1a932ae397d67e45e0c923367bc5e64ffa3a7b0bac9b0b");
+		assert.equal(computeManagedRequestDigest(first), "5ad64622c38b858c1bae976d120fb486154b773f7cc7573008867012b07040d1");
+		const earlyV1 = spawnRequest();
+		delete (earlyV1.expectedLaunch as Record<string, unknown>).parentSessionIdentityDigest;
+		assert.equal(
+			computeManagedRequestDigest(earlyV1),
+			"d56ca3a6832fe9de4c1a932ae397d67e45e0c923367bc5e64ffa3a7b0bac9b0b",
+			"inert early-v1 envelopes remain parseable with stable semantic identity",
+		);
 		assert.equal(computeManagedRequestDigest(first), computeManagedRequestDigest(requestIdChanged));
 		assert.equal(computeManagedRequestDigest(first), computeManagedRequestDigest(inputReordered));
 		assert.notEqual(computeManagedRequestDigest(first), computeManagedRequestDigest(operationChanged));
@@ -387,7 +410,7 @@ describe("managed-dispatch public protocol foundation", () => {
 	});
 
 	it("uses a contract-valid resume input and exact contracts for every mutation method", () => {
-		assert.equal(computeManagedRequestDigest(resumeRequest()), "c9bef0c1d7b4501382fc269313513372e97e2ad06f17592c39b3c8547ceafbf1");
+		assert.equal(computeManagedRequestDigest(resumeRequest()), "78a614da8566809a5dc537c44602b894534761f986c8b35f041ca4e004132c6e");
 		for (const method of ["steer", "interrupt", "stop", "retire"] as const) {
 			assert.match(computeManagedRequestDigest(controlRequest(method)), /^[a-f0-9]{64}$/);
 		}
@@ -401,6 +424,7 @@ describe("managed-dispatch public protocol foundation", () => {
 				["hostId", "host-2"],
 				["candidateRunId", "candidate-2"],
 				["profileIdentityDigest", "c".repeat(64)],
+				["parentSessionIdentityDigest", "f".repeat(64)],
 				["contractDigest", "d".repeat(64)],
 			] as const) {
 				assert.notEqual(computeManagedRequestDigest(makeRequest({ expectedLaunch: expectedLaunch({ [field]: value }) })), baseline, field);

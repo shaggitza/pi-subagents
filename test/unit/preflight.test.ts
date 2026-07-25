@@ -101,6 +101,8 @@ Project prompt.
 				cwd,
 				task: "Inspect the repo",
 				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
 				sessionRoot,
 				availableModels: [
 					{ provider: "test", id: "primary", fullId: "test/primary" },
@@ -124,12 +126,33 @@ Project prompt.
 			assert.equal(result.contract.tools.disableAmbientExtensions, true);
 			assert.equal(result.contract.roots.sessionFile, path.join(sessionRoot, "run-123", "run-0", "session.jsonl"));
 			assert.equal(result.contract.roots.outputPath, path.join(cwd, ".pi-subagents", "artifacts", "outputs", "run-123", "report.md"));
+			const attestations = result.contract.roots.attestations;
+			assert.ok(attestations);
+			assert.deepEqual(
+				Object.keys(attestations).sort(),
+				[
+					"artifactPaths.inputPath",
+					"artifactPaths.jsonlPath",
+					"artifactPaths.metadataPath",
+					"artifactPaths.outputPath",
+					"artifactPaths.transcriptPath",
+					"artifactsDir",
+					"cwd",
+					"outputPath",
+					"sessionDir",
+					"sessionFile",
+					"sessionRoot",
+				].sort(),
+			);
+			assert.equal(attestations.cwd.existingAncestorRealPath, fs.realpathSync(cwd));
 			assert.match(result.contract.digest, /^[a-f0-9]{64}$/);
 			const repeated = await resolveSubagentLaunchContract({
 				agent: "worker",
 				cwd,
 				task: "Inspect the repo",
 				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
 				sessionRoot,
 				availableModels: [
 					{ provider: "test", id: "primary", fullId: "test/primary" },
@@ -139,11 +162,87 @@ Project prompt.
 			});
 			assert.equal(repeated.ok, true);
 			assert.equal(repeated.contract.digest, result.contract.digest);
+			assert.match(result.contract.parentSessionIdentityDigest, /^[a-f0-9]{64}$/);
+			const otherParent = await resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				task: "Inspect the repo",
+				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "other-parent-session",
+				sessionRoot,
+				availableModels: [
+					{ provider: "test", id: "primary", fullId: "test/primary" },
+					{ provider: "test", id: "fallback", fullId: "test/fallback" },
+				],
+				capabilityCeiling: ceiling,
+			});
+			assert.equal(otherParent.ok, true);
+			assert.notEqual(otherParent.contract.parentSessionIdentityDigest, result.contract.parentSessionIdentityDigest);
+			assert.notEqual(otherParent.contract.digest, result.contract.digest);
+			assert.match(result.contract.agent.definitionDigest, /^[a-f0-9]{64}$/);
+			fs.appendFileSync(path.join(cwd, ".pi", "agents", "worker.md"), "\nChanged prompt content.\n", "utf-8");
+			const changedDefinition = await resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				task: "Inspect the repo",
+				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
+				sessionRoot,
+				availableModels: [
+					{ provider: "test", id: "primary", fullId: "test/primary" },
+					{ provider: "test", id: "fallback", fullId: "test/fallback" },
+				],
+				capabilityCeiling: ceiling,
+			});
+			assert.equal(changedDefinition.ok, true);
+			assert.notEqual(changedDefinition.contract.agent.definitionDigest, result.contract.agent.definitionDigest);
+			assert.notEqual(changedDefinition.contract.digest, result.contract.digest);
 			assert.equal(fs.existsSync(sessionRoot), false);
 			assert.equal(fs.existsSync(path.join(cwd, ".pi-subagents")), false);
 		} finally {
 			handle.dispose();
 		}
+	});
+
+	it("treats an explicit sessionDir as the ordinary executor session root", async () => {
+		const cwd = path.join(tempDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+---
+Exact session path prompt.
+`);
+		const sessionRoot = path.join(tempDir, "managed", "operation-1");
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			runId: "candidate-1",
+			identityMode: "managed-v1",
+			parentSessionId: "parent-session",
+			sessionDir: sessionRoot,
+		});
+		assert.equal(result.ok, true);
+		assert.equal(result.contract.roots.sessionRoot, sessionRoot);
+		assert.equal(result.contract.roots.sessionDir, path.join(sessionRoot, "run-0"));
+		assert.equal(result.contract.roots.sessionFile, path.join(sessionRoot, "run-0", "session.jsonl"));
+		assert.equal(result.contract.roots.attestations?.sessionDir.path, path.join(sessionRoot, "run-0"));
+		assert.equal(result.contract.roots.attestations?.sessionDir.existingAncestorRealPath, fs.realpathSync(tempDir));
+		assert.equal(fs.existsSync(sessionRoot), false);
+
+		const ordinary = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			runId: "ordinary-1",
+			sessionDir: sessionRoot,
+		});
+		assert.equal(ordinary.ok, true);
+		assert.equal(ordinary.contract.parentSessionIdentityDigest, undefined);
+		assert.equal(ordinary.contract.agent.definitionDigest, undefined);
+		assert.equal(ordinary.contract.roots.attestations, undefined);
+		assert.equal(ordinary.contract.diagnostics.some((diagnostic) => diagnostic.message.includes("parent session identity")), false);
 	});
 
 	it("returns closed failures for missing agents and missing skills", async () => {
@@ -188,6 +287,34 @@ Project prompt.
 		const invalidArtifactDir = await resolveSubagentLaunchContract({ agent: "worker", cwd, artifactDir: "bogus" as never });
 		assert.equal(invalidArtifactDir.ok, false);
 		assert.equal(invalidArtifactDir.code, "invalid_artifact_dir");
+
+		const fileAsSessionRoot = path.join(tempDir, "not-a-directory");
+		fs.writeFileSync(fileAsSessionRoot, "file", "utf8");
+		const invalidRoot = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			identityMode: "managed-v1",
+			parentSessionId: "parent-session",
+			sessionDir: fileAsSessionRoot,
+		});
+		assert.equal(invalidRoot.ok, false);
+		assert.equal(invalidRoot.code, "invalid_root");
+
+		if (fs.existsSync("/dev/null")) {
+			const specialOutput = path.join(tempDir, "special-output");
+			fs.symlinkSync("/dev/null", specialOutput);
+			const invalidSpecialFile = await resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
+				sessionDir: path.join(tempDir, "sessions"),
+				artifacts: false,
+				output: specialOutput,
+			});
+			assert.equal(invalidSpecialFile.ok, false);
+			assert.equal(invalidSpecialFile.code, "invalid_root");
+		}
 	});
 
 	it("projects MCP, extension, fanout, structured-output, and fork diagnostics", async () => {

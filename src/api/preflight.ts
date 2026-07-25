@@ -24,6 +24,7 @@ export type SubagentLaunchContractReasonCode =
 	| "denied_required_tool"
 	| "invalid_artifact_dir"
 	| "invalid_cwd"
+	| "invalid_root"
 	| "unsupported_mode";
 
 export interface SubagentLaunchContractDiagnostic {
@@ -50,6 +51,10 @@ export interface SubagentLaunchContractInput {
 	artifacts?: boolean;
 	artifactDir?: ArtifactDirPreference;
 	parentSessionFile?: string | null;
+	/** Opt in to additive host-bound identity fields used by managed dispatch. */
+	identityMode?: "managed-v1";
+	/** Host-supplied active parent session ID; never accepted from a managed request body. */
+	parentSessionId?: string;
 	sessionRoot?: string;
 	sessionDir?: string;
 	runId?: string;
@@ -73,6 +78,8 @@ export interface SubagentLaunchContractAgent {
 	packageName?: string;
 	source: AgentSource;
 	filePath: string;
+	/** Digest of every resolved agent-definition field, including the complete system prompt. */
+	definitionDigest?: string;
 	shadowedCandidates: SubagentLaunchContractAgentCandidate[];
 }
 
@@ -101,6 +108,15 @@ export interface SubagentLaunchContractTools {
 	capabilityAudit?: SubagentCapabilityAudit;
 }
 
+export interface SubagentLaunchRootAttestation {
+	path: string;
+	existingAncestor: string;
+	existingAncestorRealPath: string;
+	existingAncestorDevice: string;
+	existingAncestorInode: string;
+	relativeSuffix: string;
+}
+
 export interface SubagentLaunchContractRoots {
 	cwd: string;
 	sessionRoot?: string;
@@ -109,11 +125,14 @@ export interface SubagentLaunchContractRoots {
 	artifactsDir?: string;
 	artifactPaths?: ArtifactPaths;
 	outputPath?: string;
+	/** Identity evidence for every declared write/evidence path before creation. */
+	attestations?: Record<string, SubagentLaunchRootAttestation>;
 }
 
 export interface SubagentLaunchContract {
 	version: typeof SUBAGENT_LAUNCH_CONTRACT_VERSION;
 	runId: string;
+	parentSessionIdentityDigest?: string;
 	agent: SubagentLaunchContractAgent;
 	context: "fresh" | "fork";
 	model?: string;
@@ -155,12 +174,68 @@ function stableJson(value: unknown): string {
 	return JSON.stringify(value);
 }
 
+function sha256StableJson(value: unknown): string {
+	return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
 function digestContract(contract: Omit<SubagentLaunchContract, "digest">): string {
-	return createHash("sha256").update(stableJson(contract)).digest("hex");
+	return sha256StableJson(contract);
+}
+
+function digestAgentDefinition(agent: AgentConfig): string {
+	return sha256StableJson(agent);
+}
+
+function digestParentSessionIdentity(sessionId: string, sessionFile: string | null | undefined): string {
+	return sha256StableJson({ sessionId, sessionFile: sessionFile ? path.resolve(sessionFile) : null });
 }
 
 function normalizeAvailableModels(models: SubagentLaunchContractInput["availableModels"]): AvailableModelInfo[] {
 	return (models ?? []).map((model) => ({ ...model, fullId: model.fullId ?? `${model.provider}/${model.id}` }));
+}
+
+function attestLaunchPath(inputPath: string, expectedKind: "directory" | "file"): SubagentLaunchRootAttestation {
+	const absolutePath = path.resolve(inputPath);
+	let existingAncestor = absolutePath;
+	for (;;) {
+		try {
+			fs.lstatSync(existingAncestor);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const parent = path.dirname(existingAncestor);
+			if (parent === existingAncestor) throw error;
+			existingAncestor = parent;
+		}
+	}
+	const existingAncestorRealPath = fs.realpathSync(existingAncestor);
+	const stats = fs.statSync(existingAncestorRealPath, { bigint: true });
+	const relativeSuffix = path.relative(existingAncestor, absolutePath);
+	if (relativeSuffix && !stats.isDirectory()) throw new Error(`Existing launch-root ancestor is not a directory: ${existingAncestor}`);
+	if (!relativeSuffix && expectedKind === "directory" && !stats.isDirectory()) {
+		throw new Error(`Existing launch root is not a directory: ${absolutePath}`);
+	}
+	if (!relativeSuffix && expectedKind === "file" && !stats.isFile()) {
+		throw new Error(`Existing launch file is not a regular file: ${absolutePath}`);
+	}
+	return {
+		path: absolutePath,
+		existingAncestor,
+		existingAncestorRealPath,
+		existingAncestorDevice: String(stats.dev),
+		existingAncestorInode: String(stats.ino),
+		relativeSuffix,
+	};
+}
+
+function attestLaunchRoots(
+	paths: Record<string, { path: string | undefined; kind: "directory" | "file" }>,
+): Record<string, SubagentLaunchRootAttestation> {
+	return Object.fromEntries(
+		Object.entries(paths)
+			.filter((entry): entry is [string, { path: string; kind: "directory" | "file" }] => typeof entry[1].path === "string")
+			.map(([name, root]) => [name, attestLaunchPath(root.path, root.kind)]),
+	);
 }
 
 function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string): SubagentLaunchContractAgentCandidate[] {
@@ -262,23 +337,63 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const sessionRoot = input.sessionDir ? path.resolve(input.sessionDir) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
 	const sessionDir = sessionRoot ? path.join(sessionRoot, "run-0") : undefined;
 	if (!sessionDir) diagnostics.push({ code: "host_required", severity: "host-required", message: "No sessionRoot/sessionDir was supplied; exact child session paths require the Pi host session-root policy." });
+	if (input.identityMode === "managed-v1" && !input.parentSessionId) {
+		diagnostics.push({ code: "host_required", severity: "host-required", message: "No active parent session identity was supplied; managed execution requires host-bound session identity." });
+	}
 	if (input.availableModels === undefined && (input.model || agent.model || input.parentModel)) {
 		diagnostics.push({ code: "host_required", severity: "host-required", message: "No availableModels snapshot was supplied; model resolution may differ from the active Pi host registry." });
 	}
 	if (resolvedSkills.missing.length > 0) {
 		return { ok: false, code: "missing_skill", message: `Missing skills: ${resolvedSkills.missing.join(", ")}`, diagnostics };
 	}
+	const sessionFile = sessionDir ? path.join(sessionDir, "session.jsonl") : undefined;
+	const attestationPaths: Record<string, { path: string | undefined; kind: "directory" | "file" }> = {
+		cwd: { path: effectiveCwd, kind: "directory" },
+		sessionRoot: { path: sessionRoot, kind: "directory" },
+		sessionDir: { path: sessionDir, kind: "directory" },
+		sessionFile: { path: sessionFile, kind: "file" },
+		artifactsDir: { path: artifactsDir, kind: "directory" },
+		outputPath: { path: outputPath, kind: "file" },
+	};
+	if (artifactPaths) {
+		for (const [name, artifactPath] of Object.entries(artifactPaths)) {
+			if (typeof artifactPath === "string") {
+				attestationPaths[`artifactPaths.${name}`] = { path: artifactPath, kind: "file" };
+			}
+		}
+	}
+	let rootAttestations: Record<string, SubagentLaunchRootAttestation> | undefined;
+	if (input.identityMode === "managed-v1") {
+		try {
+			rootAttestations = attestLaunchRoots(attestationPaths);
+		} catch {
+			return {
+				ok: false,
+				code: "invalid_root",
+				message: "A launch write/evidence root could not be attested.",
+				diagnostics: [...diagnostics, {
+					code: "invalid_root",
+					severity: "error",
+					message: "A launch write/evidence root could not be attested.",
+				}],
+			};
+		}
+	}
 	const candidates = candidateList(input.agent, agent, effectiveCwd);
 	const shadowedCandidates = candidates.filter((candidate) => !candidate.selected);
 	const contractBase: Omit<SubagentLaunchContract, "digest"> = {
 		version: SUBAGENT_LAUNCH_CONTRACT_VERSION,
 		runId,
+		...(input.identityMode === "managed-v1" && input.parentSessionId ? {
+			parentSessionIdentityDigest: digestParentSessionIdentity(input.parentSessionId, input.parentSessionFile),
+		} : {}),
 		agent: {
 			name: agent.name,
 			...(agent.localName ? { localName: agent.localName } : {}),
 			...(agent.packageName ? { packageName: agent.packageName } : {}),
 			source: agent.source,
 			filePath: agent.filePath,
+			...(input.identityMode === "managed-v1" ? { definitionDigest: digestAgentDefinition(agent) } : {}),
 			shadowedCandidates,
 		},
 		context: input.context ?? agent.defaultContext ?? "fresh",
@@ -314,10 +429,11 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		roots: {
 			cwd: effectiveCwd,
 			...(sessionRoot ? { sessionRoot } : {}),
-			...(sessionDir ? { sessionDir, sessionFile: path.join(sessionDir, "session.jsonl") } : {}),
+			...(sessionDir ? { sessionDir, sessionFile } : {}),
 			...(artifactsDir ? { artifactsDir } : {}),
 			...(artifactPaths ? { artifactPaths } : {}),
 			...(outputPath ? { outputPath } : {}),
+			...(rootAttestations ? { attestations: rootAttestations } : {}),
 		},
 		protocol: {
 			lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,

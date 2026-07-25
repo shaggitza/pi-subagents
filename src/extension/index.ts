@@ -39,6 +39,7 @@ import { registerMainWatchdog } from "../watchdog/register-main.ts";
 import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
+import { registerManagedDispatchPreflightBridge } from "./managed-dispatch-preflight.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import { resolveWaitToolConfig } from "../runs/background/subagent-wait.ts";
@@ -197,6 +198,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const tempArtifactsDir = getArtifactsDir(null);
 	cleanupAllArtifactDirs(DEFAULT_ARTIFACT_CONFIG.cleanupDays);
 
+	let managedSessionGeneration = 0;
 	const state: SubagentState = {
 		baseCwd: "",
 		currentSessionId: null,
@@ -383,6 +385,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		getContext: () => state.lastUiContext,
 		execute: (id, params, signal, onUpdate, ctx) => executor.execute(id, params, signal, onUpdate, ctx),
 	});
+	const managedPreflightBridgeDispose = registerManagedDispatchPreflightBridge({
+		events: pi.events,
+		getContext: () => state.lastUiContext,
+		getSessionGeneration: () => managedSessionGeneration,
+		artifactDir: config.artifactDir,
+	});
 
 	function effectiveParallelTaskCount(tasks: Array<{ count?: unknown }> | undefined): number {
 		if (!tasks || tasks.length === 0) return 0;
@@ -499,6 +507,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		pi.events.on(SUBAGENT_CONTROL_EVENT, controlEventHandler),
 		pi.events.on(SUBAGENT_STEERING_NOTICE_EVENT, steeringNoticeHandler),
 		rpcBridge.dispose,
+		managedPreflightBridgeDispose,
 	];
 	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
 
@@ -526,6 +535,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 
 	const resetSessionState = (ctx: ExtensionContext, recovering: boolean) => {
+		managedSessionGeneration++;
 		state.baseCwd = ctx.cwd;
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
 		state.parentSessionFile = ctx.sessionManager.getSessionFile();
@@ -567,6 +577,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", () => {
+		managedSessionGeneration++;
 		stopResultWatcher();
 		state.currentSessionId = null;
 		state.parentSessionFile = null;

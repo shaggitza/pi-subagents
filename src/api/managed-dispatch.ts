@@ -67,6 +67,8 @@ export interface ManagedExpectedLaunchV1 {
 	hostId: string;
 	candidateRunId: string;
 	profileIdentityDigest: string;
+	/** Added compatibly to v1; managed mutation providers require it before claim. */
+	parentSessionIdentityDigest?: string;
 	contractDigest: string;
 }
 
@@ -102,6 +104,8 @@ export type ManagedPreflightResultV1 = {
 	host: ManagedHostIdentityV1;
 	profile: ManagedProfileIdentityV1;
 	profileIdentityDigest: string;
+	/** Present from the non-launching host provider; optional for inert early-v1 consumers. */
+	parentSessionIdentityDigest?: string;
 	candidateRunId: string;
 	contractDigest: string;
 } | {
@@ -601,19 +605,27 @@ function normalizeProfileSnapshot(value: unknown): JsonValue {
 
 function normalizeExpectedLaunch(value: unknown): JsonValue {
 	if (!value || typeof value !== "object") throw new TypeError("Managed expected launch must be an object.");
-	const expected = assertExactKeys(
+	const expected = assertObjectKeys(
 		value,
 		["version", "hostId", "candidateRunId", "profileIdentityDigest", "contractDigest"],
+		["parentSessionIdentityDigest"],
 		"Managed expected launch",
 	);
 	assertVersion(expected.version, "Managed expected launch");
-	return {
+	const normalized: Record<string, JsonValue> = {
 		version: SUBAGENT_MANAGED_DISPATCH_VERSION,
 		hostId: assertSafeIdentifier(expected.hostId, "Managed expected launch hostId"),
 		candidateRunId: assertSafeIdentifier(expected.candidateRunId, "Managed expected launch candidateRunId"),
 		profileIdentityDigest: assertDigest(expected.profileIdentityDigest, "Managed expected launch profileIdentityDigest"),
 		contractDigest: assertDigest(expected.contractDigest, "Managed expected launch contractDigest"),
 	};
+	if (Object.prototype.hasOwnProperty.call(expected, "parentSessionIdentityDigest")) {
+		normalized.parentSessionIdentityDigest = assertDigest(
+			expected.parentSessionIdentityDigest,
+			"Managed expected launch parentSessionIdentityDigest",
+		);
+	}
+	return normalized;
 }
 
 function normalizeTarget(value: unknown, expectedConsumerId?: ManagedConsumerId): JsonValue {
@@ -688,12 +700,7 @@ function normalizeControlInput(
 	return { target: normalizeTarget(input.target, expectedConsumerId) };
 }
 
-/**
- * Hashes only validated semantic mutation identity. The transport requestId is
- * validated but deliberately excluded; operationId and preflight expectations
- * are deliberately included.
- */
-export function computeManagedRequestDigest(request: unknown): string {
+function normalizeManagedMutationRequest(request: unknown): JsonObject {
 	if (!request || typeof request !== "object") throw new TypeError("Managed mutation request must be an object.");
 	const inspected = plainDataRecord(request, "Managed mutation request");
 	const method = inspected.record.method;
@@ -707,7 +714,7 @@ export function computeManagedRequestDigest(request: unknown): string {
 		"Managed mutation request",
 	);
 	assertVersion(envelope.version, "Managed mutation request");
-	assertRequestId(envelope.requestId);
+	const requestId = assertRequestId(envelope.requestId);
 	if (!envelope.managed || typeof envelope.managed !== "object") throw new TypeError("Managed mutation request managed discriminator must be an object.");
 	const managed = assertExactKeys(envelope.managed, ["version", "consumerId", "operationId"], "Managed mutation discriminator");
 	assertVersion(managed.version, "Managed mutation discriminator");
@@ -718,14 +725,72 @@ export function computeManagedRequestDigest(request: unknown): string {
 		: method === "resume"
 			? normalizeResumeInput(envelope.input)
 			: normalizeControlInput(method, envelope.input, consumerId);
-	const semantic: Record<string, JsonValue> = {
-		protocolVersion: SUBAGENT_MANAGED_DISPATCH_VERSION,
+	const normalized: Record<string, JsonValue> = {
+		version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+		requestId,
 		method,
-		consumerId,
-		operationId,
+		managed: { version: SUBAGENT_MANAGED_DISPATCH_VERSION, consumerId, operationId },
 		input,
 	};
-	if (launchMethod) semantic.expectedLaunch = normalizeExpectedLaunch(envelope.expectedLaunch);
+	if (launchMethod) normalized.expectedLaunch = normalizeExpectedLaunch(envelope.expectedLaunch);
+	return normalized;
+}
+
+/** Strictly validates and returns a deeply frozen mutation transport envelope. */
+export function parseManagedMutationRequestV1(request: unknown): Readonly<ManagedMutationRequestV1> {
+	return canonicalizeManagedJson(normalizeManagedMutationRequest(request)).normalized as unknown as Readonly<ManagedMutationRequestV1>;
+}
+
+/** Strictly validates and returns a deeply frozen preflight transport envelope. */
+export function parseManagedPreflightRequestV1(request: unknown): Readonly<ManagedPreflightRequestV1> {
+	if (!request || typeof request !== "object") throw new TypeError("Managed preflight request must be an object.");
+	const envelope = assertExactKeys(request, ["version", "requestId", "method", "consumerId", "input"], "Managed preflight request");
+	assertVersion(envelope.version, "Managed preflight request");
+	const requestId = assertRequestId(envelope.requestId);
+	if (envelope.method !== "preflight") throw new TypeError("Managed preflight request method must be 'preflight'.");
+	const consumerId = assertManagedConsumerId(envelope.consumerId);
+	if (!envelope.input || typeof envelope.input !== "object") throw new TypeError("Managed preflight input must be an object.");
+	const inspectedInput = plainDataRecord(envelope.input, "Managed preflight input").record;
+	const kind = inspectedInput.kind;
+	let input: JsonObject;
+	if (kind === "spawn") {
+		const exact = assertExactKeys(envelope.input, ["kind", "request"], "Managed spawn preflight input");
+		input = { kind, ...normalizeSpawnInput({ request: exact.request }) as JsonObject };
+	} else if (kind === "resume") {
+		const exact = assertExactKeys(envelope.input, ["kind", "sourceRunId", "index", "request"], "Managed resume preflight input");
+		input = {
+			kind,
+			...normalizeResumeInput({ sourceRunId: exact.sourceRunId, index: exact.index, request: exact.request }) as JsonObject,
+		};
+	} else {
+		throw new TypeError("Managed preflight input kind must be 'spawn' or 'resume'.");
+	}
+	return canonicalizeManagedJson({
+		version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+		requestId,
+		method: "preflight",
+		consumerId,
+		input,
+	}).normalized as unknown as Readonly<ManagedPreflightRequestV1>;
+}
+
+/**
+ * Hashes only validated semantic mutation identity. The transport requestId is
+ * validated but deliberately excluded; operationId and preflight expectations
+ * are deliberately included.
+ */
+export function computeManagedRequestDigest(request: unknown): string {
+	const parsed = parseManagedMutationRequestV1(request);
+	const semantic: Record<string, JsonValue> = {
+		protocolVersion: SUBAGENT_MANAGED_DISPATCH_VERSION,
+		method: parsed.method,
+		consumerId: parsed.managed.consumerId,
+		operationId: parsed.managed.operationId,
+		input: parsed.input as unknown as JsonValue,
+	};
+	if (parsed.method === "spawn" || parsed.method === "resume") {
+		semantic.expectedLaunch = parsed.expectedLaunch as unknown as JsonValue;
+	}
 	return sha256Domain(REQUEST_DOMAIN, canonicalizeManagedJson(semantic).serialization);
 }
 
