@@ -59,6 +59,14 @@ import { finalizeProcessTerminal, readProcessTerminal } from "./process-terminal
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
 import { resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { assertPreparedResultReservation, type PreparedResultReservationV1 } from "./prepared-result-reservation.ts";
+import {
+	createPreparedRunnerAdmission,
+	preparedRunnerAdmissionPaths,
+	readPreparedRunnerAdmissionEvidence,
+	writePreparedRunnerAdmissionControl,
+	type PreparedRunnerAdmissionEvidenceV1,
+	type PreparedRunnerAdmissionV1,
+} from "./prepared-runner-admission.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -183,6 +191,11 @@ interface AsyncSingleParams {
 	/** Prepared-spawn mode requires exclusive candidate-owned run paths. */
 	exclusiveRunPaths?: boolean;
 	preparedResultReservation?: PreparedResultReservationV1;
+	preparedRunnerAdmission?: {
+		dispatchIdentityDigest: string;
+		onReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+		onAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+	};
 	revivalLease?: SessionLeaseRequest;
 	context?: ContextMode;
 	skills?: string[];
@@ -371,6 +384,46 @@ function waitForRunnerStartup(startupPath: string, expectedState: RunnerStartupS
 	return { ok: false, error: `Timed out after ${timeoutMs}ms waiting for the async runner startup state '${expectedState}'.` };
 }
 
+type PreparedAdmissionWaitResult =
+	| { ok: true; evidence: PreparedRunnerAdmissionEvidenceV1 }
+	| { ok: false; error: string };
+
+function waitForPreparedRunnerAdmission(
+	filePath: string,
+	admission: PreparedRunnerAdmissionV1,
+	state: PreparedRunnerAdmissionEvidenceV1["state"],
+	timeoutMs: number,
+): PreparedAdmissionWaitResult {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			const evidence = readPreparedRunnerAdmissionEvidence(filePath, admission, state);
+			if (evidence) return { ok: true, evidence };
+		} catch (error) {
+			return { ok: false, error: error instanceof Error ? error.message : String(error) };
+		}
+		if (Date.now() >= deadline) break;
+		waitForStartupInterval(Math.min(20, Math.max(1, deadline - Date.now())));
+	}
+	return { ok: false, error: `Timed out after ${timeoutMs}ms waiting for prepared runner admission '${state}'.` };
+}
+
+function invokePreparedAdmissionCallback(
+	callback: (evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>) => undefined,
+	evidence: PreparedRunnerAdmissionEvidenceV1,
+): void {
+	const result = callback(evidence) as unknown;
+	if (result === undefined) return;
+	if (
+		result !== null
+		&& (typeof result === "object" || typeof result === "function")
+		&& typeof (result as { then?: unknown }).then === "function"
+	) {
+		void Promise.resolve(result).catch(() => {});
+	}
+	throw new Error("Prepared runner admission callbacks must complete synchronously.");
+}
+
 function writeRunnerStartupControl(filePath: string, payload: { action: "ack" | "proceed"; token: string }): void {
 	const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	try {
@@ -413,7 +466,14 @@ function spawnRunner(
 	suffix: string,
 	cwd: string,
 	onProcessTerminal?: (proof: unknown) => void,
-	options: { exclusiveConfigPath?: boolean } = {},
+	options: {
+		exclusiveConfigPath?: boolean;
+		preparedAdmission?: {
+			admission: PreparedRunnerAdmissionV1;
+			onReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+			onAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+		};
+	} = {},
 ): { pid?: number; error?: string } {
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
@@ -445,6 +505,16 @@ function spawnRunner(
 		: undefined;
 	const startupAckPath = startupPath ? path.join(path.dirname(startupPath), "runner-startup-ack.json") : undefined;
 	const startupProceedPath = startupPath ? path.join(path.dirname(startupPath), "runner-startup-proceed.json") : undefined;
+	const preparedAdmissionPaths = options.preparedAdmission
+		&& typeof (launchConfig as { asyncDir?: unknown }).asyncDir === "string"
+		? preparedRunnerAdmissionPaths((launchConfig as { asyncDir: string }).asyncDir)
+		: undefined;
+	if (startupPath && preparedAdmissionPaths) return { error: "Prepared runner admission cannot be combined with revival startup." };
+	if (preparedAdmissionPaths) {
+		for (const admissionPath of Object.values(preparedAdmissionPaths)) {
+			if (fs.existsSync(admissionPath)) return { error: `Prepared runner admission path already exists: ${admissionPath}` };
+		}
+	}
 	if (startupPath) fs.rmSync(startupPath, { force: true });
 	if (startupAckPath) fs.rmSync(startupAckPath, { force: true });
 	if (startupProceedPath) fs.rmSync(startupProceedPath, { force: true });
@@ -554,6 +624,43 @@ function spawnRunner(
 				fs.rmSync(startupPath, { force: true });
 			} catch {
 				// Proceed is the commit point; handshake cleanup cannot turn a running revival into a start error.
+			}
+		}
+		if (preparedAdmissionPaths && options.preparedAdmission) {
+			const { admission, onReady, onAccepted } = options.preparedAdmission;
+			const ready = waitForPreparedRunnerAdmission(
+				preparedAdmissionPaths.evidencePath,
+				admission,
+				"ready",
+				RUNNER_STARTUP_TIMEOUT_MS,
+			);
+			if (!ready.ok) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: ready.error };
+			}
+			try {
+				invokePreparedAdmissionCallback(onReady, ready.evidence);
+				writePreparedRunnerAdmissionControl(preparedAdmissionPaths.proceedPath, admission, "proceed");
+			} catch {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: "Prepared runner-ready admission failed closed." };
+			}
+			const accepted = waitForPreparedRunnerAdmission(
+				preparedAdmissionPaths.evidencePath,
+				admission,
+				"accepted",
+				RUNNER_STARTUP_TIMEOUT_MS,
+			);
+			if (!accepted.ok) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: accepted.error };
+			}
+			try {
+				invokePreparedAdmissionCallback(onAccepted, accepted.evidence);
+				writePreparedRunnerAdmissionControl(preparedAdmissionPaths.commitPath, admission, "commit");
+			} catch {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: "Prepared runner-accepted admission failed closed." };
 			}
 		}
 		return { pid: proc.pid };
@@ -1194,8 +1301,17 @@ export function executeAsyncSingle(
 	const resultPath = inheritedNestedRoute
 		? nestedResultsPath(inheritedNestedRoute.rootRunId, id)
 		: path.join(RESULTS_DIR, `${id}.json`);
+	let preparedAdmission: PreparedRunnerAdmissionV1 | undefined;
+	try {
+		preparedAdmission = params.preparedRunnerAdmission
+			? createPreparedRunnerAdmission(id, params.preparedRunnerAdmission.dispatchIdentityDigest)
+			: undefined;
+	} catch (error) {
+		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
 	try {
 		if (params.exclusiveRunPaths) {
+			if (!preparedAdmission) throw new Error("prepared runner admission is required for exclusive execution");
 			if (
 				!params.preparedResultReservation
 				|| params.preparedResultReservation.runId !== id
@@ -1340,6 +1456,7 @@ export function executeAsyncSingle(
 				],
 				resultPath,
 				...(params.preparedResultReservation ? { preparedResultReservation: params.preparedResultReservation } : {}),
+				...(preparedAdmission ? { preparedRunnerAdmission: preparedAdmission } : {}),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,
@@ -1375,7 +1492,16 @@ export function executeAsyncSingle(
 			id,
 			runnerCwd,
 			(proof) => ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof),
-			{ exclusiveConfigPath: params.exclusiveRunPaths === true },
+			{
+				exclusiveConfigPath: params.exclusiveRunPaths === true,
+				...(preparedAdmission && params.preparedRunnerAdmission ? {
+					preparedAdmission: {
+						admission: preparedAdmission,
+						onReady: params.preparedRunnerAdmission.onReady,
+						onAccepted: params.preparedRunnerAdmission.onAccepted,
+					},
+				} : {}),
+			},
 		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

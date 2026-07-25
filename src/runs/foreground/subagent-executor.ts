@@ -58,6 +58,10 @@ import {
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
 import { buildAsyncRunnerSteps, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable } from "../background/async-execution.ts";
 import {
+	preparedRunnerAdmissionPaths,
+	type PreparedRunnerAdmissionEvidenceV1,
+} from "../background/prepared-runner-admission.ts";
+import {
 	createPreparedResultReservation,
 	preparedResultReservationPath,
 	type PreparedResultReservationV1,
@@ -240,17 +244,26 @@ export interface PreparedSubagentSpawnPlan {
 	resultPath: string;
 	resultReservationPath: string;
 	runnerConfigPath: string;
+	runnerAdmissionPath: string;
+	runnerAdmissionProceedPath: string;
+	runnerAdmissionCommitPath: string;
 	artifactsDir?: string;
 }
 
 export interface PreparedSubagentSpawnOptions {
 	/** Host-generated identity already bound by managed preflight. */
 	runId: string;
+	/** Durable request/operation identity bound into runner admission evidence. */
+	dispatchIdentityDigest: string;
 	/**
 	 * Final fail-closed authorization boundary. A successful callback means all
 	 * later failures are post-dispatch and must be reconciled, never relaunched.
 	 */
 	beforeLaunch(plan: Readonly<PreparedSubagentSpawnPlan>): void | Promise<void>;
+	/** Runs while the prepared runner is blocked before model/session execution. */
+	onRunnerReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+	/** Runs after accepted evidence while the runner remains blocked before execution. */
+	onRunnerAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 }
 
 interface ExecutorDeps {
@@ -2256,6 +2269,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 				sessionDir: sessionDirForIndex(0),
 				exclusiveRunPaths: true,
 				preparedResultReservation: data.preparedResultReservation,
+				preparedRunnerAdmission: {
+					dispatchIdentityDigest: data.preparedSpawn.dispatchIdentityDigest,
+					onReady: data.preparedSpawn.onRunnerReady,
+					onAccepted: data.preparedSpawn.onRunnerAccepted,
+				},
 			} : {}),
 			sessionFile: sessionFileForTask(params.agent!, 0, modelOverride),
 			context: contextPolicy.contextForAgent(params.agent!),
@@ -3490,6 +3508,7 @@ function omitExecutionModeActionAlias(params: SubagentParamsLike): SubagentParam
 }
 
 const PREPARED_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/;
+const PREPARED_DISPATCH_DIGEST = /^[a-f0-9]{64}$/;
 const NESTED_EXECUTION_ENV = [
 	SUBAGENT_CHILD_AGENT_ENV,
 	SUBAGENT_CHILD_ENV,
@@ -3520,7 +3539,11 @@ function preparedExecutionEnvironmentIsClean(): boolean {
 
 function validatePreparedSpawnRequest(params: SubagentParamsLike, options: PreparedSubagentSpawnOptions): string | undefined {
 	if (!PREPARED_RUN_ID.test(options.runId)) return "Prepared spawn requires a safe host-generated run identity.";
+	if (!PREPARED_DISPATCH_DIGEST.test(options.dispatchIdentityDigest)) return "Prepared spawn requires a dispatch identity digest.";
 	if (typeof options.beforeLaunch !== "function") return "Prepared spawn requires a final authorization callback.";
+	if (typeof options.onRunnerReady !== "function" || typeof options.onRunnerAccepted !== "function") {
+		return "Prepared spawn requires runner-ready and runner-accepted callbacks.";
+	}
 	if (params.action !== undefined || params.tasks !== undefined || params.chain !== undefined) {
 		return "Prepared spawn supports ordinary single-agent execution only.";
 	}
@@ -4140,7 +4163,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 
 		let preparedResultReservation: PreparedResultReservationV1 | undefined;
 		if (preparedSpawn && deps.state.currentSessionId && parentSessionFile) {
+			const asyncDir = path.join(ASYNC_DIR, runId);
 			const resultPath = path.join(RESULTS_DIR, `${runId}.json`);
+			const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
 			const plan: PreparedSubagentSpawnPlan = Object.freeze({
 				runId,
 				parentSessionId: deps.state.currentSessionId,
@@ -4149,10 +4174,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				sessionRoot,
 				sessionDir: sessionDirForIndex(0),
 				sessionFile: childSessionFileForIndex(0),
-				asyncDir: path.join(ASYNC_DIR, runId),
+				asyncDir,
 				resultPath,
 				resultReservationPath: preparedResultReservationPath(resultPath),
 				runnerConfigPath: getAsyncConfigPath(runId),
+				runnerAdmissionPath: admissionPaths.evidencePath,
+				runnerAdmissionProceedPath: admissionPaths.proceedPath,
+				runnerAdmissionCommitPath: admissionPaths.commitPath,
 				...(artifactConfig.enabled ? { artifactsDir } : {}),
 			});
 			try {

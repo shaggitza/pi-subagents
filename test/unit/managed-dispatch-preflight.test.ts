@@ -12,6 +12,7 @@ import {
 import type { SubagentLaunchContract, SubagentLaunchContractInput } from "../../src/api/preflight.ts";
 import { ASYNC_DIR, RESULTS_DIR, getAsyncConfigPath } from "../../src/shared/types.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
+import { preparedRunnerAdmissionPaths } from "../../src/runs/background/prepared-runner-admission.ts";
 import {
 	loadOrCreateManagedDispatchHostId,
 	registerManagedDispatchPreflightBridge,
@@ -86,6 +87,7 @@ function contract(input: SubagentLaunchContractInput): SubagentLaunchContract {
 	const resultPath = path.join(RESULTS_DIR, `${input.runId!}.json`);
 	const resultReservationPath = preparedResultReservationPath(resultPath);
 	const runnerConfigPath = getAsyncConfigPath(input.runId!);
+	const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
 	const attestation = (attestedPath: string) => ({
 		path: attestedPath,
 		existingAncestor: temporary,
@@ -137,6 +139,9 @@ function contract(input: SubagentLaunchContractInput): SubagentLaunchContract {
 			resultPath,
 			resultReservationPath,
 			runnerConfigPath,
+			runnerAdmissionPath: admissionPaths.evidencePath,
+			runnerAdmissionProceedPath: admissionPaths.proceedPath,
+			runnerAdmissionCommitPath: admissionPaths.commitPath,
 			attestations: {
 				cwd: attestation(temporary),
 				sessionRoot: attestation(sessionRoot),
@@ -146,6 +151,9 @@ function contract(input: SubagentLaunchContractInput): SubagentLaunchContract {
 				resultPath: attestation(resultPath),
 				resultReservationPath: attestation(resultReservationPath),
 				runnerConfigPath: attestation(runnerConfigPath),
+				runnerAdmissionPath: attestation(admissionPaths.evidencePath),
+				runnerAdmissionProceedPath: attestation(admissionPaths.proceedPath),
+				runnerAdmissionCommitPath: attestation(admissionPaths.commitPath),
 			},
 		},
 		protocol: { lifecycleArtifactVersion: 3, packageVersion: "0.11.4" },

@@ -9,6 +9,7 @@ import { clearSkillCache } from "../../src/agents/skills.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import { ASYNC_DIR, RESULTS_DIR, getAsyncConfigPath } from "../../src/shared/types.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
+import { preparedRunnerAdmissionPaths } from "../../src/runs/background/prepared-runner-admission.ts";
 
 let tempDir = "";
 let previousHome: string | undefined;
@@ -132,6 +133,10 @@ Project prompt.
 			assert.equal(result.contract.roots.resultPath, path.join(RESULTS_DIR, "run-123.json"));
 			assert.equal(result.contract.roots.resultReservationPath, preparedResultReservationPath(path.join(RESULTS_DIR, "run-123.json")));
 			assert.equal(result.contract.roots.runnerConfigPath, getAsyncConfigPath("run-123"));
+			const admissionPaths = preparedRunnerAdmissionPaths(path.join(ASYNC_DIR, "run-123"));
+			assert.equal(result.contract.roots.runnerAdmissionPath, admissionPaths.evidencePath);
+			assert.equal(result.contract.roots.runnerAdmissionProceedPath, admissionPaths.proceedPath);
+			assert.equal(result.contract.roots.runnerAdmissionCommitPath, admissionPaths.commitPath);
 			const attestations = result.contract.roots.attestations;
 			assert.ok(attestations);
 			assert.deepEqual(
@@ -149,6 +154,9 @@ Project prompt.
 					"resultPath",
 					"resultReservationPath",
 					"runnerConfigPath",
+					"runnerAdmissionPath",
+					"runnerAdmissionProceedPath",
+					"runnerAdmissionCommitPath",
 					"sessionDir",
 					"sessionFile",
 					"sessionRoot",
@@ -242,6 +250,10 @@ Exact session path prompt.
 		assert.equal(result.contract.roots.resultPath, path.join(RESULTS_DIR, "candidate-1.json"));
 		assert.equal(result.contract.roots.resultReservationPath, preparedResultReservationPath(path.join(RESULTS_DIR, "candidate-1.json")));
 		assert.equal(result.contract.roots.runnerConfigPath, getAsyncConfigPath("candidate-1"));
+		const candidateAdmissionPaths = preparedRunnerAdmissionPaths(path.join(ASYNC_DIR, "candidate-1"));
+		assert.equal(result.contract.roots.runnerAdmissionPath, candidateAdmissionPaths.evidencePath);
+		assert.equal(result.contract.roots.runnerAdmissionProceedPath, candidateAdmissionPaths.proceedPath);
+		assert.equal(result.contract.roots.runnerAdmissionCommitPath, candidateAdmissionPaths.commitPath);
 		assert.equal(result.contract.roots.attestations?.sessionDir.path, path.join(sessionRoot, "run-0"));
 		assert.equal(result.contract.roots.attestations?.sessionDir.existingAncestorRealPath, fs.realpathSync(tempDir));
 		assert.equal(fs.existsSync(sessionRoot), false);

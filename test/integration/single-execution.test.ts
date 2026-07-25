@@ -53,6 +53,10 @@ import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/share
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
 import { NESTED_EVENTS_DIR } from "../../src/runs/shared/nested-events.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
+import {
+	preparedRunnerAdmissionPaths,
+	type PreparedRunnerAdmissionEvidenceV1,
+} from "../../src/runs/background/prepared-runner-admission.ts";
 import { MAX_CHILD_PENDING_LINE_BYTES, MAX_CHILD_STDERR_BYTES } from "../../src/runs/shared/child-protocol.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
@@ -252,6 +256,7 @@ const available = !!(execution && utils);
 const runSync = execution?.runSync;
 const getFinalOutput = utils?.getFinalOutput;
 const createSubagentExecutor = executorMod?.createSubagentExecutor;
+const PREPARED_TEST_DISPATCH_DIGEST = "d".repeat(64);
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -813,6 +818,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
 		const resultReservationPath = preparedResultReservationPath(resultPath);
 		const configPath = getAsyncConfigPath(candidate);
+		const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 		fs.rmSync(resultPath, { force: true });
 		fs.rmSync(resultReservationPath, { force: true });
@@ -848,7 +854,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			ctx,
 			{
 				runId: candidate,
-				beforeLaunch: (plan: { runId: string; sessionRoot: string; sessionDir: string; sessionFile: string; asyncDir: string; resultPath: string; resultReservationPath: string; runnerConfigPath: string }) => {
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				beforeLaunch: (plan: { runId: string; sessionRoot: string; sessionDir: string; sessionFile: string; asyncDir: string; resultPath: string; resultReservationPath: string; runnerConfigPath: string; runnerAdmissionPath: string; runnerAdmissionProceedPath: string; runnerAdmissionCommitPath: string }) => {
 					callbackCount++;
 					assert.deepEqual({
 						runId: plan.runId,
@@ -859,6 +866,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 						resultPath: plan.resultPath,
 						resultReservationPath: plan.resultReservationPath,
 						runnerConfigPath: plan.runnerConfigPath,
+						runnerAdmissionPath: plan.runnerAdmissionPath,
+						runnerAdmissionProceedPath: plan.runnerAdmissionProceedPath,
+						runnerAdmissionCommitPath: plan.runnerAdmissionCommitPath,
 					}, {
 						runId: candidate,
 						sessionRoot,
@@ -868,9 +878,14 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 						resultPath,
 						resultReservationPath,
 						runnerConfigPath: configPath,
+						runnerAdmissionPath: admissionPaths.evidencePath,
+						runnerAdmissionProceedPath: admissionPaths.proceedPath,
+						runnerAdmissionCommitPath: admissionPaths.commitPath,
 					});
 					throw new Error("test rejection must not escape");
 				},
+				onRunnerReady: () => assert.fail("rejected prepared spawn must not create a runner"),
+				onRunnerAccepted: () => assert.fail("rejected prepared spawn must not create a runner"),
 			},
 		);
 		assert.equal(result.isError, true);
@@ -925,7 +940,13 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				new AbortController().signal,
 				undefined,
 				ctx,
-				{ runId: `prepared-inherited-${Date.now()}`, beforeLaunch: () => { initialCallbackCount++; } },
+				{
+					runId: `prepared-inherited-${Date.now()}`,
+					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+					beforeLaunch: () => { initialCallbackCount++; },
+					onRunnerReady: () => assert.fail("inherited prepared spawn must not create a runner"),
+					onRunnerAccepted: () => assert.fail("inherited prepared spawn must not create a runner"),
+				},
 			);
 			assert.equal(inherited.isError, true);
 			assert.match(inherited.content[0]?.text ?? "", /unavailable from inherited or nested execution/);
@@ -942,10 +963,13 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				ctx,
 				{
 					runId: `prepared-environment-changed-${Date.now()}`,
+					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 					beforeLaunch: () => {
 						changedCallbackCount++;
 						process.env.PI_SUBAGENT_DEPTH = "1";
 					},
+					onRunnerReady: () => assert.fail("changed environment must stop before runner creation"),
+					onRunnerAccepted: () => assert.fail("changed environment must stop before runner creation"),
 				},
 			);
 			assert.equal(changed.isError, true);
@@ -998,7 +1022,13 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			new AbortController().signal,
 			undefined,
 			ctx,
-			{ runId: candidate, beforeLaunch: () => { callbackCount++; } },
+			{
+				runId: candidate,
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				beforeLaunch: () => { callbackCount++; },
+				onRunnerReady: () => assert.fail("config collision must prevent runner creation"),
+				onRunnerAccepted: () => assert.fail("config collision must prevent runner creation"),
+			},
 		);
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
@@ -1014,6 +1044,76 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		fs.rmSync(configPath, { force: true });
 	});
 
+	it("blocks model execution when durable accepted-state admission fails", async () => {
+		const candidate = `prepared-accepted-reject-${Date.now()}`;
+		const sessionRoot = path.join(tempDir, "prepared-accepted-reject-session");
+		const asyncDir = path.join(ASYNC_DIR, candidate);
+		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
+		const resultReservationPath = preparedResultReservationPath(resultPath);
+		const configPath = getAsyncConfigPath(candidate);
+		const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
+		for (const filePath of [resultPath, resultReservationPath, configPath]) fs.rmSync(filePath, { force: true });
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = {
+			...baseCtx,
+			sessionManager: {
+				getSessionId: () => "session-123",
+				getSessionFile: () => parentSessionFile,
+			},
+		};
+		let readyCount = 0;
+		let acceptedCount = 0;
+		const executor = makeExecutor([makeAgent("echo")]);
+		const result = await executor.executePreparedSpawn(
+			"prepared-accepted-reject-request",
+			{
+				agent: "echo",
+				task: "Must remain blocked before model execution",
+				async: true,
+				clarify: false,
+				context: "fresh",
+				cwd: tempDir,
+				sessionDir: sessionRoot,
+				artifacts: false,
+				output: false,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{
+				runId: candidate,
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				beforeLaunch: () => {},
+				onRunnerReady: () => { readyCount++; },
+				onRunnerAccepted: ((_: PreparedRunnerAdmissionEvidenceV1) => {
+					acceptedCount++;
+					return new Promise<void>((resolve) => setTimeout(resolve, 50));
+				}) as unknown as ((evidence: PreparedRunnerAdmissionEvidenceV1) => undefined),
+			},
+		);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /runner-accepted admission failed closed/);
+		assert.equal(readyCount, 1);
+		assert.equal(acceptedCount, 1);
+		assert.equal(mockPi.callCount(), 0, "runner must remain blocked until accepted state is durably committed");
+		const retainedAdmission = JSON.parse(fs.readFileSync(admissionPaths.evidencePath, "utf8")) as PreparedRunnerAdmissionEvidenceV1;
+		assert.equal(retainedAdmission.state, "accepted");
+		assert.equal(fs.existsSync(admissionPaths.commitPath), false);
+		assert.equal(fs.existsSync(resultReservationPath), true);
+		assert.equal(fs.existsSync(resultPath), false);
+		const terminalDeadline = Date.now() + 5_000;
+		while (!fs.existsSync(path.join(asyncDir, "process-terminal.json")) && Date.now() < terminalDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(fs.existsSync(path.join(asyncDir, "process-terminal.json")), true);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultReservationPath, { force: true });
+		fs.rmSync(configPath, { force: true });
+	});
+
 	it("uses one prepared candidate identity for async, result, config, and canonical session paths", async () => {
 		mockPi.onCall({ output: "prepared finished" });
 		const candidate = `prepared-success-${Date.now()}`;
@@ -1022,6 +1122,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
 		const resultReservationPath = preparedResultReservationPath(resultPath);
 		const configPath = getAsyncConfigPath(candidate);
+		const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 		fs.rmSync(resultPath, { force: true });
 		fs.rmSync(resultReservationPath, { force: true });
@@ -1037,6 +1138,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			},
 		};
 		let callbackCount = 0;
+		const readyEvidence: PreparedRunnerAdmissionEvidenceV1[] = [];
+		const acceptedEvidence: PreparedRunnerAdmissionEvidenceV1[] = [];
 		const executor = makeExecutor([makeAgent("echo")]);
 		const result = await executor.executePreparedSpawn(
 			"prepared-success-request",
@@ -1056,7 +1159,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			ctx,
 			{
 				runId: candidate,
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 				beforeLaunch: () => { callbackCount++; },
+				onRunnerReady: (evidence: PreparedRunnerAdmissionEvidenceV1) => { readyEvidence.push(evidence); },
+				onRunnerAccepted: (evidence: PreparedRunnerAdmissionEvidenceV1) => { acceptedEvidence.push(evidence); },
 			},
 		);
 		assert.equal(result.isError, undefined);
@@ -1064,6 +1170,14 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.details?.asyncId, candidate);
 		assert.equal(result.details?.asyncDir, asyncDir);
 		assert.equal(callbackCount, 1);
+		assert.equal(readyEvidence.length, 1);
+		assert.equal(acceptedEvidence.length, 1);
+		assert.equal(readyEvidence[0]?.state, "ready");
+		assert.equal(acceptedEvidence[0]?.state, "accepted");
+		assert.equal(readyEvidence[0]?.runId, candidate);
+		assert.equal(acceptedEvidence[0]?.dispatchIdentityDigest, PREPARED_TEST_DISPATCH_DIGEST);
+		assert.equal(acceptedEvidence[0]?.token, readyEvidence[0]?.token);
+		assert.equal(acceptedEvidence[0]?.runnerProcessInstanceId, readyEvidence[0]?.runnerProcessInstanceId);
 		assert.equal(fs.existsSync(sessionRoot), true);
 
 		const deadlineAt = Date.now() + 30_000;
@@ -1074,6 +1188,11 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(fs.existsSync(path.join(sessionRoot, "run-0", "session.jsonl")), true);
 		assert.equal(fs.existsSync(resultReservationPath), false, "runner must release the candidate-bound result reservation after publication");
 		assert.equal(fs.existsSync(configPath), false, "runner must consume the candidate-bound transient config");
+		const retainedAdmission = JSON.parse(fs.readFileSync(admissionPaths.evidencePath, "utf8")) as PreparedRunnerAdmissionEvidenceV1;
+		assert.equal(retainedAdmission.state, "accepted");
+		assert.equal(retainedAdmission.dispatchIdentityDigest, PREPARED_TEST_DISPATCH_DIGEST);
+		assert.equal(fs.existsSync(admissionPaths.proceedPath), false);
+		assert.equal(fs.existsSync(admissionPaths.commitPath), false);
 		assert.equal(mockPi.callCount(), 1);
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 		fs.rmSync(resultPath, { force: true });

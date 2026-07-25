@@ -180,7 +180,10 @@ function hasCompleteManagedContractIdentity(contract: SubagentLaunchContract): b
 		&& typeof contract.roots.asyncDir === "string"
 		&& typeof contract.roots.resultPath === "string"
 		&& typeof contract.roots.resultReservationPath === "string"
-		&& typeof contract.roots.runnerConfigPath === "string";
+		&& typeof contract.roots.runnerConfigPath === "string"
+		&& typeof contract.roots.runnerAdmissionPath === "string"
+		&& typeof contract.roots.runnerAdmissionProceedPath === "string"
+		&& typeof contract.roots.runnerAdmissionCommitPath === "string";
 }
 
 function deriveProfile(contract: SubagentLaunchContract): {

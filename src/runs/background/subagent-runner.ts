@@ -106,6 +106,12 @@ import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
 import {
+	preparedRunnerAdmissionPaths,
+	readPreparedRunnerAdmissionControl,
+	writePreparedRunnerAdmissionEvidence,
+	type PreparedRunnerAdmissionV1,
+} from "./prepared-runner-admission.ts";
+import {
 	assertPreparedResultReservation,
 	releasePreparedResultReservation,
 	type PreparedResultReservationV1,
@@ -126,6 +132,7 @@ interface SubagentRunConfig {
 	steps: RunnerStep[];
 	resultPath: string;
 	preparedResultReservation?: PreparedResultReservationV1;
+	preparedRunnerAdmission?: PreparedRunnerAdmissionV1;
 	cwd: string;
 	placeholder: string;
 	taskIndex?: number;
@@ -4043,12 +4050,28 @@ async function waitForStartupControl(
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for runner startup control '${action}'.`);
 }
 
+async function waitForPreparedAdmissionControl(
+	controlPath: string,
+	admission: PreparedRunnerAdmissionV1,
+	action: "proceed" | "commit",
+	timeoutMs = 30_000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() <= deadline) {
+		const control = readPreparedRunnerAdmissionControl(controlPath, admission, action);
+		if (control) return;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	throw new Error(`Timed out after ${timeoutMs}ms waiting for prepared runner admission '${action}'.`);
+}
+
 async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 	let lease: ReturnType<typeof acquireSessionLease> | undefined;
 	let startupCommitted = config.revivalLease === undefined;
 	const startupPath = path.join(config.asyncDir, "runner-startup.json");
 	const startupAckPath = path.join(config.asyncDir, "runner-startup-ack.json");
 	const startupProceedPath = path.join(config.asyncDir, "runner-startup-proceed.json");
+	const admissionPaths = preparedRunnerAdmissionPaths(config.asyncDir);
 	const releaseOnExit = (): void => {
 		try {
 			lease?.release();
@@ -4059,6 +4082,35 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 	process.once("exit", releaseOnExit);
 	try {
 		if (config.preparedResultReservation) assertPreparedResultReservation(config.preparedResultReservation);
+		if (config.preparedRunnerAdmission && config.revivalLease) {
+			throw new Error("Prepared runner admission cannot be combined with revival startup.");
+		}
+		if (config.preparedRunnerAdmission) {
+			if (!config.runnerProcessInstanceId) throw new Error("Prepared runner admission lacks a runner process identity.");
+			writePreparedRunnerAdmissionEvidence(
+				admissionPaths.evidencePath,
+				config.preparedRunnerAdmission,
+				"ready",
+				process.pid,
+				config.runnerProcessInstanceId,
+			);
+			await waitForPreparedAdmissionControl(admissionPaths.proceedPath, config.preparedRunnerAdmission, "proceed");
+			writePreparedRunnerAdmissionEvidence(
+				admissionPaths.evidencePath,
+				config.preparedRunnerAdmission,
+				"accepted",
+				process.pid,
+				config.runnerProcessInstanceId,
+			);
+			await waitForPreparedAdmissionControl(admissionPaths.commitPath, config.preparedRunnerAdmission, "commit");
+			for (const controlPath of [admissionPaths.proceedPath, admissionPaths.commitPath]) {
+				try {
+					fs.rmSync(controlPath, { force: true });
+				} catch {
+					// Admission evidence remains authoritative after commit.
+				}
+			}
+		}
 		if (config.revivalLease) {
 			lease = acquireSessionLease(config.revivalLease);
 			config.revivalLeaseToken = lease.owner.token;
