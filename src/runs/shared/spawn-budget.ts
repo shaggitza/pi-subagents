@@ -82,6 +82,25 @@ export function reserveSpawnBudget(
 	return { snapshot: getSpawnBudgetSnapshot(state, config, sessionId) };
 }
 
+/** Releases only a same-session bounded reservation that never crossed its launch boundary. */
+export function releaseSpawnBudgetReservation(
+	state: SubagentState,
+	sessionId: string | null,
+	requested: number,
+): void {
+	const counters = state.subagentSpawns;
+	if (
+		Number.isInteger(requested)
+		&& requested > 0
+		&& counters?.sessionId === sessionId
+		&& counters.configuredLimit !== null
+		&& counters.configuredLimit !== undefined
+		&& counters.count >= requested
+	) {
+		counters.count -= requested;
+	}
+}
+
 export function preflightSpawnBudgetGrant(
 	state: SubagentState,
 	config: ExtensionConfig,

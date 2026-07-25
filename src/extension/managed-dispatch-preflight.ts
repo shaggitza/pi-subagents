@@ -163,18 +163,24 @@ function profileContent(contract: SubagentLaunchContract): JsonObject {
 }
 
 function hasCompleteManagedContractIdentity(contract: SubagentLaunchContract): boolean {
-	if (!contract.parentSessionIdentityDigest || !contract.agent.definitionDigest || !contract.roots.attestations) return false;
-	for (const name of ["cwd", "sessionRoot", "sessionDir", "sessionFile", "artifactsDir", "outputPath"] as const) {
-		if (typeof contract.roots[name] === "string" && !contract.roots.attestations[name]) return false;
+	const attestations = contract.roots.attestations;
+	if (!contract.parentSessionIdentityDigest || !contract.agent.definitionDigest || !attestations) return false;
+	for (const [name, root] of Object.entries(contract.roots)) {
+		if (name === "attestations" || name === "artifactPaths") continue;
+		if (typeof root === "string" && !attestations[name]) return false;
 	}
 	if (contract.roots.artifactPaths) {
 		for (const [name, artifactPath] of Object.entries(contract.roots.artifactPaths)) {
-			if (typeof artifactPath === "string" && !contract.roots.attestations[`artifactPaths.${name}`]) return false;
+			if (typeof artifactPath === "string" && !attestations[`artifactPaths.${name}`]) return false;
 		}
 	}
 	return typeof contract.roots.sessionRoot === "string"
 		&& typeof contract.roots.sessionDir === "string"
-		&& typeof contract.roots.sessionFile === "string";
+		&& typeof contract.roots.sessionFile === "string"
+		&& typeof contract.roots.asyncDir === "string"
+		&& typeof contract.roots.resultPath === "string"
+		&& typeof contract.roots.resultReservationPath === "string"
+		&& typeof contract.roots.runnerConfigPath === "string";
 }
 
 function deriveProfile(contract: SubagentLaunchContract): {
@@ -255,7 +261,7 @@ async function preflight(
 	}
 	try {
 		const params = assertManagedSpawnParams(request.input.request);
-		const candidateRunId = (options.createRunId ?? (() => randomUUID().slice(0, 8)))();
+		const candidateRunId = (options.createRunId ?? randomUUID)();
 		if (!SAFE_HOST_ID.test(candidateRunId)) throw new TypeError("Managed candidate run identity is invalid.");
 		const contractResult = await (options.resolveContract ?? resolveSubagentLaunchContract)(
 			launchContractInput(params, candidateRunId, ctx, parentSessionId, parentSessionFile, options),

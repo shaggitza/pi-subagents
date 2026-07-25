@@ -5,6 +5,7 @@ import {
 	getSpawnBudgetSnapshot,
 	grantSpawnBudget,
 	preflightSpawnBudget,
+	releaseSpawnBudgetReservation,
 	reserveSpawnBudget,
 } from "../../src/runs/shared/spawn-budget.ts";
 import type { ExtensionConfig, SubagentState } from "../../src/shared/types.ts";
@@ -59,6 +60,21 @@ describe("spawn budget", () => {
 		const rejected = reserveSpawnBudget(state, capped, "session-a", 2);
 		assert.match(rejected.error ?? "", /3\/4 used, 2 requested\).*1 remaining/);
 		assert.equal(state.subagentSpawns?.count, 3);
+	});
+
+	it("releases only a same-session bounded reservation that did not launch", () => {
+		const state = makeState();
+		reserveSpawnBudget(state, capped, "session-a", 2);
+		releaseSpawnBudgetReservation(state, "session-a", 1);
+		assert.equal(state.subagentSpawns?.count, 1);
+		releaseSpawnBudgetReservation(state, "other-session", 1);
+		assert.equal(state.subagentSpawns?.sessionId, "session-a");
+		assert.equal(state.subagentSpawns?.count, 1);
+
+		const unlimited = makeState();
+		reserveSpawnBudget(unlimited, {}, "session-a", 5);
+		releaseSpawnBudgetReservation(unlimited, "session-a", 5);
+		assert.equal(unlimited.subagentSpawns?.count, 0);
 	});
 
 	it("grants at most the original configured limit and keeps bounded audit records", () => {

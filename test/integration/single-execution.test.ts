@@ -39,11 +39,20 @@ import {
 	type SubagentDelegationV2Response,
 	type SubagentDelegationV2Started,
 } from "../../src/api/delegation.ts";
-import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT, type SubagentState } from "../../src/shared/types.ts";
+import {
+	ASYNC_DIR,
+	RESULTS_DIR,
+	INTERCOM_DETACH_REQUEST_EVENT,
+	INTERCOM_DETACH_RESPONSE_EVENT,
+	getAsyncConfigPath,
+	type SubagentState,
+} from "../../src/shared/types.ts";
 import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts";
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/shared/tool-budget.ts";
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
+import { NESTED_EVENTS_DIR } from "../../src/runs/shared/nested-events.ts";
+import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
 import { MAX_CHILD_PENDING_LINE_BYTES, MAX_CHILD_STDERR_BYTES } from "../../src/runs/shared/child-protocol.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
@@ -219,6 +228,8 @@ interface ExecutorToolResult {
 	details?: {
 		totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 		asyncId?: string;
+		asyncDir?: string;
+		runId?: string;
 		timeoutMs?: number;
 		turnBudget?: { maxTurns: number; graceTurns: number };
 		artifacts?: { dir: string; files: ArtifactPaths[] };
@@ -229,6 +240,7 @@ interface ExecutorModule {
 	createSubagentExecutor?: (...args: unknown[]) => {
 		execute: (...args: unknown[]) => Promise<ExecutorToolResult>;
 		executeDelegated: (...args: unknown[]) => Promise<ExecutorToolResult>;
+		executePreparedSpawn: (...args: unknown[]) => Promise<ExecutorToolResult>;
 	};
 }
 
@@ -792,6 +804,281 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 		assert.equal(mockPi.callCount(), 2, "both detached mock children should start before test cleanup");
+	});
+
+	it("rejects a prepared spawn before creating candidate-owned launch paths", async () => {
+		const candidate = `prepared-reject-${Date.now()}`;
+		const sessionRoot = path.join(tempDir, "prepared-reject-session");
+		const asyncDir = path.join(ASYNC_DIR, candidate);
+		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
+		const resultReservationPath = preparedResultReservationPath(resultPath);
+		const configPath = getAsyncConfigPath(candidate);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+		fs.rmSync(resultReservationPath, { force: true });
+		fs.rmSync(configPath, { force: true });
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = {
+			...baseCtx,
+			sessionManager: {
+				getSessionId: () => "session-123",
+				getSessionFile: () => parentSessionFile,
+			},
+		};
+		let callbackCount = 0;
+		const spawnState = { sessionId: "session-123", count: 0, configuredLimit: 1, granted: 0, grantHistory: [] };
+		const executor = makeExecutor([makeAgent("echo")], { maxSubagentSpawnsPerSession: 1 }, false, spawnState);
+		const result = await executor.executePreparedSpawn(
+			"prepared-reject-request",
+			{
+				agent: "echo",
+				task: "Do not launch",
+				async: true,
+				clarify: false,
+				context: "fresh",
+				cwd: tempDir,
+				sessionDir: sessionRoot,
+				artifacts: false,
+				output: false,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{
+				runId: candidate,
+				beforeLaunch: (plan: { runId: string; sessionRoot: string; sessionDir: string; sessionFile: string; asyncDir: string; resultPath: string; resultReservationPath: string; runnerConfigPath: string }) => {
+					callbackCount++;
+					assert.deepEqual({
+						runId: plan.runId,
+						sessionRoot: plan.sessionRoot,
+						sessionDir: plan.sessionDir,
+						sessionFile: plan.sessionFile,
+						asyncDir: plan.asyncDir,
+						resultPath: plan.resultPath,
+						resultReservationPath: plan.resultReservationPath,
+						runnerConfigPath: plan.runnerConfigPath,
+					}, {
+						runId: candidate,
+						sessionRoot,
+						sessionDir: path.join(sessionRoot, "run-0"),
+						sessionFile: path.join(sessionRoot, "run-0", "session.jsonl"),
+						asyncDir,
+						resultPath,
+						resultReservationPath,
+						runnerConfigPath: configPath,
+					});
+					throw new Error("test rejection must not escape");
+				},
+			},
+		);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /final authorization failed before launch/);
+		assert.equal(callbackCount, 1);
+		assert.equal(spawnState.count, 0, "pre-launch authorization rejection must release bounded spawn capacity");
+		assert.equal(fs.existsSync(sessionRoot), false);
+		assert.equal(fs.existsSync(asyncDir), false);
+		assert.equal(fs.existsSync(resultPath), false);
+		assert.equal(fs.existsSync(resultReservationPath), false);
+		assert.equal(fs.existsSync(configPath), false);
+		assert.equal(
+			fs.existsSync(NESTED_EVENTS_DIR)
+				? fs.readdirSync(NESTED_EVENTS_DIR).some((entry) => entry.startsWith(`${candidate}-`))
+				: false,
+			false,
+			"prepared spawn must not create an ordinary nested route",
+		);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rejects inherited execution and rechecks the environment after authorization", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = {
+			...baseCtx,
+			sessionManager: {
+				getSessionId: () => "session-123",
+				getSessionFile: () => parentSessionFile,
+			},
+		};
+		const executor = makeExecutor([makeAgent("echo")]);
+		const originalDepth = process.env.PI_SUBAGENT_DEPTH;
+		const params = (sessionDir: string) => ({
+			agent: "echo",
+			task: "Do not launch",
+			async: true,
+			clarify: false,
+			context: "fresh" as const,
+			cwd: tempDir,
+			sessionDir,
+			artifacts: false,
+			output: false,
+		});
+		try {
+			process.env.PI_SUBAGENT_DEPTH = "1";
+			let initialCallbackCount = 0;
+			const inherited = await executor.executePreparedSpawn(
+				"prepared-inherited-request",
+				params(path.join(tempDir, "prepared-inherited-session")),
+				new AbortController().signal,
+				undefined,
+				ctx,
+				{ runId: `prepared-inherited-${Date.now()}`, beforeLaunch: () => { initialCallbackCount++; } },
+			);
+			assert.equal(inherited.isError, true);
+			assert.match(inherited.content[0]?.text ?? "", /unavailable from inherited or nested execution/);
+			assert.equal(initialCallbackCount, 0);
+
+			delete process.env.PI_SUBAGENT_DEPTH;
+			const changedSessionRoot = path.join(tempDir, "prepared-environment-changed-session");
+			let changedCallbackCount = 0;
+			const changed = await executor.executePreparedSpawn(
+				"prepared-environment-changed-request",
+				params(changedSessionRoot),
+				new AbortController().signal,
+				undefined,
+				ctx,
+				{
+					runId: `prepared-environment-changed-${Date.now()}`,
+					beforeLaunch: () => {
+						changedCallbackCount++;
+						process.env.PI_SUBAGENT_DEPTH = "1";
+					},
+				},
+			);
+			assert.equal(changed.isError, true);
+			assert.match(changed.content[0]?.text ?? "", /environment changed after final authorization/);
+			assert.equal(changedCallbackCount, 1);
+			assert.equal(fs.existsSync(changedSessionRoot), false);
+			assert.equal(mockPi.callCount(), 0);
+		} finally {
+			if (originalDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+			else process.env.PI_SUBAGENT_DEPTH = originalDepth;
+		}
+	});
+
+	it("retains candidate ownership evidence after a post-authorization config collision", async () => {
+		const candidate = `prepared-config-collision-${Date.now()}`;
+		const sessionRoot = path.join(tempDir, "prepared-config-collision-session");
+		const asyncDir = path.join(ASYNC_DIR, candidate);
+		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
+		const resultReservationPath = preparedResultReservationPath(resultPath);
+		const configPath = getAsyncConfigPath(candidate);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+		fs.rmSync(resultReservationPath, { force: true });
+		fs.writeFileSync(configPath, "occupied", "utf8");
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = {
+			...baseCtx,
+			sessionManager: {
+				getSessionId: () => "session-123",
+				getSessionFile: () => parentSessionFile,
+			},
+		};
+		let callbackCount = 0;
+		const executor = makeExecutor([makeAgent("echo")]);
+		const result = await executor.executePreparedSpawn(
+			"prepared-config-collision-request",
+			{
+				agent: "echo",
+				task: "Do not start through an occupied config",
+				async: true,
+				clarify: false,
+				context: "fresh",
+				cwd: tempDir,
+				sessionDir: sessionRoot,
+				artifacts: false,
+				output: false,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{ runId: candidate, beforeLaunch: () => { callbackCount++; } },
+		);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
+		assert.equal(callbackCount, 1);
+		assert.equal(mockPi.callCount(), 0);
+		assert.equal(fs.existsSync(sessionRoot), true);
+		assert.equal(fs.existsSync(asyncDir), true);
+		assert.equal(fs.existsSync(resultReservationPath), true, "post-boundary collision must retain candidate ownership evidence");
+		assert.equal(fs.existsSync(resultPath), false);
+		assert.equal(fs.readFileSync(configPath, "utf8"), "occupied");
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultReservationPath, { force: true });
+		fs.rmSync(configPath, { force: true });
+	});
+
+	it("uses one prepared candidate identity for async, result, config, and canonical session paths", async () => {
+		mockPi.onCall({ output: "prepared finished" });
+		const candidate = `prepared-success-${Date.now()}`;
+		const sessionRoot = path.join(tempDir, "prepared-success-session");
+		const asyncDir = path.join(ASYNC_DIR, candidate);
+		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
+		const resultReservationPath = preparedResultReservationPath(resultPath);
+		const configPath = getAsyncConfigPath(candidate);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+		fs.rmSync(resultReservationPath, { force: true });
+		fs.rmSync(configPath, { force: true });
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = {
+			...baseCtx,
+			sessionManager: {
+				getSessionId: () => "session-123",
+				getSessionFile: () => parentSessionFile,
+			},
+		};
+		let callbackCount = 0;
+		const executor = makeExecutor([makeAgent("echo")]);
+		const result = await executor.executePreparedSpawn(
+			"prepared-success-request",
+			{
+				agent: "echo",
+				task: "Finish once",
+				async: true,
+				clarify: false,
+				context: "fresh",
+				cwd: tempDir,
+				sessionDir: sessionRoot,
+				artifacts: false,
+				output: false,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{
+				runId: candidate,
+				beforeLaunch: () => { callbackCount++; },
+			},
+		);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.runId, candidate);
+		assert.equal(result.details?.asyncId, candidate);
+		assert.equal(result.details?.asyncDir, asyncDir);
+		assert.equal(callbackCount, 1);
+		assert.equal(fs.existsSync(sessionRoot), true);
+
+		const deadlineAt = Date.now() + 30_000;
+		while ((!fs.existsSync(resultPath) || !fs.existsSync(path.join(asyncDir, "process-terminal.json"))) && Date.now() < deadlineAt) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(fs.existsSync(resultPath), true);
+		assert.equal(fs.existsSync(path.join(sessionRoot, "run-0", "session.jsonl")), true);
+		assert.equal(fs.existsSync(resultReservationPath), false, "runner must release the candidate-bound result reservation after publication");
+		assert.equal(fs.existsSync(configPath), false, "runner must consume the candidate-bound transient config");
+		assert.equal(mockPi.callCount(), 1);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+		fs.rmSync(resultReservationPath, { force: true });
+		fs.rmSync(configPath, { force: true });
 	});
 
 	it("does not impose a cumulative spawn cap by default", async () => {

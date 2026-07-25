@@ -17,6 +17,27 @@ import { runSync } from "./execution.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
 import type { MainWatchdogRuntime } from "../../watchdog/runtime.ts";
 import { buildModelCandidates, resolveEffectiveSubagentModel, resolveModelCandidate } from "../shared/model-fallback.ts";
+import {
+	SUBAGENT_CHILD_AGENT_ENV,
+	SUBAGENT_CHILD_ENV,
+	SUBAGENT_CHILD_INDEX_ENV,
+	SUBAGENT_FANOUT_CHILD_ENV,
+	SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
+	SUBAGENT_ORCHESTRATOR_TARGET_ENV,
+	SUBAGENT_RUN_ID_ENV,
+	SUBAGENT_STEER_ACK_DIR_ENV,
+	SUBAGENT_STEER_CAPABILITY_ENV,
+	SUBAGENT_STEER_INBOX_ENV,
+	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
+	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
+	SUBAGENT_PARENT_CHILD_INDEX_ENV,
+	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
+	SUBAGENT_PARENT_DEPTH_ENV,
+	SUBAGENT_PARENT_EVENT_SINK_ENV,
+	SUBAGENT_PARENT_PATH_ENV,
+	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
+	SUBAGENT_PARENT_RUN_ID_ENV,
+} from "../shared/pi-args.ts";
 import type { ModelScopeConfig } from "../shared/model-scope.ts";
 import { aggregateParallelOutputs } from "../shared/parallel-utils.ts";
 import { recordRun } from "../shared/run-history.ts";
@@ -36,6 +57,11 @@ import {
 } from "../../shared/settings.ts";
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
 import { buildAsyncRunnerSteps, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable } from "../background/async-execution.ts";
+import {
+	createPreparedResultReservation,
+	preparedResultReservationPath,
+	type PreparedResultReservationV1,
+} from "../background/prepared-result-reservation.ts";
 import type { ScheduledRunAction } from "../background/scheduled-runs.ts";
 import { enqueueChainAppendRequest, readPendingChainAppendRequests, runnerStepOutputNames } from "../background/chain-append.ts";
 import { ChainOutputValidationError, validateChainOutputBindingsWithContext } from "../shared/chain-outputs.ts";
@@ -45,7 +71,15 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
-import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
+import {
+	formatSpawnBudget,
+	getSpawnBudgetSnapshot,
+	grantSpawnBudget,
+	preflightSpawnBudget,
+	preflightSpawnBudgetGrant,
+	releaseSpawnBudgetReservation,
+	reserveSpawnBudget,
+} from "../shared/spawn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { isAgentContractV1 } from "../shared/agent-contract.ts";
@@ -116,6 +150,7 @@ import {
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
 	SUBAGENT_FOREGROUND_COMPLETE_EVENT,
+	getAsyncConfigPath,
 	checkSubagentDepth,
 	resolveTopLevelParallelConcurrency,
 	resolveTopLevelParallelMaxTasks,
@@ -192,6 +227,32 @@ export interface SubagentParamsLike {
 	additional?: number;
 }
 
+/** Planned identities for an additive prepared spawn before any launch path is created. */
+export interface PreparedSubagentSpawnPlan {
+	runId: string;
+	parentSessionId: string;
+	parentSessionFile: string;
+	cwd: string;
+	sessionRoot: string;
+	sessionDir: string;
+	sessionFile: string;
+	asyncDir: string;
+	resultPath: string;
+	resultReservationPath: string;
+	runnerConfigPath: string;
+	artifactsDir?: string;
+}
+
+export interface PreparedSubagentSpawnOptions {
+	/** Host-generated identity already bound by managed preflight. */
+	runId: string;
+	/**
+	 * Final fail-closed authorization boundary. A successful callback means all
+	 * later failures are post-dispatch and must be reconciled, never relaunched.
+	 */
+	beforeLaunch(plan: Readonly<PreparedSubagentSpawnPlan>): void | Promise<void>;
+}
+
 interface ExecutorDeps {
 	pi: ExtensionAPI;
 	state: SubagentState;
@@ -242,6 +303,8 @@ interface ExecutionContextData {
 	modelScope?: ModelScopeConfig;
 	parentSessionId: string | null;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	preparedSpawn?: PreparedSubagentSpawnOptions;
+	preparedResultReservation?: PreparedResultReservationV1;
 }
 
 function resolveRequestedCwd(runtimeCwd: string, requestedCwd: string | undefined): string {
@@ -1998,6 +2061,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		ctx,
 		shareEnabled,
 		sessionRoot,
+		sessionDirForIndex,
 		sessionFileForIndex,
 		sessionFileForTask,
 		thinkingOverrideForTask,
@@ -2043,7 +2107,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			details: { mode: "single" as const, results: [] },
 		};
 	}
-	const id = randomUUID();
+	const id = data.preparedSpawn?.runId ?? randomUUID();
 	const asyncCtx = {
 		pi: deps.pi,
 		cwd: ctx.cwd,
@@ -2188,6 +2252,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			artifactConfig,
 			shareEnabled,
 			sessionRoot,
+			...(data.preparedSpawn ? {
+				sessionDir: sessionDirForIndex(0),
+				exclusiveRunPaths: true,
+				preparedResultReservation: data.preparedResultReservation,
+			} : {}),
 			sessionFile: sessionFileForTask(params.agent!, 0, modelOverride),
 			context: contextPolicy.contextForAgent(params.agent!),
 			skills,
@@ -3420,6 +3489,68 @@ function omitExecutionModeActionAlias(params: SubagentParamsLike): SubagentParam
 	return params;
 }
 
+const PREPARED_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/;
+const NESTED_EXECUTION_ENV = [
+	SUBAGENT_CHILD_AGENT_ENV,
+	SUBAGENT_CHILD_ENV,
+	SUBAGENT_CHILD_INDEX_ENV,
+	SUBAGENT_FANOUT_CHILD_ENV,
+	SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
+	SUBAGENT_ORCHESTRATOR_TARGET_ENV,
+	SUBAGENT_RUN_ID_ENV,
+	SUBAGENT_STEER_ACK_DIR_ENV,
+	SUBAGENT_STEER_CAPABILITY_ENV,
+	SUBAGENT_STEER_INBOX_ENV,
+	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
+	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
+	SUBAGENT_PARENT_CHILD_INDEX_ENV,
+	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
+	SUBAGENT_PARENT_DEPTH_ENV,
+	SUBAGENT_PARENT_EVENT_SINK_ENV,
+	SUBAGENT_PARENT_PATH_ENV,
+	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
+	SUBAGENT_PARENT_RUN_ID_ENV,
+	"PI_SUBAGENT_DEPTH",
+	"PI_SUBAGENT_MAX_DEPTH",
+] as const;
+
+function preparedExecutionEnvironmentIsClean(): boolean {
+	return NESTED_EXECUTION_ENV.every((name) => process.env[name] === undefined);
+}
+
+function validatePreparedSpawnRequest(params: SubagentParamsLike, options: PreparedSubagentSpawnOptions): string | undefined {
+	if (!PREPARED_RUN_ID.test(options.runId)) return "Prepared spawn requires a safe host-generated run identity.";
+	if (typeof options.beforeLaunch !== "function") return "Prepared spawn requires a final authorization callback.";
+	if (params.action !== undefined || params.tasks !== undefined || params.chain !== undefined) {
+		return "Prepared spawn supports ordinary single-agent execution only.";
+	}
+	if (typeof params.agent !== "string" || !params.agent || typeof params.task !== "string" || !params.task) {
+		return "Prepared spawn requires a non-empty agent and task.";
+	}
+	if (params.async !== true || params.clarify !== false || params.context !== "fresh") {
+		return "Prepared spawn requires async=true, clarify=false, and context='fresh'.";
+	}
+	if (typeof params.cwd !== "string" || !path.isAbsolute(params.cwd)) {
+		return "Prepared spawn requires an absolute cwd.";
+	}
+	if (typeof params.sessionDir !== "string" || !path.isAbsolute(params.sessionDir)) {
+		return "Prepared spawn requires an explicit absolute sessionDir.";
+	}
+	if (params.worktree === true) return "Prepared spawn does not support worktrees.";
+	if (!preparedExecutionEnvironmentIsClean()) {
+		return "Prepared spawn is unavailable from inherited or nested execution.";
+	}
+	return undefined;
+}
+
+function preparedSpawnError(message: string): AgentToolResult<Details> {
+	return {
+		content: [{ type: "text", text: message }],
+		isError: true,
+		details: { mode: "single", results: [] },
+	};
+}
+
 export function createSubagentExecutor(deps: ExecutorDeps): {
 	execute: (
 		id: string,
@@ -3440,9 +3571,19 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
+	/** Additive, unregistered prepared-spawn seam. It is not capability evidence. */
+	executePreparedSpawn: (
+		id: string,
+		params: SubagentParamsLike,
+		signal: AbortSignal,
+		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
+		ctx: ExtensionContext,
+		options: PreparedSubagentSpawnOptions,
+	) => Promise<AgentToolResult<Details>>;
 } {
 	const delegatedThinkingOverrides = new WeakMap<object, AgentConfig["thinking"]>();
 	const delegatedZeroToolBudgets = new WeakSet<object>();
+	const preparedSpawns = new WeakMap<object, PreparedSubagentSpawnOptions>();
 	const execute = async (
 		_id: string,
 		params: SubagentParamsLike,
@@ -3452,6 +3593,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 	): Promise<AgentToolResult<Details>> => {
 		const delegatedThinkingOverride = delegatedThinkingOverrides.get(params);
 		const allowZeroToolBudget = delegatedZeroToolBudgets.has(params);
+		const preparedSpawn = preparedSpawns.get(params);
 		deps.state.baseCwd = ctx.cwd;
 		deps.state.foregroundRuns ??= new Map();
 		deps.state.foregroundControls ??= new Map();
@@ -3844,17 +3986,17 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		effectiveParams = contextPolicy.params;
 		const sessionName = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());
 		const intercomBridge = resolveIntercomBridge({
-			config: deps.config.intercomBridge,
+			config: preparedSpawn ? { mode: "off" } : deps.config.intercomBridge,
 			context: effectiveParams.context ?? (contextPolicy.usesFork ? "fork" : undefined),
 			orchestratorTarget: sessionName,
 		});
 		const agents = intercomBridge.active
 			? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))
 			: discoveredAgents;
-		const runId = randomUUID().slice(0, 8);
-		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
+		const runId = preparedSpawn?.runId ?? randomUUID().slice(0, 8);
+		const inheritedNestedRoute = preparedSpawn ? undefined : resolveInheritedNestedRouteFromEnv();
 		const nestedParentAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
-		const nestedRoute = inheritedNestedRoute ?? createNestedRoute(runId);
+		const nestedRoute = preparedSpawn ? undefined : inheritedNestedRoute ?? createNestedRoute(runId);
 		const shareEnabled = effectiveParams.share === true;
 		const hasChain = (effectiveParams.chain?.length ?? 0) > 0;
 		const hasTasks = (effectiveParams.tasks?.length ?? 0) > 0;
@@ -3941,15 +4083,17 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				: deps.getSubagentSessionRoot(parentSessionFile);
 			sessionRoot = path.join(baseSessionRoot, runId);
 		}
-		try {
-			fs.mkdirSync(sessionRoot, { recursive: true });
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			return toExecutionErrorResult(
-				effectiveParams,
-				new Error(`Failed to create session directory '${sessionRoot}': ${message}`),
-				contextPolicy.contextSummary,
-			);
+		if (!preparedSpawn) {
+			try {
+				fs.mkdirSync(sessionRoot, { recursive: true });
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return toExecutionErrorResult(
+					effectiveParams,
+					new Error(`Failed to create session directory '${sessionRoot}': ${message}`),
+					contextPolicy.contextSummary,
+				);
+			}
 		}
 		const sessionDirForIndex = (idx?: number) =>
 			path.join(sessionRoot, `run-${idx ?? 0}`);
@@ -3983,6 +4127,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			? (r: AgentToolResult<Details>) => onUpdate(withResolvedContext(r, contextPolicy.contextSummary))
 			: undefined;
 
+		if (preparedSpawn && (!deps.state.currentSessionId || !parentSessionFile)) {
+			return preparedSpawnError("Prepared spawn requires an active persisted parent session.");
+		}
 		const reservation = reserveSpawnBudget(
 			deps.state,
 			deps.config,
@@ -3990,6 +4137,58 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			requestedSpawns,
 		);
 		if (reservation.error) return spawnBudgetErrorResult(reservation.error, foregroundMode);
+
+		let preparedResultReservation: PreparedResultReservationV1 | undefined;
+		if (preparedSpawn && deps.state.currentSessionId && parentSessionFile) {
+			const resultPath = path.join(RESULTS_DIR, `${runId}.json`);
+			const plan: PreparedSubagentSpawnPlan = Object.freeze({
+				runId,
+				parentSessionId: deps.state.currentSessionId,
+				parentSessionFile,
+				cwd: effectiveCwd,
+				sessionRoot,
+				sessionDir: sessionDirForIndex(0),
+				sessionFile: childSessionFileForIndex(0),
+				asyncDir: path.join(ASYNC_DIR, runId),
+				resultPath,
+				resultReservationPath: preparedResultReservationPath(resultPath),
+				runnerConfigPath: getAsyncConfigPath(runId),
+				...(artifactConfig.enabled ? { artifactsDir } : {}),
+			});
+			try {
+				await preparedSpawn.beforeLaunch(plan);
+			} catch {
+				releaseSpawnBudgetReservation(
+					deps.state,
+					plan.parentSessionId,
+					requestedSpawns,
+				);
+				return preparedSpawnError("Prepared spawn final authorization failed before launch.");
+			}
+			if (!preparedExecutionEnvironmentIsClean()) {
+				return preparedSpawnError("Prepared spawn environment changed after final authorization.");
+			}
+			try {
+				preparedResultReservation = createPreparedResultReservation(runId, resultPath);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return toExecutionErrorResult(
+					effectiveParams,
+					new Error(`Failed to reserve exclusive prepared result '${resultPath}': ${message}`),
+					contextPolicy.contextSummary,
+				);
+			}
+			try {
+				fs.mkdirSync(sessionRoot, { mode: 0o700 });
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return toExecutionErrorResult(
+					effectiveParams,
+					new Error(`Failed to create exclusive prepared session directory '${sessionRoot}': ${message}`),
+					contextPolicy.contextSummary,
+				);
+			}
+		}
 
 		const execData: ExecutionContextData = {
 			params: effectiveParams,
@@ -4021,6 +4220,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			modelScope,
 			parentSessionId: deps.state.currentSessionId,
 			capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(deps.state.currentSessionId ?? undefined),
+			...(preparedSpawn ? { preparedSpawn } : {}),
+			...(preparedResultReservation ? { preparedResultReservation } : {}),
 		};
 
 		const foregroundDescription = effectiveParams.task?.trim()
@@ -4194,5 +4395,25 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		return execute(id, delegatedParams, signal, onUpdate, ctx);
 	};
 
-	return { execute: executeWithSingleDispatchGuard, executeDelegated };
+	const executePreparedSpawn = async (
+		id: string,
+		params: SubagentParamsLike,
+		signal: AbortSignal,
+		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
+		ctx: ExtensionContext,
+		options: PreparedSubagentSpawnOptions,
+	): Promise<AgentToolResult<Details>> => {
+		if (!options || typeof options !== "object") return preparedSpawnError("Prepared spawn options are invalid.");
+		const validationError = validatePreparedSpawnRequest(params, options);
+		if (validationError) return preparedSpawnError(validationError);
+		const preparedParams = { ...params };
+		preparedSpawns.set(preparedParams, Object.freeze({ ...options }));
+		try {
+			return await execute(id, preparedParams, signal, onUpdate, ctx);
+		} finally {
+			preparedSpawns.delete(preparedParams);
+		}
+	};
+
+	return { execute: executeWithSingleDispatchGuard, executeDelegated, executePreparedSpawn };
 }

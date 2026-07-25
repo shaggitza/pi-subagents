@@ -10,9 +10,19 @@ import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } f
 import { normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
-import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
+import {
+	ASYNC_DIR,
+	RESULTS_DIR,
+	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
+	getAsyncConfigPath,
+	type ArtifactDirPreference,
+	type ArtifactPaths,
+	type JsonSchemaObject,
+	type OutputMode,
+} from "../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
+import { preparedResultReservationPath } from "../runs/background/prepared-result-reservation.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
 
 export const SUBAGENT_LAUNCH_CONTRACT_VERSION = 1 as const;
@@ -125,6 +135,14 @@ export interface SubagentLaunchContractRoots {
 	artifactsDir?: string;
 	artifactPaths?: ArtifactPaths;
 	outputPath?: string;
+	/** Managed async-run root containing status, recovery, logs, and process proof. */
+	asyncDir?: string;
+	/** Managed terminal result sidecar outside asyncDir. */
+	resultPath?: string;
+	/** Exclusive ownership record retained until the managed result is published. */
+	resultReservationPath?: string;
+	/** Managed transient runner config path outside asyncDir. */
+	runnerConfigPath?: string;
 	/** Identity evidence for every declared write/evidence path before creation. */
 	attestations?: Record<string, SubagentLaunchRootAttestation>;
 }
@@ -347,6 +365,15 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		return { ok: false, code: "missing_skill", message: `Missing skills: ${resolvedSkills.missing.join(", ")}`, diagnostics };
 	}
 	const sessionFile = sessionDir ? path.join(sessionDir, "session.jsonl") : undefined;
+	const managedResultPath = path.join(RESULTS_DIR, `${runId}.json`);
+	const managedRuntimePaths: Partial<Pick<SubagentLaunchContractRoots, "asyncDir" | "resultPath" | "resultReservationPath" | "runnerConfigPath">> = input.identityMode === "managed-v1"
+		? {
+				asyncDir: path.join(ASYNC_DIR, runId),
+				resultPath: managedResultPath,
+				resultReservationPath: preparedResultReservationPath(managedResultPath),
+				runnerConfigPath: getAsyncConfigPath(runId),
+			}
+		: {};
 	const attestationPaths: Record<string, { path: string | undefined; kind: "directory" | "file" }> = {
 		cwd: { path: effectiveCwd, kind: "directory" },
 		sessionRoot: { path: sessionRoot, kind: "directory" },
@@ -354,6 +381,10 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		sessionFile: { path: sessionFile, kind: "file" },
 		artifactsDir: { path: artifactsDir, kind: "directory" },
 		outputPath: { path: outputPath, kind: "file" },
+		asyncDir: { path: managedRuntimePaths.asyncDir, kind: "directory" },
+		resultPath: { path: managedRuntimePaths.resultPath, kind: "file" },
+		resultReservationPath: { path: managedRuntimePaths.resultReservationPath, kind: "file" },
+		runnerConfigPath: { path: managedRuntimePaths.runnerConfigPath, kind: "file" },
 	};
 	if (artifactPaths) {
 		for (const [name, artifactPath] of Object.entries(artifactPaths)) {
@@ -433,6 +464,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			...(artifactsDir ? { artifactsDir } : {}),
 			...(artifactPaths ? { artifactPaths } : {}),
 			...(outputPath ? { outputPath } : {}),
+			...managedRuntimePaths,
 			...(rootAttestations ? { attestations: rootAttestations } : {}),
 		},
 		protocol: {

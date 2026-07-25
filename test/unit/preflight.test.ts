@@ -7,6 +7,8 @@ import { registerSubagentCapabilityCeiling, resolveSubagentCapabilityCeiling } f
 import { resolveSubagentLaunchContract, SUBAGENT_LAUNCH_CONTRACT_VERSION } from "../../src/api/preflight.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
+import { ASYNC_DIR, RESULTS_DIR, getAsyncConfigPath } from "../../src/shared/types.ts";
+import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
 
 let tempDir = "";
 let previousHome: string | undefined;
@@ -126,6 +128,10 @@ Project prompt.
 			assert.equal(result.contract.tools.disableAmbientExtensions, true);
 			assert.equal(result.contract.roots.sessionFile, path.join(sessionRoot, "run-123", "run-0", "session.jsonl"));
 			assert.equal(result.contract.roots.outputPath, path.join(cwd, ".pi-subagents", "artifacts", "outputs", "run-123", "report.md"));
+			assert.equal(result.contract.roots.asyncDir, path.join(ASYNC_DIR, "run-123"));
+			assert.equal(result.contract.roots.resultPath, path.join(RESULTS_DIR, "run-123.json"));
+			assert.equal(result.contract.roots.resultReservationPath, preparedResultReservationPath(path.join(RESULTS_DIR, "run-123.json")));
+			assert.equal(result.contract.roots.runnerConfigPath, getAsyncConfigPath("run-123"));
 			const attestations = result.contract.roots.attestations;
 			assert.ok(attestations);
 			assert.deepEqual(
@@ -137,8 +143,12 @@ Project prompt.
 					"artifactPaths.outputPath",
 					"artifactPaths.transcriptPath",
 					"artifactsDir",
+					"asyncDir",
 					"cwd",
 					"outputPath",
+					"resultPath",
+					"resultReservationPath",
+					"runnerConfigPath",
 					"sessionDir",
 					"sessionFile",
 					"sessionRoot",
@@ -228,6 +238,10 @@ Exact session path prompt.
 		assert.equal(result.contract.roots.sessionRoot, sessionRoot);
 		assert.equal(result.contract.roots.sessionDir, path.join(sessionRoot, "run-0"));
 		assert.equal(result.contract.roots.sessionFile, path.join(sessionRoot, "run-0", "session.jsonl"));
+		assert.equal(result.contract.roots.asyncDir, path.join(ASYNC_DIR, "candidate-1"));
+		assert.equal(result.contract.roots.resultPath, path.join(RESULTS_DIR, "candidate-1.json"));
+		assert.equal(result.contract.roots.resultReservationPath, preparedResultReservationPath(path.join(RESULTS_DIR, "candidate-1.json")));
+		assert.equal(result.contract.roots.runnerConfigPath, getAsyncConfigPath("candidate-1"));
 		assert.equal(result.contract.roots.attestations?.sessionDir.path, path.join(sessionRoot, "run-0"));
 		assert.equal(result.contract.roots.attestations?.sessionDir.existingAncestorRealPath, fs.realpathSync(tempDir));
 		assert.equal(fs.existsSync(sessionRoot), false);

@@ -58,6 +58,7 @@ import type { SessionLeaseRequest } from "../shared/session-lease.ts";
 import { finalizeProcessTerminal, readProcessTerminal } from "./process-terminal.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
 import { resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
+import { assertPreparedResultReservation, type PreparedResultReservationV1 } from "./prepared-result-reservation.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -179,6 +180,9 @@ interface AsyncSingleParams {
 	sessionRoot?: string;
 	sessionDir?: string;
 	sessionFile?: string;
+	/** Prepared-spawn mode requires exclusive candidate-owned run paths. */
+	exclusiveRunPaths?: boolean;
+	preparedResultReservation?: PreparedResultReservationV1;
 	revivalLease?: SessionLeaseRequest;
 	context?: ContextMode;
 	skills?: string[];
@@ -404,7 +408,13 @@ function terminateRunnerBeforeProceed(pid: number): void {
 	}
 }
 
-function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal?: (proof: unknown) => void): { pid?: number; error?: string } {
+function spawnRunner(
+	cfg: object,
+	suffix: string,
+	cwd: string,
+	onProcessTerminal?: (proof: unknown) => void,
+	options: { exclusiveConfigPath?: boolean } = {},
+): { pid?: number; error?: string } {
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
 	}
@@ -422,7 +432,11 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal
 	const cfgPath = getAsyncConfigPath(suffix);
 	const runnerProcessInstanceId = randomUUID();
 	const launchConfig = { ...cfg, runnerProcessInstanceId };
-	fs.writeFileSync(cfgPath, JSON.stringify(launchConfig));
+	if (options.exclusiveConfigPath) {
+		fs.writeFileSync(cfgPath, JSON.stringify(launchConfig), { encoding: "utf8", flag: "wx", mode: 0o600 });
+	} else {
+		fs.writeFileSync(cfgPath, JSON.stringify(launchConfig));
+	}
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 	const nodeCommand = resolveAsyncRunnerNodeCommand();
 	const startupPath = typeof (launchConfig as { revivalLease?: unknown; asyncDir?: unknown }).revivalLease === "object"
@@ -1172,13 +1186,28 @@ export function executeAsyncSingle(
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${memoryInjection}` : memoryInjection;
 	}
 
-	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
+	const inheritedNestedRoute = params.exclusiveRunPaths ? undefined : resolveInheritedNestedRouteFromEnv();
 	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(ASYNC_DIR, id);
+	const resultPath = inheritedNestedRoute
+		? nestedResultsPath(inheritedNestedRoute.rootRunId, id)
+		: path.join(RESULTS_DIR, `${id}.json`);
 	try {
-		fs.mkdirSync(asyncDir, { recursive: true });
+		if (params.exclusiveRunPaths) {
+			if (
+				!params.preparedResultReservation
+				|| params.preparedResultReservation.runId !== id
+				|| params.preparedResultReservation.resultPath !== resultPath
+			) {
+				throw new Error("prepared result reservation does not match the candidate run");
+			}
+			assertPreparedResultReservation(params.preparedResultReservation);
+			fs.mkdirSync(asyncDir, { mode: 0o700 });
+		} else {
+			fs.mkdirSync(asyncDir, { recursive: true });
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return {
@@ -1309,7 +1338,8 @@ export function executeAsyncSingle(
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
 					},
 				],
-				resultPath: inheritedNestedRoute ? nestedResultsPath(inheritedNestedRoute.rootRunId, id) : path.join(RESULTS_DIR, `${id}.json`),
+				resultPath,
+				...(params.preparedResultReservation ? { preparedResultReservation: params.preparedResultReservation } : {}),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,
@@ -1345,6 +1375,7 @@ export function executeAsyncSingle(
 			id,
 			runnerCwd,
 			(proof) => ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof),
+			{ exclusiveConfigPath: params.exclusiveRunPaths === true },
 		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

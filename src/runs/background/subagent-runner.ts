@@ -105,6 +105,11 @@ import { formatParallelHandoffError, formatParallelHandoffReference, parallelHan
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
+import {
+	assertPreparedResultReservation,
+	releasePreparedResultReservation,
+	type PreparedResultReservationV1,
+} from "./prepared-result-reservation.ts";
 import type { ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import {
 	CHILD_WATCHDOG_CONFIG_ENV,
@@ -120,6 +125,7 @@ interface SubagentRunConfig {
 	id: string;
 	steps: RunnerStep[];
 	resultPath: string;
+	preparedResultReservation?: PreparedResultReservationV1;
 	cwd: string;
 	placeholder: string;
 	taskIndex?: number;
@@ -3907,6 +3913,7 @@ async function runSubagent(
 	});
 
 	try {
+		if (config.preparedResultReservation) assertPreparedResultReservation(config.preparedResultReservation);
 		writeAtomicJson(resultPath, {
 			lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 			id,
@@ -3984,6 +3991,7 @@ async function runSubagent(
 			...(taskIndex !== undefined && { taskIndex }),
 			...(totalTasks !== undefined && { totalTasks }),
 		});
+		if (config.preparedResultReservation) releasePreparedResultReservation(config.preparedResultReservation);
 	} catch (err) {
 		console.error(`Failed to write result file ${resultPath}:`, err);
 	}
@@ -4050,6 +4058,7 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 	};
 	process.once("exit", releaseOnExit);
 	try {
+		if (config.preparedResultReservation) assertPreparedResultReservation(config.preparedResultReservation);
 		if (config.revivalLease) {
 			lease = acquireSessionLease(config.revivalLease);
 			config.revivalLeaseToken = lease.owner.token;
