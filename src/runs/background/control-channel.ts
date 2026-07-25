@@ -337,14 +337,14 @@ function ensurePrivateManagedDirectory(asyncDir: string, directory: string): voi
 	if (directory !== control && !directory.startsWith(`${control}${path.sep}`)) throw new Error("managed control path escapes its private inbox.");
 	let current = control;
 	fs.mkdirSync(current, { recursive: true, mode: 0o700 });
-	fs.chmodSync(current, 0o700);
+	if ((fs.statSync(current).mode & 0o777) !== 0o700) fs.chmodSync(current, 0o700);
 	const relative = path.relative(control, directory);
 	for (const segment of relative.split(path.sep).filter(Boolean)) {
 		current = path.join(current, segment);
 		try { fs.mkdirSync(current, { mode: 0o700 }); } catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		fs.chmodSync(current, 0o700);
+		if ((fs.statSync(current).mode & 0o777) !== 0o700) fs.chmodSync(current, 0o700);
 	}
 }
 

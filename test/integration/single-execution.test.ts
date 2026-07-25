@@ -28,6 +28,7 @@ import {
 import registerSubagentExtension from "../../src/extension/index.ts";
 import {
 	SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT,
+	computeManagedRequestDigest,
 	managedDispatchReplyEvent,
 } from "../../src/api/managed-dispatch.ts";
 import {
@@ -57,6 +58,16 @@ import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/share
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
 import { NESTED_EVENTS_DIR } from "../../src/runs/shared/nested-events.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
+import {
+	enqueueManagedStepSteer,
+	managedControlAckPath,
+	managedControlConsumedPath,
+	publishManagedControlRequest,
+	readManagedControlAck,
+	stepSteerInboxDir,
+	writeSteerAck,
+	writeSteerCapability,
+} from "../../src/runs/background/control-channel.ts";
 import {
 	computePreparedRunnerAdmissionTokenDigest,
 	preparedRunnerAdmissionPaths,
@@ -3943,6 +3954,101 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(intercomResult.exitCode, -2);
 		assert.equal(intercomResult.detached, true);
 		assert.equal(firstDetachResponse, true);
+	});
+
+	it("keeps managed steer pending until the exact child ack and fails every rejected delivery path", async () => {
+		const candidate = `managed-steer-runner-${Date.now()}`;
+		const sessionRoot = path.join(tempDir, "managed-steer-runner-session");
+		const asyncDir = path.join(ASYNC_DIR, candidate);
+		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
+		for (const target of [asyncDir, sessionRoot]) fs.rmSync(target, { recursive: true, force: true });
+		for (const target of [resultPath, preparedResultReservationPath(resultPath), getAsyncConfigPath(candidate)]) fs.rmSync(target, { force: true });
+		mockPi.onCall({ output: "managed steer finished", delay: 8_000 });
+		const parentSessionFile = path.join(tempDir, "managed-steer-parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = { ...baseCtx, sessionManager: { getSessionId: () => "session-123", getSessionFile: () => parentSessionFile } };
+		const executor = makeExecutor([makeAgent("echo")]);
+		const actorOperationId = Buffer.alloc(32, 9).toString("base64url");
+		let runnerProcessInstanceId = "";
+		let firstCommandId = "";
+		const publishSteer = (byte: number, message: string, runner = runnerProcessInstanceId, requestedAt = Date.now()): string => {
+			const commandId = Buffer.alloc(32, byte).toString("base64url");
+			const semantic = {
+				version: 1,
+				requestId: `managed-steer-${byte}`,
+				method: "steer",
+				managed: { version: 1, consumerId: "pi-signal", operationId: commandId },
+				input: { target: { consumerId: "pi-signal", operationId: actorOperationId }, message },
+			};
+			publishManagedControlRequest(asyncDir, {
+				commandId,
+				commandRequestDigest: computeManagedRequestDigest(semantic),
+				consumerId: "pi-signal",
+				targetOperationId: actorOperationId,
+				actorOperationId,
+				actorRequestDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				runId: candidate,
+				runnerProcessInstanceId: runner,
+				method: "steer",
+				message,
+				requestedAt,
+			});
+			return commandId;
+		};
+		const result = await executor.executePreparedSpawn(
+			"managed-steer-runner-request",
+			{ agent: "echo", task: "Wait for managed guidance", async: true, clarify: false, context: "fresh", cwd: tempDir, sessionDir: sessionRoot, artifacts: false, output: false },
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{
+				runId: candidate,
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				...preparedTerminalOptions(candidate),
+				beforeLaunch: () => undefined,
+				afterAuthorization: () => undefined,
+				onRunnerReady: () => undefined,
+				onRunnerAccepted: (evidence) => {
+					runnerProcessInstanceId = evidence.runnerProcessInstanceId;
+					firstCommandId = publishSteer(60, "pending managed guidance", runnerProcessInstanceId, 100);
+				},
+			},
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		const waitFor = async (predicate: () => boolean, message: string, timeoutMs = 5_000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs;
+			while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.equal(predicate(), true, message);
+		};
+		await waitFor(() => fs.existsSync(managedControlConsumedPath(asyncDir, firstCommandId)), "runner must durably consume pending managed steer");
+		await waitFor(() => fs.existsSync(stepSteerInboxDir(asyncDir, 0)) && fs.readdirSync(stepSteerInboxDir(asyncDir, 0)).length > 0, "pending managed steer must be retained and routed when child starts");
+		assert.equal(fs.existsSync(managedControlAckPath(asyncDir, firstCommandId)), false, "managed ack must not precede child Pi acceptance");
+		writeSteerAck(asyncDir, { requestId: firstCommandId, index: 0, ts: Date.now(), state: "delivered", message: "accepted by child Pi" });
+		await waitFor(() => readManagedControlAck(asyncDir, firstCommandId)?.outcome === "acknowledged", "correlated child ack must complete managed steer");
+
+		const wrongRunnerCommand = publishSteer(64, "wrong runner", "wrong-runner-instance");
+		await waitFor(() => readManagedControlAck(asyncDir, wrongRunnerCommand)?.outcome === "failed", "runner identity mismatch must fail managed steer");
+
+		const failedChildCommand = publishSteer(61, "child rejects this");
+		await waitFor(() => fs.existsSync(managedControlConsumedPath(asyncDir, failedChildCommand)), "failed-child command consumed");
+		writeSteerAck(asyncDir, { requestId: failedChildCommand, index: 0, ts: Date.now(), state: "failed", message: "child rejected steer" });
+		await waitFor(() => readManagedControlAck(asyncDir, failedChildCommand)?.outcome === "failed", "child failed ack must fail managed steer");
+
+		const enqueueCommandId = Buffer.alloc(32, 62).toString("base64url");
+		const enqueueTs = Date.now();
+		enqueueManagedStepSteer(asyncDir, 0, { type: "steer", id: enqueueCommandId, ts: enqueueTs, message: "force enqueue collision", targetIndex: 0, source: "managed-v1" });
+		publishSteer(62, "force enqueue collision", runnerProcessInstanceId, enqueueTs);
+		await waitFor(() => readManagedControlAck(asyncDir, enqueueCommandId)?.outcome === "failed", "enqueue collision must fail managed steer");
+
+		writeSteerCapability(asyncDir, { index: 0, pid: process.pid, readyAt: Date.now(), supported: false });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const unsupportedCommand = publishSteer(63, "unsupported child");
+		await waitFor(() => readManagedControlAck(asyncDir, unsupportedCommand)?.outcome === "failed", "unsupported child must fail managed steer");
+
+		await waitFor(() => fs.existsSync(resultPath), "managed steer runner must terminate cleanly", 10_000);
+		for (const target of [asyncDir, sessionRoot]) fs.rmSync(target, { recursive: true, force: true });
+		for (const target of [resultPath, preparedResultReservationPath(resultPath), getAsyncConfigPath(candidate)]) fs.rmSync(target, { force: true });
 	});
 
 	it("handles stderr without exit code as info (not error)", async () => {
