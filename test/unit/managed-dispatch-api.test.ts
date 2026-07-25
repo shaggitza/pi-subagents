@@ -21,6 +21,7 @@ import {
 	parseManagedMutationRequestV1,
 	parseManagedPreflightRequestV1,
 	parseManagedReadRequestV1,
+	projectManagedChildCapabilityV1,
 	type ManagedPreflightRequestV1,
 	type ManagedPreflightResultV1,
 } from "../../src/api/managed-dispatch.ts";
@@ -346,6 +347,43 @@ describe("managed-dispatch public protocol foundation", () => {
 		assert.throws(() => computeManagedProfileIdentityDigest({ ...identityA, root: { ...identityA.root, realPath: "/repo\nother" } }));
 	});
 
+	it("projects an exact bounded child capability without private launch material", () => {
+		const childCapability = projectManagedChildCapabilityV1({
+			requestedBuiltin: ["private-requested-tool"],
+			declaredBuiltin: ["read", "shared-name"],
+			effectiveAllowlist: ["read", "shared-name", "private-mcp-tool", "structured_output"],
+			explicitAllowlist: true,
+			requiredChildTools: ["read"],
+			internalTools: ["structured_output"],
+			mcp: [],
+			effectiveMcpTools: ["private-mcp-tool", "shared-name"],
+			toolExtensionPaths: ["/private/tool-extension.ts"],
+			runtimeExtensions: ["/private/runtime-a.ts", "/private/runtime-b.ts"],
+			configuredExtensions: ["/private/configured.ts"],
+			extensionArgs: ["--extension", "/private/configured.ts"],
+			disableAmbientExtensions: true,
+			fanoutAuthorized: false,
+		});
+		assert.deepEqual(childCapability, {
+			version: 1,
+			effectiveToolCount: 3,
+			runtimeExtensionCount: 2,
+			configuredExtensionCount: 1,
+			disableAmbientExtensions: true,
+			fanoutAuthorized: false,
+		});
+		assert.equal(Object.isFrozen(childCapability), true);
+		assert.deepEqual(Object.keys(childCapability), [
+			"version",
+			"effectiveToolCount",
+			"runtimeExtensionCount",
+			"configuredExtensionCount",
+			"disableAmbientExtensions",
+			"fanoutAuthorized",
+		]);
+		assert.doesNotMatch(JSON.stringify(childCapability), /private|read|shared|structured|extension\.ts/);
+	});
+
 	it("exports preflight-to-launch binding vocabulary", () => {
 		const preflight: ManagedPreflightRequestV1 = {
 			version: 1,
@@ -360,6 +398,7 @@ describe("managed-dispatch public protocol foundation", () => {
 			host: { version: 1, hostId: "host-1" },
 			profile: { version: 1, contentDigest: "c".repeat(64), root: { version: 1, realPath: "/repo" } },
 			profileIdentityDigest: "a".repeat(64),
+			childCapability: { version: 1, effectiveToolCount: 0, runtimeExtensionCount: 1, configuredExtensionCount: 0, disableAmbientExtensions: true, fanoutAuthorized: false },
 			parentSessionIdentityDigest: "e".repeat(64),
 			candidateRunId: "candidate-1",
 			contractDigest: "b".repeat(64),

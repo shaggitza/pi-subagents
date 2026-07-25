@@ -223,6 +223,15 @@ describe("managed dispatch preflight bridge", () => {
 		assert.equal(result.ok && result.parentSessionIdentityDigest, "c".repeat(64));
 		assert.match(result.ok ? result.profileIdentityDigest : "", /^[a-f0-9]{64}$/);
 		assert.equal(result.ok && result.profile.root.realPath, fs.realpathSync(temporary));
+		assert.deepEqual(result.ok && result.childCapability, {
+			version: 1,
+			effectiveToolCount: 1,
+			runtimeExtensionCount: 0,
+			configuredExtensionCount: 0,
+			disableAmbientExtensions: true,
+			fanoutAuthorized: false,
+		});
+		assert.doesNotMatch(JSON.stringify(result.ok && result.childCapability), /worker|inspect|managed-preflight|\.pi|read/);
 		assert.equal(observed?.sessionDir, path.join(temporary, "child-session"));
 		assert.equal(observed?.parentSessionId, "parent-session");
 		assert.equal(observed?.runId, "candidate-1");

@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { types as utilTypes } from "node:util";
+import type { SubagentLaunchContractTools } from "./preflight.ts";
 
 /** Host-neutral protocol vocabulary only. No provider is registered by this module. */
 export const SUBAGENT_MANAGED_DISPATCH_VERSION = 1 as const;
@@ -109,12 +110,38 @@ export interface ManagedPreflightRequestV1 {
 	input: ({ kind: "spawn" } & ManagedSpawnInputV1) | ({ kind: "resume" } & ManagedResumeInputV1);
 }
 
+/** Bounded, name-free projection of the exact host-resolved child launch capabilities. */
+export interface ManagedChildCapabilityV1 {
+	readonly version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
+	readonly effectiveToolCount: number;
+	readonly runtimeExtensionCount: number;
+	readonly configuredExtensionCount: number;
+	readonly disableAmbientExtensions: boolean;
+	readonly fanoutAuthorized: boolean;
+}
+
+/** Projects counts and booleans only; tool/extension names and paths never cross this boundary. */
+export function projectManagedChildCapabilityV1(
+	tools: Readonly<SubagentLaunchContractTools>,
+): Readonly<ManagedChildCapabilityV1> {
+	const effectiveTools = new Set([...tools.declaredBuiltin, ...tools.effectiveMcpTools]);
+	return Object.freeze({
+		version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+		effectiveToolCount: effectiveTools.size,
+		runtimeExtensionCount: tools.runtimeExtensions.length,
+		configuredExtensionCount: tools.configuredExtensions.length,
+		disableAmbientExtensions: tools.disableAmbientExtensions,
+		fanoutAuthorized: tools.fanoutAuthorized,
+	});
+}
+
 export type ManagedPreflightResultV1 = {
 	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
 	ok: true;
 	host: ManagedHostIdentityV1;
 	profile: ManagedProfileIdentityV1;
 	profileIdentityDigest: string;
+	childCapability: ManagedChildCapabilityV1;
 	/** Present from the non-launching host provider; optional for inert early-v1 consumers. */
 	parentSessionIdentityDigest?: string;
 	candidateRunId: string;

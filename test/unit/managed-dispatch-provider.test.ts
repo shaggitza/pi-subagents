@@ -368,6 +368,16 @@ describe("managed dispatch provider", () => {
 		off();
 		assert.equal(preflight.ok, true);
 		assert.equal(preflight.candidateRunId, "provider-spawn-preflight-candidate");
+		assert.deepEqual(preflight.childCapability, {
+			version: 1,
+			effectiveToolCount: 0,
+			runtimeExtensionCount: 0,
+			configuredExtensionCount: 0,
+			disableAmbientExtensions: true,
+			fanoutAuthorized: false,
+		});
+		assert.deepEqual(Object.keys(preflight.childCapability), ["version", "effectiveToolCount", "runtimeExtensionCount", "configuredExtensionCount", "disableAmbientExtensions", "fanoutAuthorized"]);
+		assert.doesNotMatch(JSON.stringify(preflight.childCapability), /opaque|worker|session-provider|pi-signal|path|prompt|task/i);
 		assert.equal(preflightReplies, 1, "the consolidated provider must be the only preflight responder");
 		const invalid = await bus.request({ version: 1, requestId: "cap-invalid", method: "capabilities", extra: true }) as any;
 		assert.equal(invalid.success, false);
@@ -542,6 +552,16 @@ describe("managed dispatch provider", () => {
 		assert.equal(preflight.ok, true);
 		assert.equal(preflight.candidateRunId, candidateRunId);
 		assert.equal(preflight.parentSessionIdentityDigest, computeParentSessionIdentityDigest("parent-session", path.join(temporary, "parent.jsonl")));
+		assert.deepEqual(preflight.childCapability, {
+			version: 1,
+			effectiveToolCount: 0,
+			runtimeExtensionCount: 0,
+			configuredExtensionCount: 0,
+			disableAmbientExtensions: true,
+			fanoutAuthorized: false,
+		});
+		assert.deepEqual(Object.keys(preflight.childCapability), ["version", "effectiveToolCount", "runtimeExtensionCount", "configuredExtensionCount", "disableAmbientExtensions", "fanoutAuthorized"]);
+		assert.doesNotMatch(JSON.stringify(preflight.childCapability), /continue|worker|provider-source|pi-signal|path|prompt|task/i);
 		const resume = {
 			version: 1,
 			requestId: "resume-mutation",
