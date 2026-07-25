@@ -141,6 +141,83 @@ describe("unregistered managed control coordinator", () => {
 		assert.equal(fs.readFileSync(managedControlRequestPath(path.join(temporary, "async", "actor-one"), operationId(20)), "utf8").includes("raw secret steering text"), true);
 	});
 
+	it("rejects pre-existing request substitution by command, method/run, and steer body without execution", async () => {
+		const actorId = createActor(9, "actor-nine");
+		const actor = store.read(parentDigest, "consumer-a", actorId)!;
+		const variants = [
+			(body: Record<string, unknown>) => ({ ...body, commandId: operationId(99) }),
+			(body: Record<string, unknown>) => { const { message: _message, ...rest } = body; return { ...rest, method: "stop", runId: "other-run" }; },
+			(body: Record<string, unknown>) => ({ ...body, message: "substituted steer" }),
+		];
+		for (const [index, mutate] of variants.entries()) {
+			const commandByte = 40 + index;
+			const intended = controlRequest("steer", commandByte, { operationId: actorId });
+			const body = mutate({
+				version: 1,
+				commandId: operationId(commandByte),
+				commandRequestDigest: computeManagedRequestDigest(intended),
+				consumerId: "consumer-a",
+				targetOperationId: actorId,
+				actorOperationId: actorId,
+				actorRequestDigest: actor.requestDigest,
+				runId: actor.runId,
+				runnerProcessInstanceId: actor.runnerProcessInstanceId,
+				method: "steer",
+				requestedAt: 100,
+				targetIndex: 0,
+				message: "raw secret steering text",
+			});
+			const requestPath = managedControlRequestPath(actor.terminalAsyncDir!, operationId(commandByte));
+			fs.mkdirSync(path.dirname(requestPath), { recursive: true, mode: 0o700 });
+			fs.writeFileSync(requestPath, JSON.stringify(body), { mode: 0o600 });
+			assert.equal((await coordinator().dispatchControl(intended)).state, "uncertain");
+			let executions = 0;
+			consumeManagedControlRequests(actor.terminalAsyncDir!, () => { executions++; return { outcome: "acknowledged" }; });
+			assert.equal(executions, 0, `forged request variant ${index} must not execute`);
+		}
+	});
+
+	it("requires exact consumed proof and never gives an ack precedence over a pending request", async () => {
+		const actorId = createActor(10, "actor-ten");
+		const actor = store.read(parentDigest, "consumer-a", actorId)!;
+		for (const [offset, lifecycle] of ["ack-only", "request-and-ack", "corrupt-consumed-and-ack"].entries()) {
+			const commandByte = 50 + offset;
+			const intended = controlRequest("interrupt", commandByte, { operationId: actorId });
+			const binding = {
+				commandId: operationId(commandByte),
+				commandRequestDigest: computeManagedRequestDigest(intended),
+				consumerId: "consumer-a",
+				targetOperationId: actorId,
+				actorOperationId: actorId,
+				actorRequestDigest: actor.requestDigest,
+				runId: actor.runId!,
+				runnerProcessInstanceId: actor.runnerProcessInstanceId!,
+				method: "interrupt" as const,
+			};
+			if (lifecycle === "request-and-ack") publishManagedControlRequest(actor.terminalAsyncDir!, { ...binding, requestedAt: 100 });
+			if (lifecycle === "corrupt-consumed-and-ack") {
+				const consumedPath = path.join(actor.terminalAsyncDir!, "control", "managed-consumed", `${operationId(commandByte)}.json`);
+				fs.mkdirSync(path.dirname(consumedPath), { recursive: true, mode: 0o700 });
+				fs.writeFileSync(consumedPath, "{}", { mode: 0o600 });
+			}
+			writeManagedControlAck(actor.terminalAsyncDir!, { version: 1, ...binding, acknowledgedAt: 101, outcome: "acknowledged" });
+			assert.equal((await coordinator().dispatchControl(intended)).state, "uncertain", lifecycle);
+		}
+	});
+
+	it("serializes concurrent retries to one publication", async () => {
+		const actorId = createActor(11, "actor-eleven");
+		let publications = 0;
+		const control = coordinator((...args) => { publications++; return publishManagedControlRequest(...args); });
+		const request = controlRequest("stop", 54, { operationId: actorId });
+		const [first, second] = await Promise.all([
+			control.dispatchControl(request),
+			control.dispatchControl({ ...request, requestId: "concurrent-retry" }),
+		]);
+		assert.equal(publications, 1);
+		assert.deepEqual([first.replayed, second.replayed].sort(), [false, true]);
+	});
+
 	it("reconciles a correlated runner ack without republishing", async () => {
 		createActor(2, "actor-two");
 		let published = 0;
@@ -164,7 +241,22 @@ describe("unregistered managed control coordinator", () => {
 		consumeManagedControlRequests(asyncDir, () => ({ outcome: "acknowledged" }));
 		fs.rmSync(managedControlAckPath(asyncDir, operationId(22)));
 		assert.equal((await control.dispatchControl({ ...request, requestId: "retry-1" })).state, "uncertain");
-		writeManagedControlAck(asyncDir, { version: 1, commandId: operationId(22), method: "stop", runId: "actor-three", acknowledgedAt: 200, outcome: "acknowledged" });
+		const command = store.read(parentDigest, "consumer-a", operationId(22))!;
+		const actor = store.read(parentDigest, "consumer-a", operationId(3))!;
+		writeManagedControlAck(asyncDir, {
+			version: 1,
+			commandId: operationId(22),
+			commandRequestDigest: command.requestDigest,
+			consumerId: command.consumerId,
+			targetRunId: command.targetRunId!,
+			actorOperationId: actor.operationId,
+			actorRequestDigest: actor.requestDigest,
+			runnerProcessInstanceId: actor.runnerProcessInstanceId!,
+			method: "stop",
+			runId: "actor-three",
+			acknowledgedAt: 200,
+			outcome: "acknowledged",
+		});
 		assert.equal((await control.dispatchControl({ ...request, requestId: "retry-2" })).state, "uncertain");
 		assert.equal(published, 1);
 	});
@@ -183,6 +275,27 @@ describe("unregistered managed control coordinator", () => {
 		await assert.rejects(otherParent.dispatchControl(controlRequest("steer", 27, { operationId: actorId })), (error) => expectCode(error, "not_found"));
 		fs.writeFileSync(path.join(temporary, "async", "actor-four", "status.json"), JSON.stringify({ runId: "actor-four", mode: "single", state: "paused", steps: [] }));
 		await assert.rejects(control.dispatchControl(controlRequest("interrupt", 28, { operationId: actorId })), (error) => expectCode(error, "invalid_state"));
+	});
+
+	it("enforces retirement target/actor equality at prepare, parse, and completion", () => {
+		const targetId = createActor(12, "target-never-launched", "failed-before-launch");
+		const wrongId = createActor(13, "wrong-never-launched", "failed-before-launch");
+		const request = controlRequest("retire", 55, { operationId: targetId });
+		const digest = computeManagedRequestDigest(request);
+		store.claim(parentDigest, request);
+		const wrong = store.read(parentDigest, "consumer-a", wrongId)!;
+		assert.throws(() => store.prepareControl(parentDigest, "consumer-a", operationId(55), digest, {
+			operationId: wrongId, requestDigest: wrong.requestDigest,
+		}), (error: unknown) => error instanceof ManagedOperationJournalError && error.code === "operation_conflict");
+		const target = store.read(parentDigest, "consumer-a", targetId)!;
+		store.prepareControl(parentDigest, "consumer-a", operationId(55), digest, { operationId: targetId, requestDigest: target.requestDigest });
+		const recordPath = path.join(store.root, "operations", parentDigest, "consumer-a", operationId(55), "record.json");
+		const durable = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+		fs.writeFileSync(recordPath, `${JSON.stringify({ ...durable, actorOperationId: wrongId, actorRequestDigest: wrong.requestDigest })}\n`, { mode: 0o600 });
+		assert.throws(() => store.read(parentDigest, "consumer-a", operationId(55)), (error: unknown) => error instanceof ManagedOperationJournalError && error.code === "corrupt");
+		assert.throws(() => store.completeRetirement(parentDigest, "consumer-a", operationId(55), digest), (error: unknown) => error instanceof ManagedOperationJournalError && error.code === "corrupt");
+		assert.equal(store.read(parentDigest, "consumer-a", targetId)?.state, "failed-before-launch");
+		assert.equal(store.read(parentDigest, "consumer-a", wrongId)?.state, "failed-before-launch");
 	});
 
 	it("durably tombstones safe actors, rejects active retirement, and gates uncertainty acknowledgment", async () => {

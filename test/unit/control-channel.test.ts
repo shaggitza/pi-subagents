@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { computeManagedRequestDigest } from "../../src/api/managed-dispatch.ts";
 import {
 	closeSteerInbox,
 	consumeManagedControlRequests,
@@ -12,6 +13,7 @@ import {
 	consumeSteerRequests,
 	consumeStopRequest,
 	deliverInterruptRequest,
+	enqueueManagedStepSteer,
 	enqueueStepSteer,
 	interruptRequestPath,
 	inspectManagedControlTransport,
@@ -43,6 +45,25 @@ function tmpAsyncDir(label: string): string {
 
 function cleanup(asyncDir: string): void {
 	fs.rmSync(path.dirname(asyncDir), { recursive: true, force: true });
+}
+
+function managedAuthority(commandId: string, method: "steer" | "interrupt" | "stop", message?: string, byte = 9) {
+	const actorOperationId = Buffer.alloc(32, byte).toString("base64url");
+	const semantic = {
+		version: 1,
+		requestId: "transport-proof",
+		method,
+		managed: { version: 1, consumerId: "consumer-a", operationId: commandId },
+		input: { target: { consumerId: "consumer-a", operationId: actorOperationId }, ...(method === "steer" ? { message } : {}) },
+	};
+	return {
+		commandRequestDigest: computeManagedRequestDigest(semantic),
+		consumerId: "consumer-a",
+		targetOperationId: actorOperationId,
+		actorOperationId,
+		actorRequestDigest: "b".repeat(64),
+		runnerProcessInstanceId: "runner-instance-1",
+	};
 }
 
 describe("control channel: request file", () => {
@@ -214,6 +235,7 @@ describe("control channel: request file", () => {
 		try {
 			const requestPath = publishManagedControlRequest(asyncDir, {
 				commandId,
+				...managedAuthority(commandId, "steer", "private steering text"),
 				method: "steer",
 				runId: "managed-run",
 				message: "private steering text",
@@ -222,7 +244,7 @@ describe("control channel: request file", () => {
 			assert.equal(requestPath, managedControlRequestPath(asyncDir, commandId));
 			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "published");
 			assert.throws(() => publishManagedControlRequest(asyncDir, {
-				commandId, method: "steer", runId: "managed-run", message: "different", requestedAt: 101,
+				commandId, ...managedAuthority(commandId, "steer", "different"), method: "steer", runId: "managed-run", message: "different", requestedAt: 101,
 			}), (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST");
 			const delivered: string[] = [];
 			consumeManagedControlRequests(asyncDir, (request) => {
@@ -237,6 +259,63 @@ describe("control channel: request file", () => {
 			assert.equal(fs.existsSync(managedControlConsumedPath(asyncDir, commandId)), true);
 			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "acknowledged");
 			assert.equal(readManagedControlAck(asyncDir, commandId)?.runId, "managed-run");
+			assert.throws(() => publishManagedControlRequest(asyncDir, {
+				commandId, ...managedAuthority(commandId, "steer", "private steering text"), method: "steer", runId: "managed-run", message: "private steering text", requestedAt: 102,
+			}), (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST", "consumed/ack lifecycle must prohibit republish");
+			consumeManagedControlRequests(asyncDir, () => {
+				throw new Error("republished lifecycle must never execute");
+			});
+			assert.deepEqual(delivered, ["private steering text"]);
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("uses a cross-platform no-clobber claim when a consumed tombstone already exists", () => {
+		const asyncDir = tmpAsyncDir("pi-control-managed-claim-");
+		const commandId = Buffer.alloc(32, 6).toString("base64url");
+		try {
+			publishManagedControlRequest(asyncDir, { commandId, ...managedAuthority(commandId, "stop"), method: "stop", runId: "managed-run", requestedAt: 100 });
+			fs.mkdirSync(path.dirname(managedControlConsumedPath(asyncDir, commandId)), { recursive: true, mode: 0o700 });
+			fs.copyFileSync(managedControlRequestPath(asyncDir, commandId), managedControlConsumedPath(asyncDir, commandId), fs.constants.COPYFILE_EXCL);
+			let executions = 0;
+			consumeManagedControlRequests(asyncDir, () => { executions++; return { outcome: "acknowledged" }; });
+			assert.equal(executions, 0);
+			assert.equal(fs.existsSync(managedControlRequestPath(asyncDir, commandId)), true);
+			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "corrupt");
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("keeps managed request and child steer handoff private end-to-end", () => {
+		const asyncDir = tmpAsyncDir("pi-control-managed-private-");
+		const commandId = Buffer.alloc(32, 7).toString("base64url");
+		try {
+			const requestPath = publishManagedControlRequest(asyncDir, { commandId, ...managedAuthority(commandId, "steer", "private handoff"), method: "steer", runId: "managed-run", message: "private handoff", requestedAt: 100 });
+			const handoffPath = enqueueManagedStepSteer(asyncDir, 0, { type: "steer", id: commandId, ts: 100, message: "private handoff", targetIndex: 0, source: "managed-v1" });
+			if (process.platform !== "win32") {
+				assert.equal(fs.statSync(path.join(asyncDir, "control")).mode & 0o777, 0o700);
+				assert.equal(fs.statSync(path.dirname(requestPath)).mode & 0o777, 0o700);
+				assert.equal(fs.statSync(path.dirname(handoffPath)).mode & 0o777, 0o700);
+				assert.equal(fs.statSync(requestPath).mode & 0o777, 0o600);
+				assert.equal(fs.statSync(handoffPath).mode & 0o777, 0o600);
+			}
+			assert.equal(fs.readFileSync(handoffPath, "utf8").includes("private handoff"), true);
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("requires consumed proof and rejects ack precedence while a request is pending", () => {
+		const asyncDir = tmpAsyncDir("pi-control-managed-ack-precedence-");
+		const commandId = Buffer.alloc(32, 8).toString("base64url");
+		try {
+			const binding = managedAuthority(commandId, "interrupt");
+			publishManagedControlRequest(asyncDir, { commandId, ...binding, method: "interrupt", runId: "managed-run", requestedAt: 100 });
+			writeManagedControlAck(asyncDir, { version: 1, commandId, ...binding, method: "interrupt", runId: "managed-run", acknowledgedAt: 101, outcome: "acknowledged" });
+			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "corrupt");
+			assert.equal(fs.existsSync(managedControlRequestPath(asyncDir, commandId)), true);
 		} finally {
 			cleanup(asyncDir);
 		}
@@ -246,11 +325,11 @@ describe("control channel: request file", () => {
 		const asyncDir = tmpAsyncDir("pi-control-managed-gap-");
 		const commandId = Buffer.alloc(32, 5).toString("base64url");
 		try {
-			publishManagedControlRequest(asyncDir, { commandId, method: "interrupt", runId: "managed-run", requestedAt: 100 });
+			publishManagedControlRequest(asyncDir, { commandId, ...managedAuthority(commandId, "interrupt"), method: "interrupt", runId: "managed-run", requestedAt: 100 });
 			fs.mkdirSync(path.dirname(managedControlConsumedPath(asyncDir, commandId)), { recursive: true });
 			fs.renameSync(managedControlRequestPath(asyncDir, commandId), managedControlConsumedPath(asyncDir, commandId));
 			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "consumed");
-			const ack = { version: 1 as const, commandId, method: "interrupt" as const, runId: "managed-run", acknowledgedAt: 200, outcome: "failed" as const, reason: "not active" };
+			const ack = { version: 1 as const, commandId, ...managedAuthority(commandId, "interrupt"), method: "interrupt" as const, runId: "managed-run", acknowledgedAt: 200, outcome: "failed" as const, reason: "not active" };
 			writeManagedControlAck(asyncDir, ack);
 			assert.equal(managedControlAckPath(asyncDir, commandId), path.join(asyncDir, "control", "managed-acks", `${commandId}.json`));
 			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "failed");

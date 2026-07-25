@@ -500,6 +500,11 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 		if ((parsed.state === "claimed" && anyActor) || (parsed.state !== "claimed" && !hasActor)) {
 			throw new ManagedOperationJournalError("corrupt", "Managed command actor authority is inconsistent with its state.");
 		}
+		if (parsed.state !== "claimed"
+			&& ((parsed.targetOperationId !== undefined && parsed.targetOperationId !== parsed.actorOperationId)
+				|| (parsed.targetRunId !== undefined && parsed.targetRunId !== parsed.actorRunId))) {
+			throw new ManagedOperationJournalError("corrupt", "Managed command target differs from its resolved actor authority.");
+		}
 		const transportMethod = parsed.method === "steer" || parsed.method === "interrupt" || parsed.method === "stop";
 		const hasPaths = parsed.controlRequestPath !== undefined && parsed.controlAckPath !== undefined;
 		if (transportMethod) {
@@ -755,10 +760,17 @@ export class ManagedOperationJournal {
 		actor: { operationId: string; requestDigest: string; runId?: string },
 		options: { acknowledgeUncertain?: boolean } = {},
 	): Readonly<ManagedOperationJournalRecordV1> {
+		const actorOperationId = assertManagedOperationId(actor.operationId);
+		const actorRunId = actor.runId !== undefined ? assertRunId(actor.runId, "Managed actor run id") : undefined;
+		const command = this.read(parentSessionIdentityDigest, consumerId, operationId);
+		if (!command || (command.targetOperationId !== undefined && command.targetOperationId !== actorOperationId)
+			|| (command.targetRunId !== undefined && command.targetRunId !== actorRunId)) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed command target differs from its resolved actor authority.");
+		}
 		return this.#updateControlCommand(parentSessionIdentityDigest, consumerId, operationId, requestDigest, "prepared", {
-			actorOperationId: assertManagedOperationId(actor.operationId),
+			actorOperationId,
 			actorRequestDigest: assertDigest(actor.requestDigest, "Managed actor request digest"),
-			...(actor.runId !== undefined ? { actorRunId: assertRunId(actor.runId, "Managed actor run id") } : {}),
+			...(actorRunId !== undefined ? { actorRunId } : {}),
 			...(options.acknowledgeUncertain ? { retirementAcknowledgedUncertain: true as const } : {}),
 		});
 	}
@@ -795,6 +807,10 @@ export class ManagedOperationJournal {
 		if (!command || command.method !== "retire" || command.requestDigest !== commandRequestDigest || command.state !== "prepared"
 			|| !command.actorOperationId || !command.actorRequestDigest) {
 			throw new ManagedOperationJournalError("invalid_state", "Managed retirement intent is incomplete.");
+		}
+		if ((command.targetOperationId !== undefined && command.targetOperationId !== command.actorOperationId)
+			|| (command.targetRunId !== undefined && command.targetRunId !== command.actorRunId)) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed retirement target differs from its actor authority.");
 		}
 		const actorDirectory = this.#existingOperationDirectory(parent, consumer, command.actorOperationId);
 		if (!actorDirectory) throw new ManagedOperationJournalError("not_found", "Managed retirement actor was not found.");

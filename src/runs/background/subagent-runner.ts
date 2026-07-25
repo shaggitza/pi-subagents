@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, enqueueStepSteer, steerAcksDir, steerCapabilityPath, stepSteerInboxDir, watchAsyncControlInbox, type ManagedControlRequest, type SteerAck, type SteerCapability, type SteerRequest } from "./control-channel.ts";
+import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, enqueueManagedStepSteer, enqueueStepSteer, steerAcksDir, steerCapabilityPath, stepSteerInboxDir, watchAsyncControlInbox, writeManagedControlAck, type ManagedControlRequest, type SteerAck, type SteerCapability, type SteerRequest } from "./control-channel.ts";
 import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, injectSingleOutputInstruction, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -1688,6 +1688,7 @@ async function runSubagent(
 	const activeChildStops = new Map<number, () => void>();
 	const activeChildTurnBudgetAborts = new Map<number, (message: string, state?: TurnBudgetState) => void>();
 	const pendingStepSteers: SteerRequest[] = [];
+	const pendingManagedSteers = new Map<string, ManagedControlRequest>();
 	const steeringCapabilities = new Map<number, SteerCapability>();
 	let interrupted = false;
 	let currentActivityState: ActivityState | undefined;
@@ -2220,6 +2221,34 @@ async function runSubagent(
 		if (state === "partial") emitSteeringNotice(requestId, "partial", `Steering partially delivered for run ${id}.`);
 		else if (state === "failed") emitSteeringNotice(requestId, "failed", failureMessage);
 	};
+	const completeManagedSteer = (requestId: string, outcome: "acknowledged" | "failed", reason?: string): void => {
+		const request = pendingManagedSteers.get(requestId);
+		if (!request) return;
+		pendingManagedSteers.delete(requestId);
+		try {
+			writeManagedControlAck(asyncDir, {
+				version: 1,
+				commandId: request.commandId,
+				commandRequestDigest: request.commandRequestDigest,
+				consumerId: request.consumerId,
+				...(request.targetOperationId !== undefined ? { targetOperationId: request.targetOperationId } : { targetRunId: request.targetRunId! }),
+				actorOperationId: request.actorOperationId,
+				actorRequestDigest: request.actorRequestDigest,
+				runId: request.runId,
+				runnerProcessInstanceId: request.runnerProcessInstanceId,
+				method: request.method,
+				acknowledgedAt: Date.now(),
+				outcome,
+				...(reason ? { reason: reason.slice(0, 512) } : {}),
+			});
+		} catch {
+			// The durable consumed claim remains fail-closed if the terminal ack cannot be written.
+		}
+	};
+	const managedSteerFailure = (requestId: string): string | undefined => {
+		const target = steeringStatus(statusPayload).recent.find((candidate) => candidate.id === requestId)?.targets.find((candidate) => candidate.index === 0);
+		return target?.state === "failed" ? target.reason ?? "managed steer delivery failed" : undefined;
+	};
 	const deliverSteerRequest = (request: SteerRequest): void => {
 		if (statusPayload.state !== "running") {
 			const reason = `run became ${statusPayload.state} before steering request was consumed`;
@@ -2264,7 +2293,8 @@ async function runSubagent(
 		for (const target of targetStates) {
 			if (target.state === "routed") {
 				try {
-					enqueueStepSteer(asyncDir, target.index, request);
+					if (request.source === "managed-v1") enqueueManagedStepSteer(asyncDir, target.index, request);
+					else enqueueStepSteer(asyncDir, target.index, request);
 					updateSteeringLifecycleTarget(request.id, target.index, "routed", now);
 					emitSteeringEvent("subagent.steer.routed", request, target.index);
 				} catch (error) {
@@ -2274,6 +2304,7 @@ async function runSubagent(
 				}
 			} else if (target.state === "failed") {
 				markSteeringAttention(target.index);
+				updateSteeringLifecycleTarget(request.id, target.index, "failed", now, { reason: target.reason });
 				emitSteeringEvent("subagent.steer.failed", request, target.index, { reason: target.reason });
 			} else {
 				emitSteeringEvent("subagent.steer.scheduled", request, target.index);
@@ -2298,6 +2329,7 @@ async function runSubagent(
 			emitSteeringEvent("subagent.steer.failed", { type: "steer", id: ack.requestId, ts: now, message: ack.message }, ack.index, { reason: ack.message });
 		}
 		emitTerminalSteeringNotice(ack.requestId, `Steering failed for run ${id}: ${ack.message}`);
+		if (ack.index === 0) completeManagedSteer(ack.requestId, ack.state === "delivered" ? "acknowledged" : "failed", ack.state === "failed" ? ack.message : undefined);
 		statusPayload.lastUpdate = now;
 		writeStatusPayload();
 	};
@@ -2307,6 +2339,10 @@ async function runSubagent(
 			if (request.targetIndex === undefined) deliverSteerRequest({ ...request, targetIndex: flatIndex });
 			else if (request.targetIndex === flatIndex) deliverSteerRequest(request);
 			else remaining.push(request);
+			if (request.source === "managed-v1") {
+				const reason = managedSteerFailure(request.id);
+				if (reason) completeManagedSteer(request.id, "failed", reason);
+			}
 		}
 		pendingStepSteers.push(...remaining);
 	};
@@ -2724,6 +2760,7 @@ async function runSubagent(
 					updateSteeringLifecycleTarget(request.id, capability.index, "failed", now, { reason: "child Pi session does not support steering" });
 					emitSteeringEvent("subagent.steer.failed", { type: "steer", id: request.id, ts: request.requestedAt, message: "child Pi session does not support steering" }, capability.index, { reason: "child Pi session does not support steering" });
 					emitTerminalSteeringNotice(request.id, `Steering failed for run ${id}: child ${capability.index} does not support steering.`);
+					if (capability.index === 0) completeManagedSteer(request.id, "failed", "child Pi session does not support steering");
 				}
 				statusPayload.lastUpdate = now;
 				writeStatusPayload();
@@ -2732,10 +2769,30 @@ async function runSubagent(
 		onSteerAck: consumeSteerAck,
 		onManagedControl: (request: ManagedControlRequest) => {
 			if (request.runId !== id) return { outcome: "failed", reason: "managed run identity mismatch" };
+			if (!config.runnerProcessInstanceId || request.runnerProcessInstanceId !== config.runnerProcessInstanceId) {
+				return { outcome: "failed", reason: "managed runner process identity mismatch" };
+			}
+			if (!config.managedProcessTerminalBinding
+				|| request.consumerId !== config.managedProcessTerminalBinding.consumerId
+				|| request.actorOperationId !== config.managedProcessTerminalBinding.operationId
+				|| request.actorRequestDigest !== config.managedProcessTerminalBinding.requestDigest
+				|| (request.targetOperationId !== undefined && request.targetOperationId !== request.actorOperationId)
+				|| (request.targetRunId !== undefined && request.targetRunId !== request.runId)) {
+				return { outcome: "failed", reason: "managed actor authority mismatch" };
+			}
 			if (request.method === "steer") {
 				if (statusPayload.state !== "running") return { outcome: "failed", reason: "managed actor is not running" };
-				deliverSteerRequest({ type: "steer", id: request.commandId, ts: request.requestedAt, message: request.message!, targetIndex: 0, source: "managed-v1" });
-				return { outcome: "acknowledged" };
+				pendingManagedSteers.set(request.commandId, request);
+				const steer = { type: "steer" as const, id: request.commandId, ts: request.requestedAt, message: request.message!, targetIndex: 0, source: "managed-v1" };
+				deliverSteerRequest(steer);
+				const reason = managedSteerFailure(request.commandId);
+				if (reason) {
+					pendingManagedSteers.delete(request.commandId);
+					return { outcome: "failed", reason };
+				}
+				const target = steeringStatus(statusPayload).recent.find((candidate) => candidate.id === request.commandId)?.targets.find((candidate) => candidate.index === 0);
+				if (target?.state === "scheduled") pendingStepSteers.push(steer);
+				return undefined;
 			}
 			if (request.method === "interrupt") {
 				if (statusPayload.state !== "running") return { outcome: "failed", reason: "managed actor is not running" };
@@ -3879,7 +3936,10 @@ async function runSubagent(
 			markSteeringAttention(target.index);
 			emitSteeringEvent("subagent.steer.failed", { type: "steer", id: request.id, ts: request.requestedAt, message: "child terminated before steering delivery" }, target.index, { reason: "child terminated before steering delivery" });
 		}
-		if (changed) emitTerminalSteeringNotice(request.id, `Steering failed for run ${id}: child terminated before delivery.`);
+		if (changed) {
+			emitTerminalSteeringNotice(request.id, `Steering failed for run ${id}: child terminated before delivery.`);
+			completeManagedSteer(request.id, "failed", "child terminated before steering delivery");
+		}
 	}
 	const runEndedAt = Date.now();
 	statusPayload.activityState = undefined;

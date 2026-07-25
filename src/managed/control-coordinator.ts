@@ -17,6 +17,9 @@ import {
 	managedControlRequestPath,
 	publishManagedControlRequest,
 	readManagedControlAck,
+	readManagedControlConsumed,
+	readManagedControlRequest,
+	type ManagedControlBinding,
 } from "../runs/background/control-channel.ts";
 import { ManagedOperationJournal, type ManagedOperationJournalRecordV1 } from "./operation-journal.ts";
 
@@ -182,7 +185,7 @@ export class ManagedControlCoordinator {
 		const claim = this.#options.journal.claim(parent, request);
 		let command = claim.record;
 		if (claim.replayed && command.state !== "claimed" && command.state !== "prepared") {
-			return receipt(this.#reconcileTransport(command), true);
+			return receipt(this.#reconcileTransport(command, request.method === "steer" ? request.input.message : undefined), true);
 		}
 		if (request.method === "retire" && command.state === "prepared") {
 			return receipt(this.#options.journal.completeRetirement(parent, consumer, commandId, digest).command, true);
@@ -200,7 +203,7 @@ export class ManagedControlCoordinator {
 			const completed = this.#options.journal.completeRetirement(parent, consumer, commandId, digest);
 			return receipt(completed.command, claim.replayed);
 		}
-		if (command.state !== "prepared" || !command.actorRunId || !actor.terminalAsyncDir) return receipt(command, claim.replayed);
+		if (command.state !== "prepared" || !command.actorRunId || !actor.terminalAsyncDir || !actor.runnerProcessInstanceId) return receipt(command, claim.replayed);
 		this.#validateActiveControl(actor, request.method);
 		if (!this.#isCurrent(snapshot)) return fail("no_active_session", "Managed parent session changed before command publication.");
 		const requestPath = managedControlRequestPath(actor.terminalAsyncDir, commandId);
@@ -209,40 +212,62 @@ export class ManagedControlCoordinator {
 		try {
 			(this.#options.publishRequest ?? publishManagedControlRequest)(actor.terminalAsyncDir, {
 				commandId,
+				commandRequestDigest: command.requestDigest,
+				consumerId: command.consumerId,
+				...(command.targetOperationId !== undefined ? { targetOperationId: command.targetOperationId } : { targetRunId: command.targetRunId! }),
+				actorOperationId: actor.operationId,
+				actorRequestDigest: actor.requestDigest,
 				method: request.method,
 				runId: command.actorRunId,
+				runnerProcessInstanceId: actor.runnerProcessInstanceId,
 				...(request.method === "steer" ? { message: request.input.message } : {}),
 			});
 		} catch {
-			return receipt(this.#reconcileTransport(command), claim.replayed);
+			return receipt(this.#reconcileTransport(command, request.method === "steer" ? request.input.message : undefined), claim.replayed);
 		}
 		command = this.#options.journal.acceptControl(parent, consumer, commandId, digest);
 		if (!this.#isCurrent(snapshot)) return fail("no_active_session", "Managed parent session changed after command publication.");
-		return receipt(this.#reconcileTransport(command), claim.replayed);
+		return receipt(this.#reconcileTransport(command, request.method === "steer" ? request.input.message : undefined), claim.replayed);
 	}
 
-	#reconcileTransport(command: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+	#reconcileTransport(command: Readonly<ManagedOperationJournalRecordV1>, expectedSteerMessage?: string): Readonly<ManagedOperationJournalRecordV1> {
 		if (command.method === "retire" || command.state === "terminal" || command.state === "uncertain" || command.state === "claimed" || command.state === "prepared") return command;
 		if (!command.actorOperationId || !command.actorRequestDigest || !command.actorRunId || !command.controlRequestPath || !command.controlAckPath) {
 			return this.#options.journal.markControlUncertain(command.parentSessionIdentityDigest, command.consumerId, command.operationId, command.requestDigest);
 		}
 		const actor = this.#options.journal.read(command.parentSessionIdentityDigest, command.consumerId, command.actorOperationId);
 		if (!actor || (actor.method !== "spawn" && actor.method !== "resume") || actor.requestDigest !== command.actorRequestDigest
-			|| actor.runId !== command.actorRunId || !actor.terminalAsyncDir
+			|| actor.runId !== command.actorRunId || !actor.terminalAsyncDir || !actor.runnerProcessInstanceId
 			|| command.controlRequestPath !== managedControlRequestPath(actor.terminalAsyncDir, command.operationId)
 			|| command.controlAckPath !== managedControlAckPath(actor.terminalAsyncDir, command.operationId)) {
 			return this.#options.journal.markControlUncertain(command.parentSessionIdentityDigest, command.consumerId, command.operationId, command.requestDigest);
 		}
+		const expected: ManagedControlBinding = {
+			commandId: command.operationId,
+			commandRequestDigest: command.requestDigest,
+			consumerId: command.consumerId,
+			...(command.targetOperationId !== undefined ? { targetOperationId: command.targetOperationId } : { targetRunId: command.targetRunId! }),
+			actorOperationId: actor.operationId,
+			actorRequestDigest: actor.requestDigest,
+			runId: actor.runId!,
+			runnerProcessInstanceId: actor.runnerProcessInstanceId,
+			method: command.method as ManagedControlBinding["method"],
+		};
+		const exact = (value: ManagedControlBinding | undefined): boolean => Boolean(value)
+			&& (Object.keys(expected) as Array<keyof ManagedControlBinding>).every((key) => value![key] === expected[key]);
+		const exactRequest = (value: ReturnType<typeof readManagedControlRequest> | ReturnType<typeof readManagedControlConsumed>): boolean => exact(value)
+			&& (command.method !== "steer" || expectedSteerMessage === undefined || value?.message === expectedSteerMessage);
 		const asyncDir = actor.terminalAsyncDir;
 		const state = inspectManagedControlTransport(asyncDir, command.operationId);
 		if (state === "acknowledged" || state === "failed") {
+			const consumed = readManagedControlConsumed(asyncDir, command.operationId);
 			const ack = readManagedControlAck(asyncDir, command.operationId);
-			if (!ack || ack.commandId !== command.operationId || ack.method !== command.method || ack.runId !== command.actorRunId) {
+			if (!exactRequest(consumed) || !exact(ack) || !ack) {
 				return this.#options.journal.markControlUncertain(command.parentSessionIdentityDigest, command.consumerId, command.operationId, command.requestDigest);
 			}
 			return this.#options.journal.completeControl(command.parentSessionIdentityDigest, command.consumerId, command.operationId, command.requestDigest, ack.outcome);
 		}
-		if (state === "published") {
+		if (state === "published" && exactRequest(readManagedControlRequest(asyncDir, command.operationId))) {
 			return command.state === "dispatching"
 				? this.#options.journal.acceptControl(command.parentSessionIdentityDigest, command.consumerId, command.operationId, command.requestDigest)
 				: command;
