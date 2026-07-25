@@ -71,6 +71,10 @@ export interface SubagentLaunchContractInput {
 	runId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Host-only exact recovered agent definition for managed resume. */
+	managedAgentConfig?: AgentConfig;
+	/** Host-only exact recovered artifact root for managed resume. */
+	managedArtifactsDir?: string;
 }
 
 export interface SubagentLaunchContractAgentCandidate {
@@ -356,14 +360,18 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	}
 	const scope = resolveExecutionAgentScope(input.agentScope);
 	const discovered = discoverAgents(effectiveCwd, scope);
+	const managedAgent = input.identityMode === "managed-v1" ? input.managedAgentConfig : undefined;
 	const matches = discovered.agents.filter((agent) => agent.name === input.agent || agent.localName === input.agent);
-	if (matches.length === 0) {
+	if (!managedAgent && matches.length === 0) {
 		return { ok: false, code: "missing_agent", message: `Unknown agent: ${input.agent}`, diagnostics };
 	}
-	if (matches.length > 1) {
+	if (!managedAgent && matches.length > 1) {
 		return { ok: false, code: "ambiguous_agent", message: `Ambiguous agent: ${input.agent}`, diagnostics };
 	}
-	const agent = matches[0]!;
+	if (managedAgent && managedAgent.name !== input.agent) {
+		return { ok: false, code: "missing_agent", message: "Recovered managed agent identity differs from the requested agent.", diagnostics };
+	}
+	const agent = managedAgent ?? matches[0]!;
 	const runId = input.runId ?? "preflight";
 	const skillInput = normalizeSkillInput(input.skill);
 	const outputOverride = normalizeSingleOutputOverride(input.output, agent.output);
@@ -412,7 +420,11 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		return { ok: false, code: "denied_required_tool", message, diagnostics };
 	}
 	const artifactsEnabled = input.artifacts !== false;
-	const artifactsDir = artifactsEnabled ? getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir ?? "project") : undefined;
+	const artifactsDir = artifactsEnabled
+		? input.identityMode === "managed-v1" && input.managedArtifactsDir
+			? path.resolve(input.managedArtifactsDir)
+			: getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir ?? "project")
+		: undefined;
 	const artifactPaths = artifactsDir ? getArtifactPaths(artifactsDir, runId, agent.name, 0) : undefined;
 	const outputPath = resolveSingleOutputPath(behavior.output, effectiveCwd, effectiveCwd, artifactsDir ? path.join(artifactsDir, "outputs", runId) : undefined);
 	const sessionRoot = input.sessionDir ? path.resolve(input.sessionDir) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;

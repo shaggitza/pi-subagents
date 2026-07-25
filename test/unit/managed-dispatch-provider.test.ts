@@ -243,7 +243,7 @@ describe("managed dispatch provider", () => {
 			target: { consumerId: "pi-signal", operationId: operationId() },
 		}) as any;
 		assert.equal(recovered.success, true);
-		assert.equal(recovered.data.state, "accepted");
+		assert.equal(recovered.data.state, "uncertain", "startup without the former live close observer must be durable uncertainty");
 		assert.equal(recovered.data.runOutcome, "unknown", "recovered admission cannot substitute for current liveness proof");
 		assert.equal(calls.value, 1, "recovery must not launch another runner");
 		restarted.dispose();

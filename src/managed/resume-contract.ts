@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentConfig } from "../agents/agents.ts";
 import {
 	SUBAGENT_MANAGED_DISPATCH_VERSION,
 	assertManagedResumeExecutorRequestV1,
@@ -18,6 +19,13 @@ import {
 	type SubagentLaunchContractInput,
 	type SubagentLaunchContractResult,
 } from "../api/preflight.ts";
+import { applySteeringRecoveryAgentConfig } from "../runs/background/async-resume.ts";
+import {
+	intersectSubagentCapabilityCeilings,
+	resolveCurrentSubagentCapabilityCeiling,
+	type ResolvedSubagentCapabilityCeiling,
+} from "../runs/shared/capability-ceiling.ts";
+import type { ArtifactConfig } from "../shared/types.ts";
 import type { ManagedResumeSourceV1 } from "./resume-source.ts";
 
 export interface ManagedResumeLaunchContractV1 {
@@ -40,9 +48,18 @@ export interface ManagedResumeLaunchContractV1 {
 	readonly digest: string;
 }
 
+export interface ManagedResumeExecutionSpecV1 {
+	readonly agentConfig: Readonly<AgentConfig>;
+	readonly artifactConfig: Readonly<ArtifactConfig>;
+	readonly artifactsDir?: string;
+	readonly outputPath?: string;
+	readonly capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+}
+
 export interface ResolvedManagedResumeLaunchV1 {
 	readonly request: Readonly<ManagedResumeExecutorRequestV1>;
 	readonly source: Readonly<ManagedResumeSourceV1>;
+	readonly execution: Readonly<ManagedResumeExecutionSpecV1>;
 	readonly contract: Readonly<ManagedResumeLaunchContractV1>;
 	readonly profile: ManagedProfileIdentityV1;
 	readonly profileIdentityDigest: string;
@@ -51,6 +68,7 @@ export interface ResolvedManagedResumeLaunchV1 {
 export interface ManagedResumeLaunchResolverOptions {
 	artifactDir?: "project" | "session" | "temp";
 	resolveContract?: (input: SubagentLaunchContractInput) => Promise<SubagentLaunchContractResult>;
+	resolveCapabilityCeiling?: typeof resolveCurrentSubagentCapabilityCeiling;
 }
 
 function hash(domain: string, value: unknown): string {
@@ -77,6 +95,29 @@ export async function resolveManagedResumeLaunchV1(
 ): Promise<ResolvedManagedResumeLaunchV1> {
 	const request = assertManagedResumeExecutorRequestV1(requestInput, source.sourceRunId, source.sourceIndex);
 	const descriptor = source.recoveryDescriptor;
+	const baseAgent: AgentConfig = {
+		name: source.agent,
+		description: "Persisted managed resume contract",
+		systemPrompt: descriptor.systemPrompt ?? "",
+		systemPromptMode: descriptor.systemPromptMode,
+		inheritProjectContext: descriptor.inheritProjectContext,
+		inheritSkills: descriptor.inheritSkills,
+		source: "project",
+		filePath: descriptor.agentFilePath ?? path.join(source.cwd, ".pi-subagents-managed-resume-agent"),
+	};
+	const recoveredAgent = applySteeringRecoveryAgentConfig(baseAgent, descriptor);
+	const agentConfig = Object.freeze(JSON.parse(JSON.stringify(recoveredAgent)) as AgentConfig);
+	const artifactConfig = Object.freeze({ ...(descriptor.artifactConfig ?? { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 0 }) } as ArtifactConfig);
+	if (artifactConfig.enabled && !descriptor.artifactsDir) throw new TypeError("Managed resume recovery descriptor lacks its artifact root.");
+	const currentCeiling = (options.resolveCapabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling)(parentSessionFile);
+	const capabilityCeiling = intersectSubagentCapabilityCeilings(descriptor.capabilityCeiling, currentCeiling);
+	const execution: ManagedResumeExecutionSpecV1 = Object.freeze({
+		agentConfig,
+		artifactConfig,
+		...(descriptor.artifactsDir ? { artifactsDir: path.resolve(descriptor.artifactsDir) } : {}),
+		...(descriptor.outputPath ? { outputPath: path.resolve(descriptor.outputPath) } : {}),
+		...(capabilityCeiling ? { capabilityCeiling } : {}),
+	});
 	const contractResult = await (options.resolveContract ?? resolveSubagentLaunchContract)({
 		agent: source.agent,
 		cwd: source.cwd,
@@ -87,18 +128,20 @@ export async function resolveManagedResumeLaunchV1(
 		parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
 		availableModels: ctx.modelRegistry.getAvailable(),
 		preferredProvider: ctx.model?.provider,
-		skill: descriptor.skills,
-		output: descriptor.outputPath,
+		skill: agentConfig.skills,
+		output: execution.outputPath,
 		outputMode: descriptor.outputMode,
 		outputSchema: descriptor.structuredOutputSchema,
-		artifacts: descriptor.artifactConfig?.enabled ?? false,
+		artifacts: artifactConfig.enabled,
 		artifactDir: options.artifactDir,
 		parentSessionFile,
 		identityMode: "managed-v1",
 		parentSessionId,
 		sessionDir: sourceSessionRoot(source.canonicalSessionFile),
 		runId: candidateRunId,
-		capabilityCeiling: descriptor.capabilityCeiling,
+		capabilityCeiling,
+		managedAgentConfig: agentConfig,
+		managedArtifactsDir: execution.artifactsDir,
 	});
 	if (contractResult.ok === false || contractResult.contract.diagnostics.some((diagnostic) => diagnostic.severity !== "warning")) {
 		throw new TypeError("Managed resume launch contract preflight failed.");
@@ -144,5 +187,5 @@ export async function resolveManagedResumeLaunchV1(
 		}),
 		root: { version: 1, realPath: rootRealPath, device: String(rootStats.dev), inode: String(rootStats.ino) },
 	};
-	return Object.freeze({ request, source, contract, profile, profileIdentityDigest: computeManagedProfileIdentityDigest(profile) });
+	return Object.freeze({ request, source, execution, contract, profile, profileIdentityDigest: computeManagedProfileIdentityDigest(profile) });
 }

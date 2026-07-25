@@ -21,6 +21,9 @@ export interface ManagedOperationTerminalEvidenceV1 {
 	proofDigest: string;
 	observedAt: number;
 	canonicalSessionId: string;
+	/** Exact canonical-session file identity at terminal observation. */
+	sessionDevice?: string;
+	sessionInode?: string;
 }
 
 export interface ManagedOperationJournalRecordV1 {
@@ -49,6 +52,8 @@ export interface ManagedOperationJournalRecordV1 {
 	terminalAsyncDir?: string;
 	canonicalSessionFile?: string;
 	terminalEvidence?: ManagedOperationTerminalEvidenceV1;
+	/** Durable marker that the process owning the live close observer was lost. */
+	observerLost?: true;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -141,14 +146,22 @@ function parseTerminalEvidence(value: unknown): ManagedOperationTerminalEvidence
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is corrupt.");
 	const record = value as Record<string, unknown>;
 	const keys = Object.keys(record).sort();
-	if (keys.join("\0") !== ["canonicalSessionId", "observedAt", "proofDigest", "version"].sort().join("\0") || record.version !== 1) {
+	const legacyKeys = ["canonicalSessionId", "observedAt", "proofDigest", "version"].sort().join("\0");
+	const identityKeys = ["canonicalSessionId", "observedAt", "proofDigest", "sessionDevice", "sessionInode", "version"].sort().join("\0");
+	if ((keys.join("\0") !== legacyKeys && keys.join("\0") !== identityKeys) || record.version !== 1) {
 		throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is corrupt.");
+	}
+	if ((record.sessionDevice === undefined) !== (record.sessionInode === undefined)
+		|| (record.sessionDevice !== undefined && (typeof record.sessionDevice !== "string" || !/^[0-9]+$/.test(record.sessionDevice)))
+		|| (record.sessionInode !== undefined && (typeof record.sessionInode !== "string" || !/^[0-9]+$/.test(record.sessionInode)))) {
+		throw new ManagedOperationJournalError("corrupt", "Managed terminal session identity is corrupt.");
 	}
 	return {
 		version: 1,
 		proofDigest: assertDigest(record.proofDigest, "Managed terminal proof digest"),
 		observedAt: assertTimestamp(record.observedAt, "Managed terminal observedAt"),
 		canonicalSessionId: assertDigest(record.canonicalSessionId, "Managed canonical session id"),
+		...(record.sessionDevice !== undefined ? { sessionDevice: record.sessionDevice as string, sessionInode: record.sessionInode as string } : {}),
 	};
 }
 
@@ -339,7 +352,7 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 		"version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "method", "state",
 		"expectedLaunch", "runId", "sourceRunId", "sourceOperationId", "sourceRequestDigest", "sourceTerminalProofDigest",
 		"sourceCanonicalSessionId", "sourceRecoveryDescriptorDigest", "runnerProcessInstanceId", "runnerAdmissionTokenDigest",
-		"runnerSessionLeaseTokenDigest", "runnerCanonicalSessionId", "terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "createdAt", "updatedAt",
+		"runnerSessionLeaseTokenDigest", "runnerCanonicalSessionId", "terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "observerLost", "createdAt", "updatedAt",
 	]);
 	if (Object.keys(record).some((key) => !allowed.has(key))) throw new ManagedOperationJournalError("corrupt", "Managed operation record has unknown fields.");
 	if (record.version !== MANAGED_OPERATION_JOURNAL_VERSION) throw new ManagedOperationJournalError("corrupt", "Managed operation record version is unsupported.");
@@ -381,6 +394,10 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	if (record.terminalAsyncDir !== undefined) parsed.terminalAsyncDir = assertAbsolutePath(record.terminalAsyncDir, "Managed terminal async directory");
 	if (record.canonicalSessionFile !== undefined) parsed.canonicalSessionFile = assertAbsolutePath(record.canonicalSessionFile, "Managed canonical session file");
 	if (record.terminalEvidence !== undefined) parsed.terminalEvidence = parseTerminalEvidence(record.terminalEvidence);
+	if (record.observerLost !== undefined) {
+		if (record.observerLost !== true) throw new ManagedOperationJournalError("corrupt", "Managed observer-loss marker is corrupt.");
+		parsed.observerLost = true;
+	}
 	const launchMethod = parsed.method === "spawn" || parsed.method === "resume";
 	if (launchMethod && !parsed.expectedLaunch) {
 		throw new ManagedOperationJournalError("corrupt", "Managed launch operation lacks expected launch identity.");
@@ -664,6 +681,7 @@ export class ManagedOperationJournal {
 			terminalAsyncDir?: string;
 			canonicalSessionFile?: string;
 			terminalEvidence?: ManagedOperationTerminalEvidenceV1;
+			observerLost?: true;
 		} = {},
 	): Readonly<ManagedOperationJournalRecordV1> {
 		this.#assertOpen();
@@ -711,6 +729,10 @@ export class ManagedOperationJournal {
 		const patchedTerminalEvidence = patch.terminalEvidence !== undefined
 			? parseTerminalEvidence(patch.terminalEvidence)
 			: undefined;
+		if (patch.observerLost !== undefined && patch.observerLost !== true) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed observer-loss marker is invalid.");
+		}
+		const patchedObserverLost = patch.observerLost;
 		if (patchedSourceRunId !== undefined && existing.method !== "resume") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed source run identity is valid only for resume operations.");
 		}
@@ -773,6 +795,9 @@ export class ManagedOperationJournal {
 		}
 		if (patchedTerminalEvidence !== undefined && nextState !== "terminal") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed terminal evidence may bind only at terminal.");
+		}
+		if (patchedObserverLost && nextState !== "uncertain") {
+			throw new ManagedOperationJournalError("invalid_state", "Managed observer loss may bind only at uncertain.");
 		}
 		if (existing.runnerProcessInstanceId === undefined && patchedRunnerInstance !== undefined && nextState !== "runner-ready") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed runner admission correlation may first bind only at runner-ready.");
@@ -857,6 +882,7 @@ export class ManagedOperationJournal {
 			...(patchedTerminalAsyncDir !== undefined ? { terminalAsyncDir: patchedTerminalAsyncDir } : {}),
 			...(patchedCanonicalSessionFile !== undefined ? { canonicalSessionFile: patchedCanonicalSessionFile } : {}),
 			...(patchedTerminalEvidence !== undefined ? { terminalEvidence: patchedTerminalEvidence } : {}),
+			...(patchedObserverLost ? { observerLost: true as const } : {}),
 			updatedAt: Math.max(existing.updatedAt, this.#now()),
 		};
 		const validatedRecord = parseRecord(record);

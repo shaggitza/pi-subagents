@@ -26,6 +26,7 @@
 - Show each subagent child’s resolved `[fresh]` or `[fork]` launch context in foreground results, async status, fleet, and widget surfaces, with `[mixed]` on aggregate headers when a run uses both modes.
 
 ### Fixed
+- Hardened inert exact managed resume so its contract and runner share one recovered execution specification intersected with the current capability ceiling; resume-as-source admission/lease identity and terminal session device/inode are revalidated, same-path JSONL replacement is rejected, and startup observer loss becomes durable uncertainty without relaunch.
 - Closed the managed final-fence same-path substitution race by rechecking the original ancestor's real path, device, inode, and expected file kind immediately before launch side effects.
 - Kept explicit empty and MCP-only child tool allowlists from falling back to Pi's default builtin tools. Thanks to @jstokke for #628.
 - Kept completed Fleet inspector durations stable when legacy terminal status lacks an explicit end timestamp, preventing time-sensitive redraws from changing rendered snapshots.

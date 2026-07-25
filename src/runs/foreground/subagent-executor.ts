@@ -5,6 +5,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "../../agents/agents.ts";
 import { assertManagedConsumerId, assertManagedOperationId, assertManagedResumeExecutorRequestV1 } from "../../api/managed-dispatch.ts";
+import type { ManagedResumeExecutionSpecV1 } from "../../managed/resume-contract.ts";
 import type { ManagedResumeSourceV1 } from "../../managed/resume-source.ts";
 import { getArtifactsDir, getProjectChainRunsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -296,12 +297,15 @@ export interface PreparedSubagentResumePlan {
 	runnerAdmissionPath: string;
 	runnerAdmissionProceedPath: string;
 	runnerAdmissionCommitPath: string;
+	artifactsDir?: string;
+	outputPath?: string;
 }
 
 export interface PreparedSubagentResumeOptions {
 	runId: string;
 	dispatchIdentityDigest: string;
 	source: Readonly<ManagedResumeSourceV1>;
+	execution: Readonly<ManagedResumeExecutionSpecV1>;
 	beforeLaunch(plan: Readonly<PreparedSubagentResumePlan>): void | Promise<void>;
 	afterAuthorization(plan: Readonly<PreparedSubagentResumePlan>): undefined;
 	processTerminalBinding: Readonly<Omit<ManagedProcessTerminalBindingV1, "runnerAdmissionTokenDigest">>;
@@ -3635,6 +3639,9 @@ function validatePreparedResumeRequest(params: SubagentParamsLike, options: Prep
 	if (!options.source || options.source.sourceIndex !== 0 || options.source.canonicalSessionId.length !== 64) {
 		return "Prepared resume requires exact source authority.";
 	}
+	if (!options.execution || !options.execution.agentConfig || !options.execution.artifactConfig) {
+		return "Prepared resume requires an exact recovered execution specification.";
+	}
 	try {
 		assertManagedResumeExecutorRequestV1(params as unknown as import("../../api/managed-dispatch.ts").JsonObject, options.source.sourceRunId, 0);
 		const binding = options.processTerminalBinding;
@@ -4602,6 +4609,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			runnerAdmissionPath: admissionPaths.evidencePath,
 			runnerAdmissionProceedPath: admissionPaths.proceedPath,
 			runnerAdmissionCommitPath: admissionPaths.commitPath,
+			...(options.execution.artifactsDir ? { artifactsDir: options.execution.artifactsDir } : {}),
+			...(options.execution.outputPath ? { outputPath: options.execution.outputPath } : {}),
 		});
 		try {
 			await options.beforeLaunch(plan);
@@ -4622,18 +4631,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			return preparedSpawnError("Prepared resume candidate ownership failed after authorization.");
 		}
 		const descriptor = source.recoveryDescriptor;
-		const baseAgent: AgentConfig = {
-			name: source.agent,
-			description: "Persisted managed resume contract",
-			systemPrompt: descriptor.systemPrompt ?? "",
-			systemPromptMode: descriptor.systemPromptMode,
-			inheritProjectContext: descriptor.inheritProjectContext,
-			inheritSkills: descriptor.inheritSkills,
-			source: "project",
-			filePath: descriptor.agentFilePath ?? path.join(source.cwd, ".pi-subagents-managed-resume-agent"),
-		};
-		const agentConfig = applySteeringRecoveryAgentConfig(baseAgent, descriptor);
-		const artifactConfig: ArtifactConfig = descriptor.artifactConfig ?? { ...DEFAULT_ARTIFACT_CONFIG, enabled: false };
+		const agentConfig = options.execution.agentConfig as AgentConfig;
+		const artifactConfig = options.execution.artifactConfig as ArtifactConfig;
 		const resumeBinding: PreparedRunnerResumeBindingV1 = {
 			version: 1,
 			sourceRunId: source.sourceRunId,
@@ -4656,7 +4655,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				interactive: ctx.hasUI,
 			},
 			cwd: source.cwd,
-			artifactsDir: descriptor.artifactsDir,
+			artifactsDir: options.execution.artifactsDir,
 			artifactConfig,
 			shareEnabled: descriptor.share,
 			sessionRoot: path.dirname(path.dirname(source.canonicalSessionFile)),
@@ -4668,7 +4667,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			maxSubagentDepth: descriptor.maxSubagentDepth,
 			waitToolEnabled: deps.waitToolEnabled,
 			availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
-			output: descriptor.outputPath,
+			output: options.execution.outputPath,
 			outputMode: descriptor.outputMode,
 			...(descriptor.agentContract ? { agentContract: descriptor.agentContract } : {}),
 			...(descriptor.structuredOutputSchema ? { structuredOutputSchema: descriptor.structuredOutputSchema } : {}),
@@ -4676,7 +4675,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			...(descriptor.acceptance !== undefined ? { acceptance: descriptor.acceptance } : {}),
 			...(descriptor.initialTurnBudget ? { turnBudget: descriptor.initialTurnBudget } : {}),
 			...(descriptor.initialToolBudget ? { toolBudget: descriptor.initialToolBudget } : {}),
-			capabilityCeiling: descriptor.capabilityCeiling,
+			capabilityCeiling: options.execution.capabilityCeiling,
 			exclusiveRunPaths: true,
 			preparedResultReservation: resultReservation,
 			preparedRunnerAdmission: {

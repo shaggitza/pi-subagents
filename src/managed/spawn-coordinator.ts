@@ -216,7 +216,7 @@ export class ManagedSpawnCoordinator {
 		return resolved;
 	}
 
-	reconcileExisting(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+	reconcileExisting(record: Readonly<ManagedOperationJournalRecordV1>, options: { observerLost?: boolean } = {}): Readonly<ManagedOperationJournalRecordV1> {
 		const snapshot = this.#snapshot();
 		const activeParentDigest = computeParentSessionIdentityDigest(snapshot.parentSessionId, snapshot.parentSessionFile);
 		if (record.parentSessionIdentityDigest !== activeParentDigest) {
@@ -225,7 +225,18 @@ export class ManagedSpawnCoordinator {
 		if (!this.#snapshotIsCurrent(snapshot)) {
 			return fail("no_active_session", "Managed parent session changed during recovery.");
 		}
-		return this.#reconcileReplay(record, record.requestDigest);
+		const reconciled = this.#reconcileReplay(record, record.requestDigest);
+		if (options.observerLost === true && reconciled.state === "accepted") {
+			return this.#options.journal.transition(
+				reconciled.parentSessionIdentityDigest,
+				reconciled.consumerId,
+				reconciled.operationId,
+				reconciled.requestDigest,
+				"uncertain",
+				{ observerLost: true },
+			);
+		}
+		return reconciled;
 	}
 
 	async dispatchSpawn(
@@ -489,7 +500,9 @@ export class ManagedSpawnCoordinator {
 			&& proof.runId === record.runId
 			&& proof.runnerProcessInstanceId === record.runnerProcessInstanceId
 			&& proof.managed !== undefined
-			&& proof.canonicalSession?.freeAtObservation === true;
+			&& proof.canonicalSession?.freeAtObservation === true
+			&& proof.canonicalSession.sessionDevice !== undefined
+			&& proof.canonicalSession.sessionInode !== undefined;
 		let expectedCanonicalSessionId: string | undefined;
 		try {
 			expectedCanonicalSessionId = canonicalSessionId(record.canonicalSessionFile);
@@ -515,6 +528,8 @@ export class ManagedSpawnCoordinator {
 				proofDigest: computeManagedProcessTerminalProofDigest(proof),
 				observedAt: proof.observedAt!,
 				canonicalSessionId: expectedCanonicalSessionId,
+				sessionDevice: proof.canonicalSession!.sessionDevice!,
+				sessionInode: proof.canonicalSession!.sessionInode!,
 			},
 		});
 	}
@@ -538,6 +553,7 @@ export class ManagedSpawnCoordinator {
 				runId: reconciling.runId,
 			});
 		}
+		if (record.state === "uncertain" && record.observerLost) return record;
 		if (record.state === "uncertain" && !durableTerminalProofExists
 			&& record.runnerProcessInstanceId && record.runnerAdmissionTokenDigest && this.#hasCommittedAdmission(record)) {
 			this.#options.journal.transition(parentSessionIdentityDigest, consumerId, operationId, requestDigest, "reconciling");

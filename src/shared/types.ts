@@ -345,6 +345,9 @@ export interface ProcessInstanceExitV1 {
 
 export interface CanonicalSessionTerminalV1 {
 	canonicalSessionId: string;
+	/** Exact file identity observed when the canonical session was proven free. */
+	sessionDevice?: string;
+	sessionInode?: string;
 	leaseDisposition: "released" | "not-held";
 	freeAtObservation: true;
 	canonicalSessionLeaseReleased?: true;

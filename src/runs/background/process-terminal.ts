@@ -228,8 +228,12 @@ function resumeDisposition(state: string | undefined, sessionFile: string | unde
 function sessionProjection(candidate: ProcessTerminalCandidate, lease: ReturnType<typeof inspectSessionLease>): CanonicalSessionTerminalV1 | undefined {
 	if (!candidate.sessionFile || lease.state !== "free") return undefined;
 	if (candidate.revivalLeaseToken && candidate.revivalLeaseReleaseAcknowledged !== true) return undefined;
+	const stats = fs.statSync(lease.canonicalSessionFile, { bigint: true });
+	if (!stats.isFile()) return undefined;
 	return {
 		canonicalSessionId: canonicalSessionId(candidate.sessionFile),
+		sessionDevice: String(stats.dev),
+		sessionInode: String(stats.ino),
 		leaseDisposition: candidate.revivalLeaseToken ? "released" : "not-held",
 		freeAtObservation: true,
 		...(candidate.revivalLeaseToken ? { canonicalSessionLeaseReleased: true } : {}),
@@ -237,10 +241,13 @@ function sessionProjection(candidate: ProcessTerminalCandidate, lease: ReturnTyp
 }
 
 function validateCanonicalSession(value: unknown, label: string): value is CanonicalSessionTerminalV1 {
-	if (!isRecord(value) || !hasOnlyKeys(value, ["canonicalSessionId", "leaseDisposition", "freeAtObservation"], ["canonicalSessionLeaseReleased"])) {
+	if (!isRecord(value) || !hasOnlyKeys(value, ["canonicalSessionId", "leaseDisposition", "freeAtObservation"], ["canonicalSessionLeaseReleased", "sessionDevice", "sessionInode"])) {
 		throw new Error(`Invalid canonical-session proof in '${label}'.`);
 	}
 	if (typeof value.canonicalSessionId !== "string" || !SHA256.test(value.canonicalSessionId)
+		|| (value.sessionDevice !== undefined && (typeof value.sessionDevice !== "string" || !/^[0-9]+$/.test(value.sessionDevice)))
+		|| (value.sessionInode !== undefined && (typeof value.sessionInode !== "string" || !/^[0-9]+$/.test(value.sessionInode)))
+		|| ((value.sessionDevice === undefined) !== (value.sessionInode === undefined))
 		|| (value.leaseDisposition !== "released" && value.leaseDisposition !== "not-held")
 		|| value.freeAtObservation !== true
 		|| (value.canonicalSessionLeaseReleased !== undefined && value.canonicalSessionLeaseReleased !== true)

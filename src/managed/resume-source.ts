@@ -113,8 +113,10 @@ function exactSourceRecord(
 	}
 	if (!record) return fail("not_found", "Managed resume source was not found.");
 	if ((record.method !== "spawn" && record.method !== "resume") || record.state !== "terminal" || record.runId !== sourceRunId
-		|| !record.terminalEvidence || !record.terminalAsyncDir || !record.canonicalSessionFile
-		|| !record.runnerProcessInstanceId || !record.runnerAdmissionTokenDigest) {
+		|| !record.terminalEvidence || !record.terminalEvidence.sessionDevice || !record.terminalEvidence.sessionInode
+		|| !record.terminalAsyncDir || !record.canonicalSessionFile
+		|| !record.runnerProcessInstanceId || !record.runnerAdmissionTokenDigest
+		|| (record.method === "resume" && (!record.sourceRunId || !record.runnerSessionLeaseTokenDigest || !record.runnerCanonicalSessionId))) {
 		return fail(record.state === "retired" ? "retired" : "invalid_state", "Managed resume source is not a resumable terminal actor.");
 	}
 	return record;
@@ -147,13 +149,27 @@ export function resolveManagedResumeSourceV1(input: {
 	try {
 		admission = readPreparedRunnerAdmissionEvidenceForDispatch(
 			preparedRunnerAdmissionPaths(record.terminalAsyncDir!).evidencePath,
-			{ runId: record.runId!, dispatchIdentityDigest: record.requestDigest },
+			{
+				runId: record.runId!,
+				dispatchIdentityDigest: record.requestDigest,
+				...(record.method === "resume" ? {
+					resume: {
+						version: 1 as const,
+						sourceRunId: record.sourceRunId!,
+						sourceIndex: 0 as const,
+						canonicalSessionId: record.runnerCanonicalSessionId!,
+					},
+				} : {}),
+			},
 		);
 	} catch {
 		return fail("operation_uncertain", "Managed resume source admission evidence is unavailable or mismatched.");
 	}
 	if (admission?.state !== "committed" || admission.runnerProcessInstanceId !== record.runnerProcessInstanceId
-		|| computePreparedRunnerAdmissionTokenDigest(admission.token) !== record.runnerAdmissionTokenDigest) {
+		|| computePreparedRunnerAdmissionTokenDigest(admission.token) !== record.runnerAdmissionTokenDigest
+		|| (record.method === "resume" && (!record.runnerSessionLeaseTokenDigest
+			|| !record.runnerCanonicalSessionId
+			|| admission.sessionLeaseTokenDigest !== record.runnerSessionLeaseTokenDigest))) {
 		return fail("operation_uncertain", "Managed resume source admission evidence is unavailable or mismatched.");
 	}
 	const proof = readProcessTerminal(record.terminalAsyncDir!, {
@@ -168,7 +184,12 @@ export function resolveManagedResumeSourceV1(input: {
 	}
 	const session = assertCanonicalSessionFile(record.canonicalSessionFile!);
 	if (proof.canonicalSession.canonicalSessionId !== session.canonicalId
-		|| record.terminalEvidence!.canonicalSessionId !== session.canonicalId) {
+		|| record.terminalEvidence!.canonicalSessionId !== session.canonicalId
+		|| !record.terminalEvidence!.sessionDevice || !record.terminalEvidence!.sessionInode
+		|| proof.canonicalSession.sessionDevice !== record.terminalEvidence!.sessionDevice
+		|| proof.canonicalSession.sessionInode !== record.terminalEvidence!.sessionInode
+		|| session.device !== record.terminalEvidence!.sessionDevice
+		|| session.inode !== record.terminalEvidence!.sessionInode) {
 		return fail("operation_uncertain", "Managed resume source canonical session differs from terminal evidence.");
 	}
 	let lease: ReturnType<typeof inspectSessionLease>;

@@ -1441,6 +1441,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 				source,
+				execution: {
+					agentConfig: makeAgent("echo"),
+					artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 0 },
+				},
 				...preparedTerminalOptions(candidate),
 				beforeLaunch: (plan) => {
 					assert.equal(plan.sourceSessionFile, sourceSessionFile);

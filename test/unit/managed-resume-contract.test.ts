@@ -97,6 +97,57 @@ describe("managed resume launch contract", () => {
 		assert.equal(replay.profileIdentityDigest, resolved.profileIdentityDigest);
 	});
 
+	it("binds the exact recovered execution spec and tightened active capability ceiling", async () => {
+		const artifactsDir = path.join(temporary, "retained-artifacts");
+		fs.mkdirSync(artifactsDir, { recursive: true });
+		const skillDir = path.join(temporary, "retained-skills");
+		fs.mkdirSync(skillDir, { recursive: true });
+		const retained = source({
+			recoveryDescriptor: {
+				version: 1,
+				sourceRunId: "source-run",
+				agent: "worker",
+				sessionFile: path.join(temporary, "sessions", "source", "run-0", "session.jsonl"),
+				cwd: temporary,
+				model: "test/model",
+				fallbackModels: ["test/fallback"],
+				tools: ["read", "write"],
+				extensions: ["retained-extension.ts"],
+				subagentOnlyExtensions: ["retained-child.ts"],
+				mcpDirectTools: ["server/tool"],
+				systemPrompt: "retained prompt",
+				systemPromptMode: "replace",
+				inheritProjectContext: false,
+				inheritSkills: false,
+				skills: ["retained-skill"],
+				skillPath: [skillDir],
+				memory: { scope: "project", path: "MEMORY.md" },
+				outputPath: path.join(temporary, "retained-output.md"),
+				outputMode: "inline",
+				artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 1 },
+				artifactsDir,
+				maxSubagentDepth: 1,
+				share: false,
+				capabilityCeiling: { version: 1, allowedTools: ["read", "write"], denyExtensions: false, sources: ["source"] },
+			},
+		});
+		let captured: SubagentLaunchContractInput | undefined;
+		const result = await resolveManagedResumeLaunchV1(request, "candidate-resume", retained, context(), "parent", path.join(temporary, "parent.jsonl"), {
+			resolveContract: (input) => { captured = input; return resolver(input); },
+			resolveCapabilityCeiling: () => ({ version: 1, allowedTools: ["read"], denyExtensions: true, sources: ["current"] }),
+		});
+		assert.deepEqual(result.execution.capabilityCeiling?.allowedTools, ["read"]);
+		assert.equal(result.execution.capabilityCeiling?.denyExtensions, true);
+		assert.deepEqual(captured?.capabilityCeiling, result.execution.capabilityCeiling);
+		assert.equal(captured?.managedArtifactsDir, artifactsDir);
+		assert.deepEqual(captured?.managedAgentConfig?.fallbackModels, ["test/fallback"]);
+		assert.deepEqual(captured?.managedAgentConfig?.tools, ["read", "write"]);
+		assert.deepEqual(captured?.managedAgentConfig?.extensions, ["retained-extension.ts"]);
+		assert.equal(captured?.managedAgentConfig?.systemPrompt, "retained prompt");
+		assert.deepEqual(captured?.managedAgentConfig?.skillPath, [skillDir]);
+		assert.deepEqual(captured?.managedAgentConfig?.memory, { scope: "project", path: "MEMORY.md" });
+	});
+
 	it("changes contract and profile identity when durable source proof identity changes", async () => {
 		const first = await resolveManagedResumeLaunchV1(request, "candidate-resume", source(), context(), "parent", path.join(temporary, "parent.jsonl"), { resolveContract: resolver });
 		const changed = await resolveManagedResumeLaunchV1(request, "candidate-resume", source({ sourceTerminalProofDigest: "9".repeat(64) }), context(), "parent", path.join(temporary, "parent.jsonl"), { resolveContract: resolver });

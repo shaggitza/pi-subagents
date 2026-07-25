@@ -255,7 +255,10 @@ export class ManagedDispatchProvider {
 						}
 						runBindings.set(key, record.operationId);
 					}
-					coordinator.reconcileExisting(record);
+					// A newly bound provider cannot inherit the former parent's live close
+					// observer. Accepted-without-proof is therefore durably uncertain;
+					// it is never inferred terminal and never relaunched.
+					coordinator.reconcileExisting(record, { observerLost: true });
 				}
 				cursor = page.nextCursor;
 				await Promise.resolve();

@@ -28,7 +28,7 @@ import type {
 	createSubagentExecutor,
 } from "../runs/foreground/subagent-executor.ts";
 import { ManagedOperationJournal, type ManagedOperationJournalRecordV1 } from "./operation-journal.ts";
-import { resolveManagedResumeLaunchV1, type ResolvedManagedResumeLaunchV1 } from "./resume-contract.ts";
+import { resolveManagedResumeLaunchV1, type ManagedResumeLaunchResolverOptions, type ResolvedManagedResumeLaunchV1 } from "./resume-contract.ts";
 import { resolveManagedResumeSourceV1, type ManagedResumeSourceV1 } from "./resume-source.ts";
 
 export interface ManagedResumeExecutor {
@@ -50,6 +50,7 @@ export interface ManagedResumeCoordinatorOptions {
 	hostIdPath?: string;
 	loadHostId?: (filePath?: string) => string;
 	artifactDir?: "project" | "session" | "temp";
+	resolveCapabilityCeiling?: ManagedResumeLaunchResolverOptions["resolveCapabilityCeiling"];
 	resolveLaunch?: typeof resolveManagedResumeLaunchV1;
 }
 
@@ -104,7 +105,8 @@ function planMatches(plan: Readonly<PreparedSubagentResumePlan>, resolved: Resol
 		&& plan.cwd === resolved.source.cwd && plan.asyncDir === roots.asyncDir && plan.resultPath === roots.resultPath
 		&& plan.resultReservationPath === roots.resultReservationPath && plan.runnerConfigPath === roots.runnerConfigPath
 		&& plan.runnerAdmissionPath === roots.runnerAdmissionPath && plan.runnerAdmissionProceedPath === roots.runnerAdmissionProceedPath
-		&& plan.runnerAdmissionCommitPath === roots.runnerAdmissionCommitPath;
+		&& plan.runnerAdmissionCommitPath === roots.runnerAdmissionCommitPath
+		&& plan.artifactsDir === roots.artifactsDir && plan.outputPath === roots.outputPath;
 }
 
 function operationKey(parent: string, request: ManagedResumeRequestV1): string {
@@ -150,7 +152,10 @@ export class ManagedResumeCoordinator {
 	async #resolve(request: ManagedResumeRequestV1, source: Readonly<ManagedResumeSourceV1>, snapshot: ParentSnapshot): Promise<ResolvedManagedResumeLaunchV1> {
 		const resolved = await (this.#options.resolveLaunch ?? resolveManagedResumeLaunchV1)(
 			request.input.request, request.expectedLaunch.candidateRunId, source, snapshot.ctx,
-			snapshot.parentSessionId, snapshot.parentSessionFile, { artifactDir: this.#options.artifactDir },
+			snapshot.parentSessionId, snapshot.parentSessionFile, {
+				artifactDir: this.#options.artifactDir,
+				resolveCapabilityCeiling: this.#options.resolveCapabilityCeiling,
+			},
 		);
 		if (!this.#current(snapshot)) return fail("no_active_session", "Managed resume parent session changed during authorization.");
 		return resolved;
@@ -213,6 +218,7 @@ export class ManagedResumeCoordinator {
 			runId: request.expectedLaunch.candidateRunId,
 			dispatchIdentityDigest: digest,
 			source: initialSource,
+			execution: initialResolved.execution,
 			processTerminalBinding: { version: 1, parentSessionIdentityDigest: parent, consumerId: consumer, operationId: operation, requestDigest: digest, candidateRunId: request.expectedLaunch.candidateRunId },
 			beforeLaunch: async (plan) => {
 				const execution = this.#snapshot();
@@ -298,6 +304,7 @@ export class ManagedResumeCoordinator {
 		let canonical: string | undefined;
 		try { canonical = canonicalSessionId(record.canonicalSessionFile); } catch { canonical = undefined; }
 		const exact = proof.state === "observed" && proof.canonicalSession?.canonicalSessionId === canonical
+			&& proof.canonicalSession.sessionDevice !== undefined && proof.canonicalSession.sessionInode !== undefined
 			&& proof.canonicalSession.canonicalSessionLeaseReleased === true && proof.resumeDisposition === "resumable";
 		if (!exact || !canonical) {
 			if (record.state === "accepted" || record.state === "reconciling") return this.#options.journal.transition(record.parentSessionIdentityDigest, record.consumerId, record.operationId, record.requestDigest, "uncertain");
@@ -306,8 +313,28 @@ export class ManagedResumeCoordinator {
 		let current = record;
 		if (current.state === "uncertain") current = this.#options.journal.transition(current.parentSessionIdentityDigest, current.consumerId, current.operationId, current.requestDigest, "reconciling");
 		return this.#options.journal.transition(current.parentSessionIdentityDigest, current.consumerId, current.operationId, current.requestDigest, "terminal", {
-			terminalEvidence: { version: 1, proofDigest: computeManagedProcessTerminalProofDigest(proof), observedAt: proof.observedAt!, canonicalSessionId: canonical },
+			terminalEvidence: {
+				version: 1,
+				proofDigest: computeManagedProcessTerminalProofDigest(proof),
+				observedAt: proof.observedAt!,
+				canonicalSessionId: canonical,
+				sessionDevice: proof.canonicalSession!.sessionDevice!,
+				sessionInode: proof.canonicalSession!.sessionInode!,
+			},
 		});
+	}
+
+	reconcileAfterObserverLoss(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+		const reconciled = this.#reconcile(record);
+		if (reconciled.state !== "accepted") return reconciled;
+		return this.#options.journal.transition(
+			reconciled.parentSessionIdentityDigest,
+			reconciled.consumerId,
+			reconciled.operationId,
+			reconciled.requestDigest,
+			"uncertain",
+			{ observerLost: true },
+		);
 	}
 
 	#reconcile(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
@@ -321,6 +348,7 @@ export class ManagedResumeCoordinator {
 			return this.#options.journal.transition(parent, consumer, operation, digest, "uncertain");
 		}
 		if (record.state === "uncertain") {
+			if (record.observerLost) return record;
 			if (record.terminalAsyncDir && readProcessTerminal(record.terminalAsyncDir, { runId: record.runId, runnerProcessInstanceId: record.runnerProcessInstanceId })) return record;
 			if (this.#hasCommitted(record)) {
 				this.#options.journal.transition(parent, consumer, operation, digest, "reconciling");

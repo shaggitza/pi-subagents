@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { computeManagedRequestDigest, type JsonObject } from "../../src/api/managed-dispatch.ts";
-import type { SubagentLaunchContract } from "../../src/api/preflight.ts";
+import { computeParentSessionIdentityDigest, type SubagentLaunchContract } from "../../src/api/preflight.ts";
 import { ManagedOperationJournal } from "../../src/managed/operation-journal.ts";
 import {
 	ManagedSpawnCoordinator,
@@ -25,13 +25,14 @@ import { ASYNC_DIR, RESULTS_DIR, getAsyncConfigPath } from "../../src/shared/typ
 import { canonicalSessionId } from "../../src/runs/shared/session-lease.ts";
 
 let temporary = "";
-const parentDigest = "c".repeat(64);
+let parentDigest = "c".repeat(64);
 const profileDigest = "a".repeat(64);
 const contractDigest = "b".repeat(64);
 const hostId = "host-1";
 
 beforeEach(() => {
 	temporary = fs.mkdtempSync(path.join(os.tmpdir(), "managed-spawn-coordinator-"));
+	parentDigest = computeParentSessionIdentityDigest("parent-session", path.join(temporary, "parent.jsonl"));
 });
 
 afterEach(() => {
@@ -398,6 +399,20 @@ describe("unregistered managed spawn coordinator", () => {
 		assert.equal(replay.state, "terminal");
 		assert.equal(replay.replayed, true);
 		assert.equal(calls, 0);
+		store.close();
+	});
+
+	it("classifies accepted state uncertain when startup has lost the live close observer", async () => {
+		const runId = candidate("observer-loss");
+		const store = new ManagedOperationJournal({ root: path.join(temporary, "journal-observer-loss") });
+		const calls = { value: 0 };
+		const coordinator = makeCoordinator(store, successfulExecutor(runId, calls), async () => resolved(runId));
+		await coordinator.dispatchSpawn(spawnRequest(runId));
+		const accepted = store.read(parentDigest, "pi-signal", operationId())!;
+		assert.equal(accepted.state, "accepted");
+		const recovered = coordinator.reconcileExisting(accepted, { observerLost: true });
+		assert.equal(recovered.state, "uncertain");
+		assert.equal(calls.value, 1, "observer-loss recovery must never relaunch");
 		store.close();
 	});
 

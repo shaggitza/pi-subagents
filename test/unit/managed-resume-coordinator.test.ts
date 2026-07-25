@@ -60,10 +60,13 @@ function createTerminalSource(journal: ManagedOperationJournal): { runId: string
 	journal.transition(parentDigest, "pi-signal", sourceOperationId, digest, "runner-ready", { runnerProcessInstanceId: "source-runner", runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(admission.token) });
 	journal.transition(parentDigest, "pi-signal", sourceOperationId, digest, "accepted");
 	writePreparedRunnerAdmissionEvidence(preparedRunnerAdmissionPaths(asyncDir).evidencePath, admission, "committed", 123, "source-runner", 10);
+	const sessionStats = fs.statSync(sessionFile, { bigint: true });
+	const sessionDevice = String(sessionStats.dev);
+	const sessionInode = String(sessionStats.ino);
 	const managed = { version: 1 as const, parentSessionIdentityDigest: parentDigest, consumerId: "pi-signal", operationId: sourceOperationId, requestDigest: digest, candidateRunId: runId, runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(admission.token) };
-	const proof: ProcessTerminalV1 = { version: 1, state: "observed", runId, runnerProcessInstanceId: "source-runner", observedAt: 20, instances: [{ kind: "runner", processInstanceId: "source-runner", closeObservedAt: 20, exitCode: 0, signal: null }], managed, canonicalSession: { canonicalSessionId: canonicalSessionId(sessionFile), leaseDisposition: "not-held", freeAtObservation: true }, resumeDisposition: "resumable" };
+	const proof: ProcessTerminalV1 = { version: 1, state: "observed", runId, runnerProcessInstanceId: "source-runner", observedAt: 20, instances: [{ kind: "runner", processInstanceId: "source-runner", closeObservedAt: 20, exitCode: 0, signal: null }], managed, canonicalSession: { canonicalSessionId: canonicalSessionId(sessionFile), sessionDevice, sessionInode, leaseDisposition: "not-held", freeAtObservation: true }, resumeDisposition: "resumable" };
 	fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
-	journal.transition(parentDigest, "pi-signal", sourceOperationId, digest, "terminal", { terminalEvidence: { version: 1, proofDigest: computeManagedProcessTerminalProofDigest(proof), observedAt: 20, canonicalSessionId: canonicalSessionId(sessionFile) } });
+	journal.transition(parentDigest, "pi-signal", sourceOperationId, digest, "terminal", { terminalEvidence: { version: 1, proofDigest: computeManagedProcessTerminalProofDigest(proof), observedAt: 20, canonicalSessionId: canonicalSessionId(sessionFile), sessionDevice, sessionInode } });
 	fs.writeFileSync(path.join(asyncDir, "recovery-descriptor.json"), JSON.stringify({ version: 1, sourceRunId: runId, agent: "worker", sessionFile, cwd: temporary, systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false, outputMode: "inline", maxSubagentDepth: 1, share: false }));
 	return { runId, sessionFile };
 }
@@ -94,6 +97,10 @@ function resolved(runId: string, source: Readonly<ManagedResumeSourceV1>): Resol
 	return {
 		request: { action: "resume", runId: source.sourceRunId, index: 0, message: "continue", async: true, clarify: false, context: "fresh" },
 		source,
+		execution: {
+			agentConfig: { name: "worker", description: "recovered", systemPrompt: "", systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false, source: "project", filePath: path.join(temporary, "worker.md") },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 0 },
+		},
 		contract: { version: 1, runId, parentSessionIdentityDigest: parentDigest, source: { operationId: source.sourceOperationId, requestDigest: source.sourceRequestDigest, runId: source.sourceRunId, index: 0, terminalProofDigest: source.sourceTerminalProofDigest, canonicalSessionId: source.canonicalSessionId, canonicalSessionFile: source.canonicalSessionFile, sessionDevice: source.sessionDevice, sessionInode: source.sessionInode, recoveryDescriptorDigest: source.recoveryDescriptorDigest }, launchContract, digest: resumeContractDigest },
 		profile: { version: 1, contentDigest: "2".repeat(64), root: { version: 1, realPath: temporary } },
 		profileIdentityDigest: profileDigest,
@@ -123,7 +130,8 @@ function successfulExecutor(runId: string, calls: { value: number }, terminal = 
 		writePreparedRunnerAdmissionEvidence(admissionPaths.evidencePath, admission, "committed", 123, "resume-runner", 50, leaseDigest);
 		if (terminal) {
 			const managed = { ...options.processTerminalBinding, runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(admission.token), sessionLeaseTokenDigest: leaseDigest };
-			const proof: ProcessTerminalV1 = { version: 1, state: "observed", runId, runnerProcessInstanceId: "resume-runner", observedAt: 60, instances: [{ kind: "runner", processInstanceId: "resume-runner", closeObservedAt: 60, exitCode: 0, signal: null }], managed, canonicalSession: { canonicalSessionId: source.canonicalSessionId, leaseDisposition: "released", freeAtObservation: true, canonicalSessionLeaseReleased: true }, resumeDisposition: "resumable" };
+			const sourceStats = fs.statSync(source.canonicalSessionFile, { bigint: true });
+			const proof: ProcessTerminalV1 = { version: 1, state: "observed", runId, runnerProcessInstanceId: "resume-runner", observedAt: 60, instances: [{ kind: "runner", processInstanceId: "resume-runner", closeObservedAt: 60, exitCode: 0, signal: null }], managed, canonicalSession: { canonicalSessionId: source.canonicalSessionId, sessionDevice: String(sourceStats.dev), sessionInode: String(sourceStats.ino), leaseDisposition: "released", freeAtObservation: true, canonicalSessionLeaseReleased: true }, resumeDisposition: "resumable" };
 			fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(proof));
 			options.onProcessTerminal(proof);
 		}
@@ -163,6 +171,9 @@ describe("unregistered managed resume coordinator", () => {
 		const reopened = coordinator(journal, { executePreparedResume: (async () => { calls.value++; return { content: [], details: { mode: "single", results: [] } }; }) as ManagedResumeExecutor["executePreparedResume"] });
 		assert.equal((await reopened.dispatchResume(resumeRequest(source.runId, runId, "reopened"))).state, "accepted");
 		assert.equal(calls.value, 1, "reopened accepted admission must not execute again");
+		const observerLost = reopened.reconcileAfterObserverLoss(journal.read(parentDigest, "pi-signal", resumeOperationId)!);
+		assert.equal(observerLost.state, "uncertain");
+		assert.equal(calls.value, 1, "observer-loss reconciliation must not execute again");
 		fs.writeFileSync(path.join(ASYNC_DIR, runId, "process-terminal.json"), JSON.stringify({ version: 1, state: "unknown", runId, runnerProcessInstanceId: "resume-runner", reason: "observer-unavailable" }));
 		assert.equal((await reopened.dispatchResume(resumeRequest(source.runId, runId, "unknown-1"))).state, "uncertain");
 		assert.equal((await reopened.dispatchResume(resumeRequest(source.runId, runId, "unknown-2"))).state, "uncertain");
