@@ -12,6 +12,7 @@ import {
 	type ManagedSpawnRequestV1,
 } from "../api/managed-dispatch.ts";
 import {
+	computeParentSessionIdentityDigest,
 	managedLaunchRootProjectionsAreCurrent,
 	type SubagentLaunchContract,
 } from "../api/preflight.ts";
@@ -149,10 +150,7 @@ function operationKey(parentSessionIdentityDigest: string, request: ManagedSpawn
 	return `${parentSessionIdentityDigest}\0${request.managed.consumerId}\0${request.managed.operationId}`;
 }
 
-/**
- * Unregistered managed spawn coordinator. It is deliberately not an event-bus
- * provider and is not managed capability evidence.
- */
+/** Guarded spawn coordinator. Event-bus registration and capability evidence are owned by the recovery-gated provider. */
 export class ManagedSpawnCoordinator {
 	readonly #options: ManagedSpawnCoordinatorOptions;
 	readonly #inFlight = new Map<string, {
@@ -216,6 +214,18 @@ export class ManagedSpawnCoordinator {
 			return fail("no_active_session", "Managed spawn parent session changed during authorization.");
 		}
 		return resolved;
+	}
+
+	reconcileExisting(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+		const snapshot = this.#snapshot();
+		const activeParentDigest = computeParentSessionIdentityDigest(snapshot.parentSessionId, snapshot.parentSessionFile);
+		if (record.parentSessionIdentityDigest !== activeParentDigest) {
+			return fail("not_found", "Managed operation was not found in the active parent session.");
+		}
+		if (!this.#snapshotIsCurrent(snapshot)) {
+			return fail("no_active_session", "Managed parent session changed during recovery.");
+		}
+		return this.#reconcileReplay(record, record.requestDigest);
 	}
 
 	async dispatchSpawn(

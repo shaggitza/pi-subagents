@@ -227,7 +227,7 @@ function digestManagedSkillContent(content: string): string {
 	return sha256StableJson({ domain: "pi-subagents/managed-dispatch/v1/skill-content", content });
 }
 
-function digestParentSessionIdentity(sessionId: string, sessionFile: string | null | undefined): string {
+export function computeParentSessionIdentityDigest(sessionId: string, sessionFile: string | null | undefined): string {
 	return sha256StableJson({ sessionId, sessionFile: sessionFile ? path.resolve(sessionFile) : null });
 }
 
@@ -496,7 +496,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		version: SUBAGENT_LAUNCH_CONTRACT_VERSION,
 		runId,
 		...(input.identityMode === "managed-v1" && input.parentSessionId ? {
-			parentSessionIdentityDigest: digestParentSessionIdentity(input.parentSessionId, input.parentSessionFile),
+			parentSessionIdentityDigest: computeParentSessionIdentityDigest(input.parentSessionId, input.parentSessionFile),
 		} : {}),
 		agent: {
 			name: agent.name,

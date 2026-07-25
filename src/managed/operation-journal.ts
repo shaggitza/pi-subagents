@@ -50,6 +50,16 @@ export interface ManagedOperationClaimResult {
 	record: Readonly<ManagedOperationJournalRecordV1>;
 }
 
+export interface ManagedOperationJournalCursorV1 {
+	consumerId: string;
+	operationId: string;
+}
+
+export interface ManagedOperationJournalPageV1 {
+	records: ReadonlyArray<Readonly<ManagedOperationJournalRecordV1>>;
+	nextCursor?: ManagedOperationJournalCursorV1;
+}
+
 export class ManagedOperationJournalError extends Error {
 	readonly code: ManagedDispatchErrorCodeV1 | "busy" | "corrupt";
 
@@ -757,6 +767,81 @@ export class ManagedOperationJournal {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
 		}
+	}
+
+	list(
+		parentSessionIdentityDigest: string,
+		options: { limit?: number; after?: ManagedOperationJournalCursorV1 } = {},
+	): ManagedOperationJournalPageV1 {
+		this.#assertOpen();
+		const sessionDigest = assertDigest(parentSessionIdentityDigest, "Managed parent-session identity digest");
+		const limit = options.limit ?? 256;
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+			throw new ManagedOperationJournalError("invalid_request", "Managed journal page limit is invalid.");
+		}
+		const after = options.after ? {
+			consumerId: assertManagedConsumerId(options.after.consumerId),
+			operationId: assertManagedOperationId(options.after.operationId),
+		} : undefined;
+		const operations = existingPrivateChild(this.root, "operations");
+		if (!operations) return { records: [] };
+		const session = existingPrivateChild(operations, sessionDigest);
+		if (!session) return { records: [] };
+		const entries: Array<{ consumerId: string; operationId: string; directory: string }> = [];
+		for (const consumerName of fs.readdirSync(session).sort()) {
+			const consumerId = assertManagedConsumerId(consumerName);
+			const consumerDirectory = existingPrivateChild(session, consumerId);
+			if (!consumerDirectory) continue;
+			for (const operationName of fs.readdirSync(consumerDirectory).sort()) {
+				if (operationName.startsWith(".operation.") && operationName.endsWith(".tmp")) continue;
+				const operationId = assertManagedOperationId(operationName);
+				if (after && (consumerId < after.consumerId || (consumerId === after.consumerId && operationId <= after.operationId))) continue;
+				const directory = existingPrivateChild(consumerDirectory, operationId);
+				if (!directory) continue;
+				entries.push({ consumerId, operationId, directory });
+				if (entries.length > limit) break;
+			}
+			if (entries.length > limit) break;
+		}
+		const selected = entries.slice(0, limit);
+		const records = selected.map(({ consumerId, operationId, directory }) =>
+			this.#readOperationRecord(directory, sessionDigest, consumerId, operationId));
+		return {
+			records: Object.freeze(records),
+			...(entries.length > limit && selected.length > 0 ? {
+				nextCursor: {
+					consumerId: selected[selected.length - 1]!.consumerId,
+					operationId: selected[selected.length - 1]!.operationId,
+				},
+			} : {}),
+		};
+	}
+
+	readByRun(parentSessionIdentityDigest: string, consumerIdInput: string, runIdInput: string): Readonly<ManagedOperationJournalRecordV1> | undefined {
+		this.#assertOpen();
+		const sessionDigest = assertDigest(parentSessionIdentityDigest, "Managed parent-session identity digest");
+		const consumerId = assertManagedConsumerId(consumerIdInput);
+		const runId = assertRunId(runIdInput, "Managed run id");
+		const operations = existingPrivateChild(this.root, "operations");
+		if (!operations) return undefined;
+		const session = existingPrivateChild(operations, sessionDigest);
+		if (!session) return undefined;
+		const consumer = existingPrivateChild(session, consumerId);
+		if (!consumer) return undefined;
+		let match: Readonly<ManagedOperationJournalRecordV1> | undefined;
+		let inspected = 0;
+		for (const operationName of fs.readdirSync(consumer).sort()) {
+			if (operationName.startsWith(".operation.") && operationName.endsWith(".tmp")) continue;
+			if (++inspected > 10_000) throw new ManagedOperationJournalError("busy", "Managed run lookup exceeds the bounded namespace limit.");
+			const operationId = assertManagedOperationId(operationName);
+			const directory = existingPrivateChild(consumer, operationId);
+			if (!directory) continue;
+			const record = this.#readOperationRecord(directory, sessionDigest, consumerId, operationId);
+			if (record.runId !== runId) continue;
+			if (match) throw new ManagedOperationJournalError("corrupt", "Managed run identity is bound to multiple operations.");
+			match = record;
+		}
+		return match;
 	}
 
 	close(): void {

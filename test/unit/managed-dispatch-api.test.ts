@@ -19,6 +19,7 @@ import {
 	managedDispatchReplyEvent,
 	parseManagedMutationRequestV1,
 	parseManagedPreflightRequestV1,
+	parseManagedReadRequestV1,
 	type ManagedPreflightRequestV1,
 	type ManagedPreflightResultV1,
 } from "../../src/api/managed-dispatch.ts";
@@ -354,6 +355,37 @@ describe("managed-dispatch public protocol foundation", () => {
 		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, extra: true }));
 		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, input: { kind: "spawn", request: {}, extra: true } }));
 		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, input: { kind: "resume", sourceRunId: "run", index: 0, request: [] } }));
+	});
+
+	it("strictly parses capability and exact status/details targets", () => {
+		const capabilities = parseManagedReadRequestV1({ version: 1, requestId: "cap-1", method: "capabilities" });
+		assert.equal(capabilities.method, "capabilities");
+		assert.equal(Object.isFrozen(capabilities), true);
+		const status = parseManagedReadRequestV1({
+			version: 1,
+			requestId: "status-1",
+			method: "status",
+			target: { consumerId: "pi-signal", operationId: operationId() },
+		});
+		assert.equal(status.method, "status");
+		const details = parseManagedReadRequestV1({
+			version: 1,
+			requestId: "details-1",
+			method: "details",
+			target: { consumerId: "pi-signal", runId: "exact-run" },
+		});
+		assert.equal(details.method, "details");
+		for (const invalid of [
+			{ version: 1, requestId: "cap-1", method: "capabilities", extra: true },
+			{ version: 1, requestId: "status-1", method: "status", target: { consumerId: "pi-signal", operationId: operationId(), runId: "run" } },
+			{ version: 1, requestId: "status-1", method: "status", target: { consumerId: "pi-signal", operationId: "prefix" } },
+			{ version: 1, requestId: "details-1", method: "details", target: { consumerId: "other", runId: "bad/run" } },
+		]) assert.throws(() => parseManagedReadRequestV1(invalid));
+		let getterCalls = 0;
+		const hostile = { version: 1, requestId: "status-1", method: "status" } as Record<string, unknown>;
+		Object.defineProperty(hostile, "target", { enumerable: true, get: () => { getterCalls++; return {}; } });
+		assert.throws(() => parseManagedReadRequestV1(hostile));
+		assert.equal(getterCalls, 0);
 	});
 
 	it("hashes exact spawn identity while excluding transport requestId", () => {

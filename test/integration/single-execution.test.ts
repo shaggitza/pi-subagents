@@ -27,6 +27,10 @@ import {
 } from "../support/helpers.ts";
 import registerSubagentExtension from "../../src/extension/index.ts";
 import {
+	SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT,
+	managedDispatchReplyEvent,
+} from "../../src/api/managed-dispatch.ts";
+import {
 	SUBAGENT_DELEGATION_PROTOCOL_VERSION,
 	SUBAGENT_DELEGATION_V2_PROTOCOL_VERSION,
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
@@ -552,6 +556,56 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(first.isError, undefined);
 		assert.equal(second.isError, undefined);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("advertises the registered managed provider only after active-session recovery", async () => {
+		const extensionEvents = createEventBus();
+		const runtimeHandlers = new Map<string, Array<(event: unknown, ctx: ReturnType<typeof makeMinimalCtx>) => void>>();
+		const fakePi = new Proxy({
+			events: extensionEvents,
+			on(event: string, handler: (event: unknown, ctx: ReturnType<typeof makeMinimalCtx>) => void) {
+				const handlers = runtimeHandlers.get(event) ?? [];
+				handlers.push(handler);
+				runtimeHandlers.set(event, handlers);
+			},
+			registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; },
+		}, { get(target, prop) { return prop in target ? target[prop as keyof typeof target] : () => undefined; } });
+		const ctx = {
+			...makeMinimalCtx(tempDir),
+			sessionManager: {
+				getSessionId: () => "managed-provider-session",
+				getSessionFile: () => path.join(tempDir, "managed-provider-session.jsonl"),
+				getEntries: () => [],
+			},
+		};
+		const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = path.join(tempDir, "managed-agent-dir");
+		try {
+			registerSubagentExtension(fakePi as never);
+			for (const handler of runtimeHandlers.get("session_start") ?? []) await handler({ reason: "startup" }, ctx);
+			const reply = new Promise<any>((resolve) => extensionEvents.on(managedDispatchReplyEvent("managed-capability-integration"), resolve));
+			extensionEvents.emit(SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, { version: 1, requestId: "managed-capability-integration", method: "capabilities" });
+			const first = await reply;
+			assert.equal(first.success, true);
+			assert.equal(first.data.state, "recovering");
+			assert.equal(first.data.methods.spawn, false);
+			let value = first;
+			for (let attempt = 0; attempt < 20 && value.data.state !== "ready"; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				const requestId = `managed-capability-ready-${attempt}`;
+				const next = new Promise<any>((resolve) => extensionEvents.on(managedDispatchReplyEvent(requestId), resolve));
+				extensionEvents.emit(SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, { version: 1, requestId, method: "capabilities" });
+				value = await next;
+			}
+			assert.equal(value.data.state, "ready");
+			assert.equal(value.data.methods.spawn, true);
+			assert.equal(value.data.methods.resume, false);
+			assert.equal(value.data.lifecycle.managedTerminalCorrelation, true);
+		} finally {
+			for (const handler of runtimeHandlers.get("session_shutdown") ?? []) await handler({}, ctx);
+			if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+		}
 	});
 
 	it("routes registered strict v1 delegation through the concurrent executor", async () => {

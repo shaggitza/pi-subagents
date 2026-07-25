@@ -112,6 +112,45 @@ describe("managed durable operation journal", () => {
 		store.close();
 	});
 
+	it("enumerates deterministically with bounded cursors and resolves only exact run identities", () => {
+		const store = journal();
+		for (const [byte, runId] of [[9, "run-nine"], [8, "run-eight"], [10, "run-ten"]] as const) {
+			const value = spawnRequest({
+				managed: { version: 1, consumerId: "pi-signal", operationId: operationId(byte) },
+				expectedLaunch: {
+					version: 1,
+					hostId: "host-1",
+					candidateRunId: runId,
+					profileIdentityDigest: "a".repeat(64),
+					parentSessionIdentityDigest: parentDigest,
+					contractDigest: "b".repeat(64),
+				},
+			});
+			const digest = computeManagedRequestDigest(value);
+			store.claim(parentDigest, value);
+			store.transition(parentDigest, "pi-signal", operationId(byte), digest, "prepared");
+			store.transition(parentDigest, "pi-signal", operationId(byte), digest, "dispatching", {
+				runId,
+				terminalAsyncDir: path.join(temporary, "async", runId),
+				canonicalSessionFile: path.join(temporary, "sessions", runId, "session.jsonl"),
+			});
+			store.transition(parentDigest, "pi-signal", operationId(byte), digest, "uncertain");
+		}
+		const first = store.list(parentDigest, { limit: 2 });
+		assert.equal(first.records.length, 2);
+		assert.ok(first.nextCursor);
+		const second = store.list(parentDigest, { limit: 2, after: first.nextCursor });
+		assert.equal(second.records.length, 1);
+		assert.equal(second.nextCursor, undefined);
+		const all = [...first.records, ...second.records];
+		assert.deepEqual(all.map((record) => record.operationId), [...all.map((record) => record.operationId)].sort());
+		assert.equal(store.readByRun(parentDigest, "pi-signal", "run-eight")?.operationId, operationId(8));
+		assert.equal(store.readByRun(parentDigest, "pi-signal", "run-eigh"), undefined, "prefixes must not resolve");
+		assert.equal(store.readByRun(parentDigest, "other", "run-eight"), undefined);
+		expectCode(() => store.list(parentDigest, { limit: 257 }), "invalid_request");
+		store.close();
+	});
+
 	it("requires parent-session binding before creating a launch operation directory", () => {
 		const store = journal();
 		const missing = spawnRequest();

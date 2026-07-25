@@ -77,6 +77,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	const managedDispatch = await import("pi-subagents/managed-dispatch");
 	assert.equal(managedDispatch.SUBAGENT_MANAGED_DISPATCH_VERSION, 1);
 	assert.equal(typeof managedDispatch.createManagedOperationId, "function");
+	assert.equal(typeof managedDispatch.parseManagedReadRequestV1, "function");
 });
 
 test("public fork metadata and legacy installer remain fork-owned", () => {

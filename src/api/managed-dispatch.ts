@@ -137,6 +137,12 @@ export type ManagedOperationTargetV1 =
 	| { consumerId: ManagedConsumerId; operationId: ManagedOperationId; runId?: never }
 	| { consumerId: ManagedConsumerId; runId: string; operationId?: never };
 
+export interface ManagedCapabilitiesRequestV1 {
+	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
+	requestId: string;
+	method: "capabilities";
+}
+
 export interface ManagedStatusRequestV1 {
 	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
 	requestId: string;
@@ -150,6 +156,8 @@ export interface ManagedDetailsRequestV1 {
 	method: "details";
 	target: ManagedOperationTargetV1;
 }
+
+export type ManagedReadRequestV1 = ManagedCapabilitiesRequestV1 | ManagedStatusRequestV1 | ManagedDetailsRequestV1;
 
 export interface ManagedSteerRequestV1 extends ManagedMutationRequestBaseV1 {
 	method: "steer";
@@ -178,9 +186,9 @@ export type ManagedControlRequestV1 =
 	| ManagedRetireRequestV1;
 
 export type ManagedMutationRequestV1 = ManagedSpawnRequestV1 | ManagedResumeRequestV1 | ManagedControlRequestV1;
-export type ManagedDispatchRequestV1 = ManagedPreflightRequestV1 | ManagedStatusRequestV1 | ManagedDetailsRequestV1 | ManagedMutationRequestV1;
+export type ManagedDispatchRequestV1 = ManagedPreflightRequestV1 | ManagedReadRequestV1 | ManagedMutationRequestV1;
 export type ManagedMutationMethodV1 = ManagedMutationRequestV1["method"];
-export type ManagedReadMethodV1 = "preflight" | "status" | "details";
+export type ManagedReadMethodV1 = "preflight" | "capabilities" | "status" | "details";
 export type ManagedDispatchMethodV1 = ManagedMutationMethodV1 | ManagedReadMethodV1;
 
 export type ManagedOperationStateV1 =
@@ -204,9 +212,17 @@ export interface ManagedDispatchReceiptV1 {
 	replayed: boolean;
 }
 
+export interface ManagedChildIdentityV1 {
+	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
+	index: 0;
+	canonicalSessionId: string;
+	resumeDisposition: "resumable" | "non-resumable" | "unavailable";
+}
+
 export interface ManagedOperationStatusV1 extends ManagedDispatchReceiptV1 {
 	runOutcome?: "running" | "completed" | "failed" | "interrupted" | "unknown";
 	processTerminal?: JsonValue;
+	child?: ManagedChildIdentityV1;
 }
 
 export interface ManagedOperationDetailsV1 extends ManagedOperationStatusV1 {
@@ -214,6 +230,29 @@ export interface ManagedOperationDetailsV1 extends ManagedOperationStatusV1 {
 	profile?: ManagedProfileIdentityV1;
 	createdAt?: string;
 	updatedAt?: string;
+}
+
+export interface ManagedDispatchCapabilitiesV1 {
+	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
+	state: "ready" | "recovering" | "unavailable";
+	available: boolean;
+	hostId?: string;
+	parentSessionIdentityDigest?: string;
+	sessionGeneration?: number;
+	methods: {
+		preflight: true;
+		spawn: boolean;
+		status: boolean;
+		details: boolean;
+		resume: false;
+		steer: false;
+		interrupt: false;
+		stop: false;
+		retire: false;
+	};
+	durability: "journal-v1";
+	lifecycle: { version: 3; managedTerminalCorrelation: boolean };
+	effects: "not-exactly-once";
 }
 
 export type ManagedDispatchErrorCodeV1 =
@@ -734,6 +773,32 @@ function normalizeManagedMutationRequest(request: unknown): JsonObject {
 	};
 	if (launchMethod) normalized.expectedLaunch = normalizeExpectedLaunch(envelope.expectedLaunch);
 	return normalized;
+}
+
+/** Strictly validates capability/status/details transport envelopes. */
+export function parseManagedReadRequestV1(request: unknown): Readonly<ManagedReadRequestV1> {
+	if (!request || typeof request !== "object") throw new TypeError("Managed read request must be an object.");
+	const inspected = plainDataRecord(request, "Managed read request").record;
+	const method = inspected.method;
+	if (method === "capabilities") {
+		const envelope = assertExactKeys(request, ["version", "requestId", "method"], "Managed capabilities request");
+		assertVersion(envelope.version, "Managed capabilities request");
+		if (envelope.method !== "capabilities") throw new TypeError("Managed capabilities request method is invalid.");
+		return canonicalizeManagedJson({
+			version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+			requestId: assertRequestId(envelope.requestId),
+			method,
+		}).normalized as unknown as Readonly<ManagedCapabilitiesRequestV1>;
+	}
+	if (method !== "status" && method !== "details") throw new TypeError("Managed read request has an unsupported method.");
+	const envelope = assertExactKeys(request, ["version", "requestId", "method", "target"], `Managed ${method} request`);
+	assertVersion(envelope.version, `Managed ${method} request`);
+	return canonicalizeManagedJson({
+		version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+		requestId: assertRequestId(envelope.requestId),
+		method,
+		target: normalizeTarget(envelope.target),
+	}).normalized as unknown as Readonly<ManagedStatusRequestV1 | ManagedDetailsRequestV1>;
 }
 
 /** Strictly validates and returns a deeply frozen mutation transport envelope. */

@@ -40,6 +40,7 @@ import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
 import { registerManagedDispatchPreflightBridge } from "./managed-dispatch-preflight.ts";
+import { ManagedDispatchProvider } from "./managed-dispatch-provider.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import { resolveWaitToolConfig } from "../runs/background/subagent-wait.ts";
@@ -248,7 +249,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		{ notifier: completionNotifier },
 	);
 
+	let managedDispatchProvider: ManagedDispatchProvider | undefined;
 	const runtimeCleanup = () => {
+		managedDispatchProvider?.dispose();
 		stopResultWatcher();
 		state.currentSessionId = null;
 		completionNotifier.dispose();
@@ -296,6 +299,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		discoverAgents,
 	});
 	executorExecute = executor.execute;
+	managedDispatchProvider = new ManagedDispatchProvider({
+		events: pi.events,
+		executor,
+		getContext: () => state.lastUiContext,
+		getSessionGeneration: () => managedSessionGeneration,
+		artifactDir: config.artifactDir,
+	});
 
 	pi.registerMessageRenderer<SlashMessageDetails>(SLASH_RESULT_TYPE, (message, options, theme) => {
 		const details = resolveSlashMessageDetails(message.details);
@@ -572,12 +582,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (event, ctx) => {
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
 		resetSessionState(ctx, recovering);
+		void managedDispatchProvider?.bindSession(ctx, managedSessionGeneration);
 		rpcBridge.emitReady(ctx);
 		supervisorChannel.start();
 	});
 
 	pi.on("session_shutdown", () => {
 		managedSessionGeneration++;
+		managedDispatchProvider?.dispose();
 		stopResultWatcher();
 		state.currentSessionId = null;
 		state.parentSessionFile = null;
