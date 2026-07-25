@@ -142,9 +142,25 @@ describe("managed durable operation journal", () => {
 			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching"),
 			"invalid_state",
 		);
-		const dispatching = store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", { runId: "candidate-1" });
+		const terminalAsyncDir = path.join(temporary, "async", "candidate-1");
+		const canonicalSessionFile = path.join(temporary, "sessions", "candidate-1", "run-0", "session.jsonl");
+		const dispatching = store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", {
+			runId: "candidate-1",
+			terminalAsyncDir,
+			canonicalSessionFile,
+		});
 		assert.equal(dispatching.runId, "candidate-1");
-		assert.equal(store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", { runId: "candidate-1" }).updatedAt, dispatching.updatedAt);
+		assert.equal(dispatching.terminalAsyncDir, terminalAsyncDir);
+		assert.equal(store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", {
+			runId: "candidate-1",
+			terminalAsyncDir,
+			canonicalSessionFile,
+		}).updatedAt, dispatching.updatedAt);
+		expectCode(() => store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", {
+			runId: "candidate-1",
+			terminalAsyncDir: path.join(temporary, "other"),
+			canonicalSessionFile,
+		}), "operation_conflict");
 		expectCode(
 			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "uncertain", {
 				runnerProcessInstanceId: "premature-runner",
@@ -177,11 +193,30 @@ describe("managed durable operation journal", () => {
 		store.transition(parentDigest, "pi-signal", operationId(), digest, "accepted", { runId: "candidate-1" });
 		store.transition(parentDigest, "pi-signal", operationId(), digest, "uncertain");
 		store.transition(parentDigest, "pi-signal", operationId(), digest, "reconciling");
-		const terminal = store.transition(parentDigest, "pi-signal", operationId(), digest, "terminal", { runId: "candidate-1" });
+		expectCode(() => store.transition(parentDigest, "pi-signal", operationId(), digest, "terminal", { runId: "candidate-1" }), "invalid_state");
+		const terminalEvidence = { version: 1 as const, proofDigest: "e".repeat(64), observedAt: 99, canonicalSessionId: "f".repeat(64) };
+		const terminal = store.transition(parentDigest, "pi-signal", operationId(), digest, "terminal", { runId: "candidate-1", terminalEvidence });
 		assert.equal(terminal.state, "terminal");
+		assert.deepEqual(terminal.terminalEvidence, terminalEvidence);
+		assert.deepEqual(store.transition(parentDigest, "pi-signal", operationId(), digest, "terminal", { terminalEvidence }).terminalEvidence, terminalEvidence);
 		assert.equal(store.read(parentDigest, "pi-signal", operationId())?.createdAt, claimed.createdAt);
 		expectCode(() => store.transition(parentDigest, "pi-signal", operationId(), digest, "prepared"), "invalid_state");
 		store.close();
+
+		const uncorrelated = journal(path.join(temporary, "journal-uncorrelated"));
+		uncorrelated.claim(parentDigest, request);
+		uncorrelated.transition(parentDigest, "pi-signal", operationId(), digest, "prepared");
+		uncorrelated.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", {
+			runId: "candidate-1",
+			terminalAsyncDir,
+			canonicalSessionFile,
+		});
+		uncorrelated.transition(parentDigest, "pi-signal", operationId(), digest, "uncertain");
+		uncorrelated.transition(parentDigest, "pi-signal", operationId(), digest, "reconciling");
+		expectCode(() => uncorrelated.transition(parentDigest, "pi-signal", operationId(), digest, "terminal", {
+			terminalEvidence,
+		}), "invalid_state");
+		uncorrelated.close();
 	});
 
 	it("enforces one live owner and safely reclaims a provably dead owner", () => {

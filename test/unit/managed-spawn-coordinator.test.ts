@@ -19,8 +19,10 @@ import {
 	writePreparedRunnerAdmissionEvidence,
 } from "../../src/runs/background/prepared-runner-admission.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
+import { finalizeProcessTerminal, writeProcessTerminalCandidate } from "../../src/runs/background/process-terminal.ts";
 import type { PreparedSubagentSpawnPlan, SubagentParamsLike } from "../../src/runs/foreground/subagent-executor.ts";
 import { ASYNC_DIR, RESULTS_DIR, getAsyncConfigPath } from "../../src/shared/types.ts";
+import { canonicalSessionId } from "../../src/runs/shared/session-lease.ts";
 
 let temporary = "";
 const parentDigest = "c".repeat(64);
@@ -142,6 +144,35 @@ function contract(runId: string, digest = contractDigest): SubagentLaunchContrac
 	};
 }
 
+function contractWithAttestedSessionRoot(runId: string): SubagentLaunchContract {
+	const launchRoot = path.join(temporary, `attested-root-${runId}`);
+	fs.mkdirSync(launchRoot, { mode: 0o700 });
+	const sessionRoot = path.join(launchRoot, "session");
+	const base = contract(runId);
+	const stats = fs.statSync(launchRoot, { bigint: true });
+	const sessionDir = path.join(sessionRoot, "run-0");
+	return {
+		...base,
+		roots: {
+			...base.roots,
+			sessionRoot,
+			sessionDir,
+			sessionFile: path.join(sessionDir, "session.jsonl"),
+			attestations: {
+				sessionRoot: {
+					path: sessionRoot,
+					existingAncestor: launchRoot,
+					existingAncestorRealPath: fs.realpathSync(launchRoot),
+					projectedRealPath: sessionRoot,
+					existingAncestorDevice: String(stats.dev),
+					existingAncestorInode: String(stats.ino),
+					relativeSuffix: "session",
+				},
+			},
+		},
+	};
+}
+
 function plan(resolved: SubagentLaunchContract): PreparedSubagentSpawnPlan {
 	return {
 		runId: resolved.runId,
@@ -191,7 +222,7 @@ function makeCoordinator(
 	});
 }
 
-function successfulExecutor(runId: string, callCount: { value: number }): ManagedSpawnExecutor {
+function successfulExecutor(runId: string, callCount: { value: number }, terminalize = false): ManagedSpawnExecutor {
 	return {
 		executePreparedSpawn: (async (_id, _params, _signal, _update, _ctx, options) => {
 			callCount.value++;
@@ -212,6 +243,33 @@ function successfulExecutor(runId: string, callCount: { value: number }): Manage
 				"runner-instance-1",
 				300,
 			);
+			if (terminalize) {
+				const sessionFile = contract(runId).roots.sessionFile!;
+				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+				fs.writeFileSync(sessionFile, "{}\n", "utf8");
+				const managed = {
+					...options.processTerminalBinding,
+					runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(admission.token),
+				};
+				writeProcessTerminalCandidate(contract(runId).roots.asyncDir!, {
+					version: 1,
+					runId,
+					runnerProcessInstanceId: "runner-instance-1",
+					writers: { "0": [{ processInstanceId: "writer-instance-1", kind: "pi-writer", attempt: 0, closeObservedAt: 350, exitCode: 0, signal: null }] },
+					expectedWriters: { "0": 1 },
+					sessionFile,
+					managed,
+				});
+				fs.writeFileSync(path.join(contract(runId).roots.asyncDir!, "status.json"), JSON.stringify({ runId, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile }] }));
+				fs.writeFileSync(path.join(contract(runId).roots.asyncDir!, "events.jsonl"), "");
+				const proof = finalizeProcessTerminal(contract(runId).roots.asyncDir!, runId, {
+					processInstanceId: "runner-instance-1",
+					closeObservedAt: 400,
+					exitCode: 0,
+					signal: null,
+				}, managed);
+				options.onProcessTerminal(proof);
+			}
 			return { content: [{ type: "text", text: "started" }], details: { mode: "single", results: [] } };
 		}) as ManagedSpawnExecutor["executePreparedSpawn"],
 	};
@@ -235,6 +293,111 @@ describe("unregistered managed spawn coordinator", () => {
 		assert.equal(replay.state, "accepted");
 		assert.equal(replay.replayed, true);
 		assert.equal(calls.value, 1);
+		store.close();
+	});
+
+	it("terminalizes only from exact durable managed process proof and replays idempotently", async () => {
+		const runId = candidate("terminal");
+		const root = path.join(temporary, "journal-terminal");
+		let store = new ManagedOperationJournal({ root });
+		const calls = { value: 0 };
+		let coordinator = makeCoordinator(store, successfulExecutor(runId, calls, true), async () => resolved(runId));
+		const first = await coordinator.dispatchSpawn(spawnRequest(runId));
+		assert.equal(first.state, "terminal");
+		const durable = store.read(parentDigest, "pi-signal", operationId());
+		assert.equal(durable?.state, "terminal");
+		assert.match(durable?.terminalEvidence?.proofDigest ?? "", /^[a-f0-9]{64}$/);
+		assert.match(durable?.terminalEvidence?.canonicalSessionId ?? "", /^[a-f0-9]{64}$/);
+		assert.equal(durable?.terminalAsyncDir, contract(runId).roots.asyncDir);
+		assert.equal(durable?.canonicalSessionFile, contract(runId).roots.sessionFile);
+		store.close();
+
+		store = new ManagedOperationJournal({ root });
+		coordinator = makeCoordinator(store, {
+			executePreparedSpawn: (async () => {
+				calls.value++;
+				return { content: [], details: { mode: "single", results: [] } };
+			}) as ManagedSpawnExecutor["executePreparedSpawn"],
+		}, async () => resolved(runId));
+		const replay = await coordinator.dispatchSpawn(spawnRequest(runId, "terminal-replay"));
+		assert.equal(replay.state, "terminal");
+		assert.equal(replay.replayed, true);
+		assert.equal(calls.value, 1);
+		store.close();
+	});
+
+	it("reconciles accepted durable proof to terminal after journal reopen without relaunch", async () => {
+		const runId = candidate("restart-terminal");
+		const root = path.join(temporary, "journal-restart-terminal");
+		let store = new ManagedOperationJournal({ root });
+		const request = spawnRequest(runId);
+		const digest = computeManagedRequestDigest(request);
+		store.claim(parentDigest, request);
+		store.transition(parentDigest, "pi-signal", operationId(), digest, "prepared");
+		store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", {
+			runId,
+			terminalAsyncDir: contract(runId).roots.asyncDir!,
+			canonicalSessionFile: contract(runId).roots.sessionFile!,
+		});
+		const admission = createPreparedRunnerAdmission(runId, digest);
+		store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", {
+			runId,
+			runnerProcessInstanceId: "runner-restart-1",
+			runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(admission.token),
+		});
+		store.transition(parentDigest, "pi-signal", operationId(), digest, "accepted");
+		const asyncDir = contract(runId).roots.asyncDir!;
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writePreparedRunnerAdmissionEvidence(
+			contract(runId).roots.runnerAdmissionPath!,
+			admission,
+			"committed",
+			123,
+			"runner-restart-1",
+		);
+		const sessionFile = contract(runId).roots.sessionFile!;
+		fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+		fs.writeFileSync(sessionFile, "{}\n", "utf8");
+		const managed = {
+			version: 1 as const,
+			parentSessionIdentityDigest: parentDigest,
+			consumerId: "pi-signal",
+			operationId: operationId(),
+			requestDigest: digest,
+			candidateRunId: runId,
+			runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(admission.token),
+		};
+		writeProcessTerminalCandidate(asyncDir, {
+			version: 1,
+			runId,
+			runnerProcessInstanceId: "runner-restart-1",
+			writers: { "0": [{ processInstanceId: "writer-restart-1", kind: "pi-writer", attempt: 0, closeObservedAt: 350, exitCode: 0, signal: null }] },
+			expectedWriters: { "0": 1 },
+			sessionFile,
+			managed,
+		});
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile }] }));
+		fs.writeFileSync(path.join(asyncDir, "events.jsonl"), "");
+		assert.equal(finalizeProcessTerminal(asyncDir, runId, {
+			processInstanceId: "runner-restart-1",
+			closeObservedAt: 400,
+			exitCode: 0,
+			signal: null,
+		}, managed).state, "observed");
+		store.close();
+
+		store = new ManagedOperationJournal({ root });
+		let calls = 0;
+		const coordinator = makeCoordinator(store, {
+			executePreparedSpawn: (async () => {
+				calls++;
+				return { content: [], details: { mode: "single", results: [] } };
+			}) as ManagedSpawnExecutor["executePreparedSpawn"],
+		}, async () => resolved(runId));
+		const replay = await coordinator.dispatchSpawn({ ...request, requestId: "restart-terminal-replay" });
+		assert.equal(replay.state, "terminal");
+		assert.equal(replay.replayed, true);
+		assert.equal(calls, 0);
 		store.close();
 	});
 
@@ -272,6 +435,43 @@ describe("unregistered managed spawn coordinator", () => {
 		assert.equal(secondReceipt.state, "accepted");
 		assert.equal([firstReceipt.replayed, secondReceipt.replayed].filter(Boolean).length, 1);
 		store.close();
+	});
+
+	it("rejects final-fence root substitutions before candidate side effects", async () => {
+		for (const substitution of ["directory", "file"] as const) {
+			const runId = candidate(`fence-${substitution}`);
+			const store = new ManagedOperationJournal({ root: path.join(temporary, `journal-fence-${substitution}`) });
+			const authorized = contractWithAttestedSessionRoot(runId);
+			let calls = 0;
+			const executor: ManagedSpawnExecutor = {
+				executePreparedSpawn: (async (_id, _params, _signal, _update, _ctx, options) => {
+					calls++;
+					const preparedPlan = plan(authorized);
+					await options.beforeLaunch(preparedPlan);
+					const launchRoot = authorized.roots.attestations!.sessionRoot!.existingAncestor;
+					fs.renameSync(launchRoot, `${launchRoot}.replaced`);
+					if (substitution === "directory") fs.mkdirSync(launchRoot, { mode: 0o700 });
+					else fs.writeFileSync(launchRoot, "replacement", "utf8");
+					try {
+						options.afterAuthorization(preparedPlan);
+					} catch {
+						return { content: [], isError: true, details: { mode: "single", results: [] } };
+					}
+					assert.fail("substituted launch root must fail the final coordinator fence");
+				}) as ManagedSpawnExecutor["executePreparedSpawn"],
+			};
+			const coordinator = makeCoordinator(store, executor, async () => ({ ...resolved(runId), contract: authorized }));
+			const result = await coordinator.dispatchSpawn(spawnRequest(runId));
+			assert.equal(result.state, "failed-before-launch");
+			assert.equal(calls, 1);
+			assert.equal(store.read(parentDigest, "pi-signal", operationId())?.runId, undefined);
+			assert.equal(fs.existsSync(authorized.roots.sessionRoot!), false);
+			assert.equal(fs.existsSync(authorized.roots.asyncDir!), false);
+			assert.equal(fs.existsSync(authorized.roots.resultPath!), false);
+			assert.equal(fs.existsSync(authorized.roots.resultReservationPath!), false);
+			assert.equal(fs.existsSync(authorized.roots.runnerConfigPath!), false);
+			store.close();
+		}
 	});
 
 	it("fails before launch when execution-time contract identity changes", async () => {
@@ -326,7 +526,11 @@ describe("unregistered managed spawn coordinator", () => {
 			const digest = computeManagedRequestDigest(request);
 			store.claim(parentDigest, request);
 			store.transition(parentDigest, "pi-signal", operationId(), digest, "prepared");
-			store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", { runId });
+			store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", {
+				runId,
+				terminalAsyncDir: contract(runId).roots.asyncDir!,
+				canonicalSessionFile: contract(runId).roots.sessionFile!,
+			});
 			const admission = createPreparedRunnerAdmission(runId, digest);
 			store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", {
 				runId,
@@ -353,6 +557,25 @@ describe("unregistered managed spawn coordinator", () => {
 				const recovered = await coordinator.dispatchSpawn({ ...request, requestId: "retry-late-committed" });
 				assert.equal(recovered.state, "accepted");
 				assert.equal(recovered.replayed, true);
+				assert.equal(calls, 0);
+			} else {
+				const sessionFile = contract(runId).roots.sessionFile!;
+				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+				fs.writeFileSync(sessionFile, "{}\n", "utf8");
+				fs.writeFileSync(path.join(contract(runId).roots.asyncDir!, "process-terminal.json"), JSON.stringify({
+					version: 1,
+					state: "observed",
+					runId,
+					runnerProcessInstanceId: "runner-recovery-1",
+					observedAt: 400,
+					instances: [{ processInstanceId: "runner-recovery-1", kind: "runner", closeObservedAt: 400, exitCode: 0, signal: null }],
+					canonicalSession: { canonicalSessionId: canonicalSessionId(sessionFile), leaseDisposition: "not-held", freeAtObservation: true },
+					resumeDisposition: "resumable",
+				}));
+				const forged = await coordinator.dispatchSpawn({ ...request, requestId: "retry-forged-ordinary-proof" });
+				assert.equal(forged.state, "uncertain");
+				const forgedAgain = await coordinator.dispatchSpawn({ ...request, requestId: "retry-forged-ordinary-proof-again" });
+				assert.equal(forgedAgain.state, "uncertain", "durable non-observed proof must remain sticky across retries");
 				assert.equal(calls, 0);
 			}
 			store.close();

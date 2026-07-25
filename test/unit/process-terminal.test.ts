@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -180,6 +181,83 @@ test("process-terminal sanitizes malformed status fallback proofs", () => {
 	const sanitized = sanitizeProcessTerminal({ version: 1, state: "bogus", runId: "run-fallback", runnerProcessInstanceId: "runner-fallback" }, { runId: "run-fallback", runnerProcessInstanceId: "runner-fallback" }, "status.json");
 	assert.equal(sanitized?.state, "unknown");
 	assert.equal(sanitized?.reason, "proof-write-failed");
+});
+
+test("process-terminal binds managed identity and canonical fresh session without exposing the token", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-process-terminal-managed-"));
+	const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-process-terminal-session-"));
+	try {
+		const sessionFile = path.join(sessionDir, "session.jsonl");
+		fs.writeFileSync(sessionFile, "{}\n", "utf8");
+		const managed = {
+			version: 1 as const,
+			parentSessionIdentityDigest: "a".repeat(64),
+			consumerId: "pi-signal",
+			operationId: Buffer.alloc(32, 3).toString("base64url"),
+			requestDigest: "b".repeat(64),
+			candidateRunId: "managed-run",
+			runnerAdmissionTokenDigest: "c".repeat(64),
+		};
+		writeProcessTerminalCandidate(asyncDir, {
+			version: 1,
+			runId: "managed-run",
+			runnerProcessInstanceId: "managed-runner",
+			expectedWriters: { "0": 1 },
+			writers: { "0": [{ processInstanceId: "managed-writer", kind: "pi-writer", attempt: 0, closeObservedAt: 10, exitCode: 0, signal: null }] },
+			sessionFile,
+			managed,
+		});
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "managed-run", state: "complete", lifecycleArtifactVersion: 3, steps: [{ agent: "worker", status: "complete", sessionFile }] }));
+		fs.writeFileSync(path.join(asyncDir, "events.jsonl"), "");
+		const proof = finalizeProcessTerminal(asyncDir, "managed-run", { processInstanceId: "managed-runner", closeObservedAt: 20, exitCode: 0, signal: null }, managed);
+		assert.equal(proof.state, "observed");
+		assert.deepEqual(proof.managed, managed);
+		assert.equal(proof.canonicalSession?.freeAtObservation, true);
+		assert.equal(JSON.stringify(proof).includes("raw-admission-token"), false);
+
+		fs.rmSync(processTerminalPath(asyncDir), { force: true });
+		const mismatch = finalizeProcessTerminal(asyncDir, "managed-run", { processInstanceId: "managed-runner", closeObservedAt: 30, exitCode: 0, signal: null }, { ...managed, requestDigest: "d".repeat(64) });
+		assert.equal(mismatch.state, "unknown");
+		assert.equal(mismatch.reason, "managed-binding-mismatch");
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(sessionDir, { recursive: true, force: true });
+	}
+});
+
+test("process-terminal rejects malformed managed and canonical proof projections", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-process-terminal-malformed-managed-"));
+	try {
+		fs.writeFileSync(processTerminalPath(asyncDir), JSON.stringify({
+			version: 1,
+			state: "observed",
+			runId: "managed-run",
+			runnerProcessInstanceId: "managed-runner",
+			observedAt: 10,
+			instances: [{ processInstanceId: "managed-runner", kind: "runner", closeObservedAt: 10, exitCode: 0, signal: null }],
+			managed: { version: 1, parentSessionIdentityDigest: "bad" },
+			canonicalSession: { canonicalSessionId: "e".repeat(64), leaseDisposition: "not-held", freeAtObservation: false },
+		}));
+		const proof = readProcessTerminal(asyncDir, { runId: "managed-run", runnerProcessInstanceId: "managed-runner" });
+		assert.equal(proof?.state, "unknown");
+		assert.equal(proof?.reason, "proof-write-failed");
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	}
+});
+
+test("process-terminal descriptor read rejects symlinks without following oversized targets", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-process-terminal-symlink-"));
+	const target = path.join(asyncDir, "oversized-target.json");
+	try {
+		fs.writeFileSync(target, "x".repeat(1_048_577), "utf8");
+		fs.symlinkSync(target, processTerminalPath(asyncDir));
+		const proof = readProcessTerminal(asyncDir, { runId: "managed-run", runnerProcessInstanceId: "managed-runner" });
+		assert.equal(proof?.state, "unknown");
+		assert.equal(proof?.reason, "proof-write-failed");
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	}
 });
 
 test("process-terminal reports unknown when the runner candidate is unavailable", () => {

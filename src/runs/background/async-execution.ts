@@ -36,7 +36,9 @@ import {
 	type Details,
 	type JsonSchemaObject,
 	type MaxOutputConfig,
+	type ManagedProcessTerminalBindingV1,
 	type NestedRouteInfo,
+	type ProcessTerminalV1,
 	type ResolvedControlConfig,
 	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
@@ -60,6 +62,7 @@ import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
 import { resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { assertPreparedResultReservation, type PreparedResultReservationV1 } from "./prepared-result-reservation.ts";
 import {
+	computePreparedRunnerAdmissionTokenDigest,
 	createPreparedRunnerAdmission,
 	preparedRunnerAdmissionPaths,
 	readPreparedRunnerAdmissionEvidence,
@@ -193,8 +196,10 @@ interface AsyncSingleParams {
 	preparedResultReservation?: PreparedResultReservationV1;
 	preparedRunnerAdmission?: {
 		dispatchIdentityDigest: string;
+		processTerminalBinding: Readonly<Omit<ManagedProcessTerminalBindingV1, "runnerAdmissionTokenDigest">>;
 		onReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 		onAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+		onProcessTerminal(proof: Readonly<ProcessTerminalV1>): undefined;
 	};
 	revivalLease?: SessionLeaseRequest;
 	context?: ContextMode;
@@ -424,6 +429,19 @@ function invokePreparedAdmissionCallback(
 	throw new Error("Prepared runner admission callbacks must complete synchronously.");
 }
 
+function invokePreparedProcessTerminalCallback(
+	callback: (proof: Readonly<ProcessTerminalV1>) => undefined,
+	proof: Readonly<ProcessTerminalV1>,
+): void {
+	const result = callback(proof) as unknown;
+	if (result === undefined) return;
+	if (result !== null && (typeof result === "object" || typeof result === "function")
+		&& typeof (result as { then?: unknown }).then === "function") {
+		void Promise.resolve(result).catch(() => {});
+	}
+	throw new Error("Prepared process-terminal callback must complete synchronously.");
+}
+
 function writeRunnerStartupControl(filePath: string, payload: { action: "ack" | "proceed"; token: string }): void {
 	const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	try {
@@ -544,7 +562,7 @@ function spawnRunner(
 			console.error(`[pi-subagents] async spawn failed: ${error.message}`);
 		});
 		proc.once("close", (exitCode, signal) => {
-			const launch = launchConfig as { asyncDir?: unknown; id?: unknown; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
+			const launch = launchConfig as { asyncDir?: unknown; id?: unknown; managedProcessTerminalBinding?: ManagedProcessTerminalBindingV1; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
 			const asyncDir = launch.asyncDir;
 			const runId = launch.id;
 			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
@@ -553,8 +571,12 @@ function spawnRunner(
 				closeObservedAt: Date.now(),
 				exitCode,
 				signal,
+			}, launch.managedProcessTerminalBinding);
+			const persisted = readProcessTerminal(asyncDir, {
+				runId,
+				runnerProcessInstanceId,
+				...(launch.managedProcessTerminalBinding ? { managed: launch.managedProcessTerminalBinding } : {}),
 			});
-			const persisted = readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId });
 			if (!persisted) return;
 			if (launch.nestedRoute && launch.nestedSelf) {
 				try {
@@ -1312,9 +1334,16 @@ export function executeAsyncSingle(
 		? nestedResultsPath(inheritedNestedRoute.rootRunId, id)
 		: path.join(RESULTS_DIR, `${id}.json`);
 	let preparedAdmission: PreparedRunnerAdmissionV1 | undefined;
+	let managedProcessTerminalBinding: ManagedProcessTerminalBindingV1 | undefined;
 	try {
 		preparedAdmission = params.preparedRunnerAdmission
 			? createPreparedRunnerAdmission(id, params.preparedRunnerAdmission.dispatchIdentityDigest)
+			: undefined;
+		managedProcessTerminalBinding = preparedAdmission && params.preparedRunnerAdmission
+			? {
+				...params.preparedRunnerAdmission.processTerminalBinding,
+				runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(preparedAdmission.token),
+			}
 			: undefined;
 	} catch (error) {
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
@@ -1467,6 +1496,7 @@ export function executeAsyncSingle(
 				resultPath,
 				...(params.preparedResultReservation ? { preparedResultReservation: params.preparedResultReservation } : {}),
 				...(preparedAdmission ? { preparedRunnerAdmission: preparedAdmission } : {}),
+				...(managedProcessTerminalBinding ? { managedProcessTerminalBinding } : {}),
 				cwd: runnerCwd,
 				placeholder: "{previous}",
 				maxOutput,
@@ -1501,7 +1531,20 @@ export function executeAsyncSingle(
 			},
 			id,
 			runnerCwd,
-			(proof) => ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof),
+			(proof) => {
+				try {
+					ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+				} catch (error) {
+					console.error("[pi-subagents] process-terminal event listener failed:", error);
+				}
+				if (params.preparedRunnerAdmission) {
+					try {
+						invokePreparedProcessTerminalCallback(params.preparedRunnerAdmission.onProcessTerminal, proof as Readonly<ProcessTerminalV1>);
+					} catch (error) {
+						console.error("[pi-subagents] prepared process-terminal callback failed closed:", error);
+					}
+				}
+			},
 			{
 				exclusiveConfigPath: params.exclusiveRunPaths === true,
 				...(preparedAdmission && params.preparedRunnerAdmission ? {

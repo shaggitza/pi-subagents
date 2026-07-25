@@ -16,6 +16,13 @@ export const MANAGED_OPERATION_JOURNAL_VERSION = 1 as const;
 
 export type ManagedOperationJournalStateV1 = ManagedOperationStateV1 | "dispatching" | "reconciling";
 
+export interface ManagedOperationTerminalEvidenceV1 {
+	version: 1;
+	proofDigest: string;
+	observedAt: number;
+	canonicalSessionId: string;
+}
+
 export interface ManagedOperationJournalRecordV1 {
 	version: typeof MANAGED_OPERATION_JOURNAL_VERSION;
 	parentSessionIdentityDigest: string;
@@ -29,6 +36,10 @@ export interface ManagedOperationJournalRecordV1 {
 	sourceRunId?: string;
 	runnerProcessInstanceId?: string;
 	runnerAdmissionTokenDigest?: string;
+	/** Host-authorized paths retained for exact admission/terminal recovery. */
+	terminalAsyncDir?: string;
+	canonicalSessionFile?: string;
+	terminalEvidence?: ManagedOperationTerminalEvidenceV1;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -98,6 +109,28 @@ function assertTimestamp(value: unknown, label: string): number {
 function assertRunId(value: unknown, label: string): string {
 	if (typeof value !== "string" || !SAFE_RUN_ID.test(value)) throw new ManagedOperationJournalError("invalid_request", `${label} is invalid.`);
 	return value;
+}
+
+function assertAbsolutePath(value: unknown, label: string): string {
+	if (typeof value !== "string" || value.length === 0 || value.length > 4096 || value.includes("\0") || !path.isAbsolute(value) || path.resolve(value) !== value) {
+		throw new ManagedOperationJournalError("invalid_request", `${label} is invalid.`);
+	}
+	return value;
+}
+
+function parseTerminalEvidence(value: unknown): ManagedOperationTerminalEvidenceV1 {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is corrupt.");
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record).sort();
+	if (keys.join("\0") !== ["canonicalSessionId", "observedAt", "proofDigest", "version"].sort().join("\0") || record.version !== 1) {
+		throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is corrupt.");
+	}
+	return {
+		version: 1,
+		proofDigest: assertDigest(record.proofDigest, "Managed terminal proof digest"),
+		observedAt: assertTimestamp(record.observedAt, "Managed terminal observedAt"),
+		canonicalSessionId: assertDigest(record.canonicalSessionId, "Managed canonical session id"),
+	};
 }
 
 function processStartFingerprint(pid: number): string | undefined {
@@ -285,7 +318,8 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	const record = value as Record<string, unknown>;
 	const allowed = new Set([
 		"version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "method", "state",
-		"expectedLaunch", "runId", "sourceRunId", "runnerProcessInstanceId", "runnerAdmissionTokenDigest", "createdAt", "updatedAt",
+		"expectedLaunch", "runId", "sourceRunId", "runnerProcessInstanceId", "runnerAdmissionTokenDigest",
+		"terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "createdAt", "updatedAt",
 	]);
 	if (Object.keys(record).some((key) => !allowed.has(key))) throw new ManagedOperationJournalError("corrupt", "Managed operation record has unknown fields.");
 	if (record.version !== MANAGED_OPERATION_JOURNAL_VERSION) throw new ManagedOperationJournalError("corrupt", "Managed operation record version is unsupported.");
@@ -317,6 +351,9 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	if (record.runnerAdmissionTokenDigest !== undefined) {
 		parsed.runnerAdmissionTokenDigest = assertDigest(record.runnerAdmissionTokenDigest, "Managed runner admission token digest");
 	}
+	if (record.terminalAsyncDir !== undefined) parsed.terminalAsyncDir = assertAbsolutePath(record.terminalAsyncDir, "Managed terminal async directory");
+	if (record.canonicalSessionFile !== undefined) parsed.canonicalSessionFile = assertAbsolutePath(record.canonicalSessionFile, "Managed canonical session file");
+	if (record.terminalEvidence !== undefined) parsed.terminalEvidence = parseTerminalEvidence(record.terminalEvidence);
 	const launchMethod = parsed.method === "spawn" || parsed.method === "resume";
 	if (launchMethod && !parsed.expectedLaunch) {
 		throw new ManagedOperationJournalError("corrupt", "Managed launch operation lacks expected launch identity.");
@@ -347,11 +384,20 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	if (hasRunnerInstance !== hasAdmissionToken) {
 		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is incomplete.");
 	}
-	if (["runner-ready", "accepted"].includes(parsed.state) && !hasRunnerInstance) {
+	if (["runner-ready", "accepted", "terminal"].includes(parsed.state) && !hasRunnerInstance) {
 		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is missing.");
 	}
 	if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasRunnerInstance) {
 		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is premature.");
+	}
+	const pathsRequired = ["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(parsed.state);
+	const pathsForbidden = ["claimed", "prepared", "failed-before-launch"].includes(parsed.state);
+	const hasBothPaths = parsed.terminalAsyncDir !== undefined && parsed.canonicalSessionFile !== undefined;
+	if ((pathsRequired && !hasBothPaths) || (pathsForbidden && (parsed.terminalAsyncDir !== undefined || parsed.canonicalSessionFile !== undefined))) {
+		throw new ManagedOperationJournalError("corrupt", "Managed terminal recovery paths are inconsistent with the operation state.");
+	}
+	if ((parsed.state === "terminal") !== (parsed.terminalEvidence !== undefined)) {
+		throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is inconsistent with the operation state.");
 	}
 	return Object.freeze(parsed);
 }
@@ -558,6 +604,9 @@ export class ManagedOperationJournal {
 			sourceRunId?: string;
 			runnerProcessInstanceId?: string;
 			runnerAdmissionTokenDigest?: string;
+			terminalAsyncDir?: string;
+			canonicalSessionFile?: string;
+			terminalEvidence?: ManagedOperationTerminalEvidenceV1;
 		} = {},
 	): Readonly<ManagedOperationJournalRecordV1> {
 		this.#assertOpen();
@@ -585,6 +634,15 @@ export class ManagedOperationJournal {
 		const patchedAdmissionTokenDigest = patch.runnerAdmissionTokenDigest !== undefined
 			? assertDigest(patch.runnerAdmissionTokenDigest, "Managed runner admission token digest")
 			: undefined;
+		const patchedTerminalAsyncDir = patch.terminalAsyncDir !== undefined
+			? assertAbsolutePath(patch.terminalAsyncDir, "Managed terminal async directory")
+			: undefined;
+		const patchedCanonicalSessionFile = patch.canonicalSessionFile !== undefined
+			? assertAbsolutePath(patch.canonicalSessionFile, "Managed canonical session file")
+			: undefined;
+		const patchedTerminalEvidence = patch.terminalEvidence !== undefined
+			? parseTerminalEvidence(patch.terminalEvidence)
+			: undefined;
 		if (patchedSourceRunId !== undefined && existing.method !== "resume") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed source run identity is valid only for resume operations.");
 		}
@@ -608,6 +666,25 @@ export class ManagedOperationJournal {
 		if ((patchedRunnerInstance === undefined) !== (patchedAdmissionTokenDigest === undefined)) {
 			throw new ManagedOperationJournalError("invalid_state", "Managed runner admission correlation must be bound atomically.");
 		}
+		if ((patchedTerminalAsyncDir === undefined) !== (patchedCanonicalSessionFile === undefined)) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed terminal recovery paths must be bound atomically.");
+		}
+		if (patchedTerminalAsyncDir !== undefined && existing.terminalAsyncDir !== undefined && patchedTerminalAsyncDir !== existing.terminalAsyncDir) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed terminal async directory is immutable.");
+		}
+		if (patchedCanonicalSessionFile !== undefined && existing.canonicalSessionFile !== undefined && patchedCanonicalSessionFile !== existing.canonicalSessionFile) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed canonical session file is immutable.");
+		}
+		if (patchedTerminalEvidence !== undefined && existing.terminalEvidence !== undefined
+			&& JSON.stringify(patchedTerminalEvidence) !== JSON.stringify(existing.terminalEvidence)) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed terminal evidence is immutable.");
+		}
+		if (existing.terminalAsyncDir === undefined && patchedTerminalAsyncDir !== undefined && nextState !== "dispatching") {
+			throw new ManagedOperationJournalError("invalid_state", "Managed terminal recovery paths may first bind only at dispatching.");
+		}
+		if (patchedTerminalEvidence !== undefined && nextState !== "terminal") {
+			throw new ManagedOperationJournalError("invalid_state", "Managed terminal evidence may bind only at terminal.");
+		}
 		if (existing.runnerProcessInstanceId === undefined && patchedRunnerInstance !== undefined && nextState !== "runner-ready") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed runner admission correlation may first bind only at runner-ready.");
 		}
@@ -620,19 +697,32 @@ export class ManagedOperationJournal {
 		const effectiveRunId = existing.runId ?? patchedRunId;
 		const effectiveRunnerInstance = existing.runnerProcessInstanceId ?? patchedRunnerInstance;
 		const effectiveAdmissionTokenDigest = existing.runnerAdmissionTokenDigest ?? patchedAdmissionTokenDigest;
+		const effectiveTerminalAsyncDir = existing.terminalAsyncDir ?? patchedTerminalAsyncDir;
+		const effectiveCanonicalSessionFile = existing.canonicalSessionFile ?? patchedCanonicalSessionFile;
+		const effectiveTerminalEvidence = existing.terminalEvidence ?? patchedTerminalEvidence;
 		if (["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(nextState) && !effectiveRunId) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} requires a durable run identity.`);
 		}
 		if (["claimed", "prepared", "failed-before-launch"].includes(nextState) && effectiveRunId) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} cannot contain a run identity.`);
 		}
-		if (["runner-ready", "accepted"].includes(nextState)
+		if (["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(nextState)
+			&& (!effectiveTerminalAsyncDir || !effectiveCanonicalSessionFile)) {
+			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} requires terminal recovery paths.`);
+		}
+		if (["runner-ready", "accepted", "terminal"].includes(nextState)
 			&& (!effectiveRunnerInstance || !effectiveAdmissionTokenDigest)) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} requires runner admission correlation.`);
 		}
 		if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(nextState)
 			&& (effectiveRunnerInstance || effectiveAdmissionTokenDigest)) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} cannot contain runner admission correlation.`);
+		}
+		if (nextState === "terminal" && !effectiveTerminalEvidence) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed terminal state requires durable terminal evidence.");
+		}
+		if (nextState !== "terminal" && effectiveTerminalEvidence) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed terminal evidence is premature.");
 		}
 		if (!TRANSITIONS[existing.state].has(nextState)) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed operation cannot transition from ${existing.state} to ${nextState}.`);
@@ -644,6 +734,9 @@ export class ManagedOperationJournal {
 			...(patchedSourceRunId !== undefined ? { sourceRunId: patchedSourceRunId } : {}),
 			...(patchedRunnerInstance !== undefined ? { runnerProcessInstanceId: patchedRunnerInstance } : {}),
 			...(patchedAdmissionTokenDigest !== undefined ? { runnerAdmissionTokenDigest: patchedAdmissionTokenDigest } : {}),
+			...(patchedTerminalAsyncDir !== undefined ? { terminalAsyncDir: patchedTerminalAsyncDir } : {}),
+			...(patchedCanonicalSessionFile !== undefined ? { canonicalSessionFile: patchedCanonicalSessionFile } : {}),
+			...(patchedTerminalEvidence !== undefined ? { terminalEvidence: patchedTerminalEvidence } : {}),
 			updatedAt: Math.max(existing.updatedAt, this.#now()),
 		};
 		const validatedRecord = parseRecord(record);

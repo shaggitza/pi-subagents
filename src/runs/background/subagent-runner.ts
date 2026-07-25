@@ -19,6 +19,7 @@ import {
 	type ChainOutputMap,
 	type CostSummary,
 	type ModelAttempt,
+	type ManagedProcessTerminalBindingV1,
 	type NestedRouteInfo,
 	type NestedRunSummary,
 	type ResolvedControlConfig,
@@ -133,6 +134,7 @@ interface SubagentRunConfig {
 	resultPath: string;
 	preparedResultReservation?: PreparedResultReservationV1;
 	preparedRunnerAdmission?: PreparedRunnerAdmissionV1;
+	managedProcessTerminalBinding?: ManagedProcessTerminalBindingV1;
 	cwd: string;
 	placeholder: string;
 	taskIndex?: number;
@@ -4015,8 +4017,11 @@ async function runSubagent(
 			runnerProcessInstanceId: config.runnerProcessInstanceId,
 			writers,
 			expectedWriters,
-			...(config.revivalLease?.sessionFile ? { sessionFile: config.revivalLease.sessionFile } : {}),
+			...(config.managedProcessTerminalBinding && effectiveSessionFile
+				? { sessionFile: effectiveSessionFile }
+				: config.revivalLease?.sessionFile ? { sessionFile: config.revivalLease.sessionFile } : {}),
 			...(config.revivalLeaseToken ? { revivalLeaseToken: config.revivalLeaseToken } : {}),
+			...(config.managedProcessTerminalBinding ? { managed: config.managedProcessTerminalBinding } : {}),
 		};
 		try {
 			writeProcessTerminalCandidate(asyncDir, candidate);

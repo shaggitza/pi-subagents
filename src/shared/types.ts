@@ -326,6 +326,7 @@ export type ProcessTerminalReason =
 	| "observer-unavailable"
 	| "runner-candidate-missing"
 	| "runner-instance-mismatch"
+	| "managed-binding-mismatch"
 	| "writer-close-unverified"
 	| "canonical-session-unavailable"
 	| "canonical-session-lease-active"
@@ -349,6 +350,17 @@ export interface CanonicalSessionTerminalV1 {
 	canonicalSessionLeaseReleased?: true;
 }
 
+/** Optional for ordinary runs; mandatory when a managed operation terminalizes. */
+export interface ManagedProcessTerminalBindingV1 {
+	version: 1;
+	parentSessionIdentityDigest: string;
+	consumerId: string;
+	operationId: string;
+	requestDigest: string;
+	candidateRunId: string;
+	runnerAdmissionTokenDigest: string;
+}
+
 export interface ProcessTerminalV1 {
 	version: 1;
 	state: ProcessTerminalState;
@@ -357,6 +369,7 @@ export interface ProcessTerminalV1 {
 	runnerProcessInstanceId: string;
 	observedAt?: number;
 	instances?: ProcessInstanceExitV1[];
+	managed?: ManagedProcessTerminalBindingV1;
 	canonicalSession?: CanonicalSessionTerminalV1;
 	resumeDisposition?: "resumable" | "non-resumable" | "unavailable";
 	reason?: ProcessTerminalReason;

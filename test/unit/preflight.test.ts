@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { registerSubagentCapabilityCeiling, resolveSubagentCapabilityCeiling } from "../../src/api/capability-ceiling.ts";
-import { resolveSubagentLaunchContract, SUBAGENT_LAUNCH_CONTRACT_VERSION } from "../../src/api/preflight.ts";
+import { managedLaunchRootProjectionsAreCurrent, resolveSubagentLaunchContract, SUBAGENT_LAUNCH_CONTRACT_VERSION } from "../../src/api/preflight.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import { ASYNC_DIR, RESULTS_DIR, getAsyncConfigPath } from "../../src/shared/types.ts";
@@ -281,6 +281,39 @@ Project prompt.
 		} finally {
 			handle.dispose();
 		}
+	});
+
+	it("rejects same-path inode and file-kind substitution at the final managed fence", async () => {
+		const cwd = path.join(tempDir, "fenced-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: worker\ndescription: worker\ntools: []\n---\nPrompt.\n`);
+		const sessionRoot = path.join(tempDir, "fenced-sessions");
+		fs.mkdirSync(sessionRoot);
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			task: "fence",
+			runId: "fenced-run",
+			identityMode: "managed-v1",
+			parentSessionId: "parent-session",
+			sessionRoot,
+		});
+		assert.equal(result.ok, true);
+		assert.equal(managedLaunchRootProjectionsAreCurrent(result.contract), true);
+
+		const displaced = `${cwd}-old`;
+		fs.renameSync(cwd, displaced);
+		fs.mkdirSync(cwd);
+		assert.equal(managedLaunchRootProjectionsAreCurrent(result.contract), false, "same path with a new inode must fail closed");
+		fs.rmSync(cwd, { recursive: true, force: true });
+		fs.renameSync(displaced, cwd);
+
+		const displacedSession = `${sessionRoot}-old`;
+		fs.renameSync(sessionRoot, displacedSession);
+		fs.writeFileSync(sessionRoot, "not-a-directory", "utf8");
+		assert.equal(managedLaunchRootProjectionsAreCurrent(result.contract), false, "directory-to-file substitution must fail closed");
+		fs.rmSync(sessionRoot, { force: true });
+		fs.renameSync(displacedSession, sessionRoot);
 	});
 
 	it("treats an explicit sessionDir as the ordinary executor session root", async () => {

@@ -1,10 +1,13 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { assertManagedConsumerId, assertManagedOperationId, canonicalizeManagedJson } from "../../api/managed-dispatch.ts";
 import { writeAtomicJson, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import {
 	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 	type AsyncStatus,
 	type CanonicalSessionTerminalV1,
+	type ManagedProcessTerminalBindingV1,
 	type ProcessInstanceExitV1,
 	type ProcessTerminalReason,
 	type ProcessTerminalV1,
@@ -20,6 +23,7 @@ export interface ProcessTerminalCandidate {
 	sessionFile?: string;
 	revivalLeaseToken?: string;
 	revivalLeaseReleaseAcknowledged?: boolean;
+	managed?: ManagedProcessTerminalBindingV1;
 }
 
 export interface RunnerCloseObservation {
@@ -29,19 +33,99 @@ export interface RunnerCloseObservation {
 	signal: string | null;
 }
 
+const SHA256 = /^[a-f0-9]{64}$/;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/;
+const MAX_PROOF_BYTES = 1_048_576;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function hasOnlyKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+	const keys = Object.keys(value);
+	const allowed = new Set([...required, ...optional]);
+	return required.every((key) => keys.includes(key)) && keys.every((key) => allowed.has(key));
+}
+
+function boundedJson(filePath: string): unknown {
+	let descriptor: number | undefined;
+	try {
+		const noFollow = "O_NOFOLLOW" in fs.constants
+			? (fs.constants as typeof fs.constants & { O_NOFOLLOW: number }).O_NOFOLLOW
+			: 0;
+		if (noFollow === 0) {
+			const pathStats = fs.lstatSync(filePath);
+			if (pathStats.isSymbolicLink()) throw new Error("process-terminal artifact must not be a symlink");
+		}
+		descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+		const stats = fs.fstatSync(descriptor);
+		if (!stats.isFile() || !Number.isSafeInteger(stats.size) || stats.size < 0 || stats.size > MAX_PROOF_BYTES) {
+			throw new Error("process-terminal artifact is not a bounded regular file");
+		}
+		const buffer = Buffer.alloc(stats.size + 1);
+		let total = 0;
+		while (total < buffer.length) {
+			const count = fs.readSync(descriptor, buffer, total, buffer.length - total, total);
+			if (count === 0) break;
+			total += count;
+		}
+		if (total !== stats.size) throw new Error("process-terminal artifact changed while being read");
+		return JSON.parse(buffer.subarray(0, total).toString("utf-8")) as unknown;
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+}
+
+function parseManagedBinding(value: unknown, runId?: string): ManagedProcessTerminalBindingV1 {
+	if (!isRecord(value) || !hasOnlyKeys(value, ["version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "candidateRunId", "runnerAdmissionTokenDigest"])) {
+		throw new Error("Invalid managed process-terminal binding.");
+	}
+	if (value.version !== 1 || typeof value.parentSessionIdentityDigest !== "string" || !SHA256.test(value.parentSessionIdentityDigest)
+		|| typeof value.requestDigest !== "string" || !SHA256.test(value.requestDigest)
+		|| typeof value.runnerAdmissionTokenDigest !== "string" || !SHA256.test(value.runnerAdmissionTokenDigest)
+		|| typeof value.candidateRunId !== "string" || !SAFE_ID.test(value.candidateRunId)
+		|| (runId !== undefined && value.candidateRunId !== runId)) {
+		throw new Error("Invalid managed process-terminal binding identity.");
+	}
+	return {
+		version: 1,
+		parentSessionIdentityDigest: value.parentSessionIdentityDigest,
+		consumerId: assertManagedConsumerId(value.consumerId),
+		operationId: assertManagedOperationId(value.operationId),
+		requestDigest: value.requestDigest,
+		candidateRunId: value.candidateRunId,
+		runnerAdmissionTokenDigest: value.runnerAdmissionTokenDigest,
+	};
+}
+
+function managedBindingsEqual(a: ManagedProcessTerminalBindingV1, b: ManagedProcessTerminalBindingV1): boolean {
+	return a.version === b.version
+		&& a.parentSessionIdentityDigest === b.parentSessionIdentityDigest
+		&& a.consumerId === b.consumerId
+		&& a.operationId === b.operationId
+		&& a.requestDigest === b.requestDigest
+		&& a.candidateRunId === b.candidateRunId
+		&& a.runnerAdmissionTokenDigest === b.runnerAdmissionTokenDigest;
+}
+
+export function computeManagedProcessTerminalProofDigest(proof: Readonly<ProcessTerminalV1>): string {
+	return createHash("sha256")
+		.update("pi-subagents/managed-dispatch/v1/process-terminal", "utf8")
+		.update("\0", "utf8")
+		.update(canonicalizeManagedJson(proof).serialization, "utf8")
+		.digest("hex");
+}
+
 function validProcessInstance(value: unknown, kind?: "runner" | "pi-writer"): value is ProcessInstanceExitV1 {
-	if (!isRecord(value)) return false;
+	if (!isRecord(value) || !hasOnlyKeys(value, ["processInstanceId", "kind", "closeObservedAt", "exitCode", "signal"], ["attempt"])) return false;
 	return typeof value.processInstanceId === "string"
 		&& value.processInstanceId.length > 0
 		&& (kind ? value.kind === kind : (value.kind === "runner" || value.kind === "pi-writer"))
 		&& typeof value.closeObservedAt === "number"
 		&& Number.isFinite(value.closeObservedAt)
 		&& (typeof value.exitCode === "number" || value.exitCode === null)
-		&& (typeof value.signal === "string" || value.signal === null);
+		&& (typeof value.signal === "string" || value.signal === null)
+		&& (value.attempt === undefined || (typeof value.attempt === "number" && Number.isSafeInteger(value.attempt) && value.attempt >= 0));
 }
 
 function validInstance(value: unknown): value is ProcessInstanceExitV1 {
@@ -62,8 +146,11 @@ function errorMessage(error: unknown): string {
 
 export function readProcessTerminalCandidate(asyncDir: string): ProcessTerminalCandidate | undefined {
 	try {
-		const raw = JSON.parse(fs.readFileSync(processTerminalCandidatePath(asyncDir), "utf-8")) as unknown;
-		if (!isRecord(raw) || raw.version !== 1 || typeof raw.runId !== "string" || typeof raw.runnerProcessInstanceId !== "string" || !isRecord(raw.writers)) {
+		const raw = boundedJson(processTerminalCandidatePath(asyncDir));
+		if (!isRecord(raw)
+			|| !hasOnlyKeys(raw, ["version", "runId", "runnerProcessInstanceId", "writers"], ["expectedWriters", "sessionFile", "revivalLeaseToken", "revivalLeaseReleaseAcknowledged", "managed"])
+			|| raw.version !== 1 || typeof raw.runId !== "string" || !SAFE_ID.test(raw.runId)
+			|| typeof raw.runnerProcessInstanceId !== "string" || !SAFE_ID.test(raw.runnerProcessInstanceId) || !isRecord(raw.writers)) {
 			throw new Error(`Invalid process-terminal candidate in '${asyncDir}'.`);
 		}
 		const writers: Record<string, ProcessInstanceExitV1[]> = {};
@@ -83,6 +170,7 @@ export function readProcessTerminalCandidate(asyncDir: string): ProcessTerminalC
 		if (raw.sessionFile !== undefined && typeof raw.sessionFile !== "string") throw new Error("Invalid process-terminal candidate sessionFile.");
 		if (raw.revivalLeaseToken !== undefined && typeof raw.revivalLeaseToken !== "string") throw new Error("Invalid process-terminal candidate lease token.");
 		if (raw.revivalLeaseReleaseAcknowledged !== undefined && typeof raw.revivalLeaseReleaseAcknowledged !== "boolean") throw new Error("Invalid process-terminal lease release acknowledgement.");
+		const managed = raw.managed === undefined ? undefined : parseManagedBinding(raw.managed, raw.runId);
 		return {
 			version: 1,
 			runId: raw.runId,
@@ -92,6 +180,7 @@ export function readProcessTerminalCandidate(asyncDir: string): ProcessTerminalC
 			...(raw.sessionFile ? { sessionFile: raw.sessionFile } : {}),
 			...(raw.revivalLeaseToken ? { revivalLeaseToken: raw.revivalLeaseToken } : {}),
 			...(raw.revivalLeaseReleaseAcknowledged !== undefined ? { revivalLeaseReleaseAcknowledged: raw.revivalLeaseReleaseAcknowledged } : {}),
+			...(managed ? { managed } : {}),
 		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -109,8 +198,22 @@ export function markProcessTerminalCandidateLeaseRelease(asyncDir: string, token
 	writeProcessTerminalCandidate(asyncDir, { ...candidate, revivalLeaseReleaseAcknowledged: acknowledged });
 }
 
-function unknownProof(runId: string, runnerProcessInstanceId: string, reason: ProcessTerminalReason, diagnostic?: string): ProcessTerminalV1 {
-	return { version: 1, state: "unknown", runId, runnerProcessInstanceId, reason, ...(diagnostic ? { diagnostic } : {}) };
+function unknownProof(
+	runId: string,
+	runnerProcessInstanceId: string,
+	reason: ProcessTerminalReason,
+	diagnostic?: string,
+	managed?: ManagedProcessTerminalBindingV1,
+): ProcessTerminalV1 {
+	return {
+		version: 1,
+		state: "unknown",
+		runId,
+		runnerProcessInstanceId,
+		reason,
+		...(diagnostic ? { diagnostic: diagnostic.slice(0, 4096) } : {}),
+		...(managed ? { managed } : {}),
+	};
 }
 
 function resumeDisposition(state: string | undefined, sessionFile: string | undefined): "resumable" | "non-resumable" | "unavailable" {
@@ -130,22 +233,48 @@ function sessionProjection(candidate: ProcessTerminalCandidate, lease: ReturnTyp
 	};
 }
 
-function validateProof(raw: unknown, asyncDir: string, fallback?: { runId?: string; runnerProcessInstanceId?: string }): raw is ProcessTerminalV1 {
-	if (!isRecord(raw) || raw.version !== 1 || !["pending", "observed", "unknown", "not-started"].includes(String(raw.state)) || typeof raw.runId !== "string" || !raw.runId || typeof raw.runnerProcessInstanceId !== "string" || !raw.runnerProcessInstanceId) {
+function validateCanonicalSession(value: unknown, label: string): value is CanonicalSessionTerminalV1 {
+	if (!isRecord(value) || !hasOnlyKeys(value, ["canonicalSessionId", "leaseDisposition", "freeAtObservation"], ["canonicalSessionLeaseReleased"])) {
+		throw new Error(`Invalid canonical-session proof in '${label}'.`);
+	}
+	if (typeof value.canonicalSessionId !== "string" || !SHA256.test(value.canonicalSessionId)
+		|| (value.leaseDisposition !== "released" && value.leaseDisposition !== "not-held")
+		|| value.freeAtObservation !== true
+		|| (value.canonicalSessionLeaseReleased !== undefined && value.canonicalSessionLeaseReleased !== true)
+		|| (value.leaseDisposition === "released") !== (value.canonicalSessionLeaseReleased === true)) {
+		throw new Error(`Invalid canonical-session proof in '${label}'.`);
+	}
+	return true;
+}
+
+function validateProof(raw: unknown, asyncDir: string, fallback?: {
+	runId?: string;
+	runnerProcessInstanceId?: string;
+	managed?: ManagedProcessTerminalBindingV1;
+}): raw is ProcessTerminalV1 {
+	if (!isRecord(raw)
+		|| !hasOnlyKeys(raw, ["version", "state", "runId", "runnerProcessInstanceId"], ["childIndex", "observedAt", "instances", "managed", "canonicalSession", "resumeDisposition", "reason", "diagnostic"])
+		|| raw.version !== 1 || !["pending", "observed", "unknown", "not-started"].includes(String(raw.state))
+		|| typeof raw.runId !== "string" || !SAFE_ID.test(raw.runId)
+		|| typeof raw.runnerProcessInstanceId !== "string" || !SAFE_ID.test(raw.runnerProcessInstanceId)) {
 		throw new Error(`Invalid process-terminal proof in '${asyncDir}'.`);
 	}
 	if (fallback?.runId && raw.runId !== fallback.runId) throw new Error(`Process-terminal proof in '${asyncDir}' belongs to run '${raw.runId}', expected '${fallback.runId}'.`);
 	if (fallback?.runnerProcessInstanceId && raw.runnerProcessInstanceId !== fallback.runnerProcessInstanceId) throw new Error(`Process-terminal proof in '${asyncDir}' belongs to runner '${raw.runnerProcessInstanceId}', expected '${fallback.runnerProcessInstanceId}'.`);
-	if (raw.instances !== undefined && (!Array.isArray(raw.instances) || !raw.instances.every((entry) => validProcessInstance(entry)))) {
-		throw new Error(`Invalid process-terminal instances in '${asyncDir}'.`);
-	}
+	if (raw.childIndex !== undefined && (typeof raw.childIndex !== "number" || !Number.isSafeInteger(raw.childIndex) || raw.childIndex < 0)) throw new Error(`Invalid process-terminal child index in '${asyncDir}'.`);
+	if (raw.instances !== undefined && (!Array.isArray(raw.instances) || !raw.instances.every((entry) => validProcessInstance(entry)))) throw new Error(`Invalid process-terminal instances in '${asyncDir}'.`);
+	const managed = raw.managed === undefined ? undefined : parseManagedBinding(raw.managed, raw.runId);
+	if (fallback?.managed && (!managed || !managedBindingsEqual(managed, fallback.managed))) throw new Error(`Process-terminal proof in '${asyncDir}' has a mismatched managed binding.`);
+	if (raw.canonicalSession !== undefined) validateCanonicalSession(raw.canonicalSession, asyncDir);
 	if (raw.state === "observed") {
-		if (typeof raw.observedAt !== "number" || !Number.isFinite(raw.observedAt)) throw new Error(`Observed process-terminal proof in '${asyncDir}' is missing observedAt.`);
+		if (typeof raw.observedAt !== "number" || !Number.isSafeInteger(raw.observedAt) || raw.observedAt < 0) throw new Error(`Observed process-terminal proof in '${asyncDir}' is missing observedAt.`);
 		if (!Array.isArray(raw.instances)) throw new Error(`Observed process-terminal proof in '${asyncDir}' is missing instances.`);
 		const runner = raw.instances.find((entry) => isRecord(entry) && entry.kind === "runner");
 		if (!validProcessInstance(runner, "runner") || runner.processInstanceId !== raw.runnerProcessInstanceId) throw new Error(`Observed process-terminal proof in '${asyncDir}' has no matching runner instance.`);
 	}
 	if (raw.resumeDisposition !== undefined && !["resumable", "non-resumable", "unavailable"].includes(String(raw.resumeDisposition))) throw new Error(`Invalid process-terminal resume disposition in '${asyncDir}'.`);
+	if (raw.reason !== undefined && !["observer-unavailable", "runner-candidate-missing", "runner-instance-mismatch", "managed-binding-mismatch", "writer-close-unverified", "canonical-session-unavailable", "canonical-session-lease-active", "canonical-session-release-unverified", "proof-write-failed", "stale-repair"].includes(String(raw.reason))) throw new Error(`Invalid process-terminal reason in '${asyncDir}'.`);
+	if (raw.diagnostic !== undefined && (typeof raw.diagnostic !== "string" || Buffer.byteLength(raw.diagnostic, "utf8") > 4096)) throw new Error(`Invalid process-terminal diagnostic in '${asyncDir}'.`);
 	return true;
 }
 
@@ -159,14 +288,14 @@ export function sanitizeProcessTerminal(value: unknown, fallback: { runId?: stri
 	}
 }
 
-export function readProcessTerminal(asyncDir: string, fallback?: { runId?: string; runnerProcessInstanceId?: string }): ProcessTerminalV1 | undefined {
+export function readProcessTerminal(asyncDir: string, fallback?: { runId?: string; runnerProcessInstanceId?: string; managed?: ManagedProcessTerminalBindingV1 }): ProcessTerminalV1 | undefined {
 	try {
-		const raw = JSON.parse(fs.readFileSync(processTerminalPath(asyncDir), "utf-8")) as unknown;
+		const raw = boundedJson(processTerminalPath(asyncDir));
 		validateProof(raw, asyncDir, fallback);
 		return raw;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		return unknownProof(fallback?.runId ?? path.basename(asyncDir), fallback?.runnerProcessInstanceId ?? "unknown", "proof-write-failed", errorMessage(error));
+		return unknownProof(fallback?.runId ?? path.basename(asyncDir), fallback?.runnerProcessInstanceId ?? "unknown", "proof-write-failed", errorMessage(error), fallback?.managed);
 	}
 }
 
@@ -199,8 +328,9 @@ export function finalizeProcessTerminal(
 	asyncDir: string,
 	runId: string,
 	runnerClose: RunnerCloseObservation,
+	expectedManaged?: ManagedProcessTerminalBindingV1,
 ): ProcessTerminalV1 {
-	const existing = readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId: runnerClose.processInstanceId });
+	const existing = readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId: runnerClose.processInstanceId, ...(expectedManaged ? { managed: expectedManaged } : {}) });
 	if (existing && fs.existsSync(processTerminalPath(asyncDir))) {
 		if (existing.state === "observed" && existing.runId === runId && existing.runnerProcessInstanceId === runnerClose.processInstanceId) return existing;
 		if (existing.state === "unknown") return existing;
@@ -210,9 +340,13 @@ export function finalizeProcessTerminal(
 	try {
 		const candidate = readProcessTerminalCandidate(asyncDir);
 		candidateForOverlay = candidate;
-		if (!candidate) proof = unknownProof(runId, runnerClose.processInstanceId, "runner-candidate-missing");
-		else if (candidate.runId !== runId || candidate.runnerProcessInstanceId !== runnerClose.processInstanceId) proof = unknownProof(runId, runnerClose.processInstanceId, "runner-instance-mismatch");
-		else {
+		if (!candidate) proof = unknownProof(runId, runnerClose.processInstanceId, "runner-candidate-missing", undefined, expectedManaged);
+		else if (candidate.runId !== runId || candidate.runnerProcessInstanceId !== runnerClose.processInstanceId) proof = unknownProof(runId, runnerClose.processInstanceId, "runner-instance-mismatch", undefined, expectedManaged);
+		else if (expectedManaged && (!candidate.managed || !managedBindingsEqual(candidate.managed, expectedManaged))) {
+			proof = unknownProof(runId, runnerClose.processInstanceId, "managed-binding-mismatch", undefined, expectedManaged);
+		} else if (!expectedManaged && candidate.managed) {
+			proof = unknownProof(runId, runnerClose.processInstanceId, "managed-binding-mismatch");
+		} else {
 			const allWriters = Object.values(candidate.writers).flat();
 			const status = (() => {
 				try { return JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatus; } catch { return undefined; }
@@ -226,11 +360,11 @@ export function finalizeProcessTerminal(
 			const inconsistentWriters = writerEntries.some(([index, records]) => !expectedIndexes.has(index) || records.length !== expectedWriters[index])
 				|| expectedEntries.some(([index, expected]) => !writerIndexes.has(index) && expected !== 0);
 			if (session && session.state !== "free") {
-				proof = unknownProof(runId, runnerClose.processInstanceId, session.state === "owned" ? "canonical-session-lease-active" : "canonical-session-unavailable");
+				proof = unknownProof(runId, runnerClose.processInstanceId, session.state === "owned" ? "canonical-session-lease-active" : "canonical-session-unavailable", undefined, expectedManaged);
 			} else if (candidate.revivalLeaseToken && candidate.revivalLeaseReleaseAcknowledged !== true) {
-				proof = unknownProof(runId, runnerClose.processInstanceId, "canonical-session-release-unverified");
+				proof = unknownProof(runId, runnerClose.processInstanceId, "canonical-session-release-unverified", undefined, expectedManaged);
 			} else if (inconsistentWriters || (allWriters.length === 0 && expectedEntries.length === 0)) {
-				proof = unknownProof(runId, runnerClose.processInstanceId, "writer-close-unverified");
+				proof = unknownProof(runId, runnerClose.processInstanceId, "writer-close-unverified", undefined, expectedManaged);
 			} else {
 				const runner: ProcessInstanceExitV1 = { kind: "runner", ...runnerClose };
 				const canonicalSession = session && sessionProjection(candidate, session);
@@ -242,12 +376,13 @@ export function finalizeProcessTerminal(
 					observedAt: runnerClose.closeObservedAt,
 					instances: [runner, ...allWriters],
 					resumeDisposition: resumeDisposition(status?.state, candidate.sessionFile ?? status?.sessionFile),
+					...(expectedManaged ? { managed: expectedManaged } : {}),
 					...(canonicalSession ? { canonicalSession } : {}),
 				};
 			}
 		}
 	} catch (error) {
-		proof = unknownProof(runId, runnerClose.processInstanceId, "proof-write-failed", errorMessage(error));
+		proof = unknownProof(runId, runnerClose.processInstanceId, "proof-write-failed", errorMessage(error), expectedManaged);
 	}
 	let durable = false;
 	try {
@@ -258,5 +393,5 @@ export function finalizeProcessTerminal(
 	} catch {
 		// Do not emit a process-terminal event when the proof sidecar was not durable.
 	}
-	return durable ? proof : unknownProof(runId, runnerClose.processInstanceId, "proof-write-failed", "Failed to persist process-terminal proof.");
+	return durable ? proof : unknownProof(runId, runnerClose.processInstanceId, "proof-write-failed", "Failed to persist process-terminal proof.", expectedManaged);
 }

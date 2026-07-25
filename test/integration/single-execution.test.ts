@@ -54,9 +54,11 @@ import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
 import { NESTED_EVENTS_DIR } from "../../src/runs/shared/nested-events.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
 import {
+	computePreparedRunnerAdmissionTokenDigest,
 	preparedRunnerAdmissionPaths,
 	type PreparedRunnerAdmissionEvidenceV1,
 } from "../../src/runs/background/prepared-runner-admission.ts";
+import { canonicalSessionId } from "../../src/runs/shared/session-lease.ts";
 import { MAX_CHILD_PENDING_LINE_BYTES, MAX_CHILD_STDERR_BYTES } from "../../src/runs/shared/child-protocol.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
@@ -258,6 +260,20 @@ const getFinalOutput = utils?.getFinalOutput;
 const createSubagentExecutor = executorMod?.createSubagentExecutor;
 const PREPARED_TEST_DISPATCH_DIGEST = "d".repeat(64);
 
+function preparedTerminalOptions(runId: string) {
+	return {
+		processTerminalBinding: {
+			version: 1 as const,
+			parentSessionIdentityDigest: "c".repeat(64),
+			consumerId: "pi-signal",
+			operationId: Buffer.alloc(32, 9).toString("base64url"),
+			requestDigest: PREPARED_TEST_DISPATCH_DIGEST,
+			candidateRunId: runId,
+		},
+		onProcessTerminal: () => undefined,
+	};
+}
+
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -321,9 +337,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		initialSpawnState?: NonNullable<SubagentState["subagentSpawns"]>,
 		allowMutatingManagementActions = true,
 		initialAsyncJobs: SubagentState["asyncJobs"] = new Map(),
+		piEvents: ReturnType<typeof createEventBus> = createEventBus(),
 	) {
 		return createSubagentExecutor!({
-			pi: { events: createEventBus(), getSessionName: () => undefined },
+			pi: { events: piEvents, getSessionName: () => undefined },
 			state: {
 				baseCwd: tempDir,
 				currentSessionId: initialSpawnState?.sessionId ?? null,
@@ -855,6 +872,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			{
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				...preparedTerminalOptions(candidate),
 				beforeLaunch: (plan: { runId: string; sessionRoot: string; sessionDir: string; sessionFile: string; asyncDir: string; resultPath: string; resultReservationPath: string; runnerConfigPath: string; runnerAdmissionPath: string; runnerAdmissionProceedPath: string; runnerAdmissionCommitPath: string }) => {
 					callbackCount++;
 					assert.deepEqual({
@@ -911,8 +929,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			undefined,
 			ctx,
 			{
-				runId: `prepared-reject-final-fence-${Date.now()}`,
+				runId: "prepared-reject-final-fence",
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				...preparedTerminalOptions("prepared-reject-final-fence"),
 				beforeLaunch: () => {},
 				afterAuthorization: () => { throw new Error("reject final fence"); },
 				onRunnerReady: () => assert.fail("rejected final fence must not create a runner"),
@@ -972,8 +991,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				undefined,
 				ctx,
 				{
-					runId: `prepared-inherited-${Date.now()}`,
+					runId: "prepared-inherited",
 					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+					...preparedTerminalOptions("prepared-inherited"),
 					beforeLaunch: () => { initialCallbackCount++; },
 					afterAuthorization: () => undefined,
 					onRunnerReady: () => assert.fail("inherited prepared spawn must not create a runner"),
@@ -994,8 +1014,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				undefined,
 				ctx,
 				{
-					runId: `prepared-environment-changed-${Date.now()}`,
+					runId: "prepared-environment-changed",
 					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+					...preparedTerminalOptions("prepared-environment-changed"),
 					beforeLaunch: () => {
 						changedCallbackCount++;
 						process.env.PI_SUBAGENT_DEPTH = "1";
@@ -1022,8 +1043,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				undefined,
 				ctx,
 				{
-					runId: `prepared-final-fence-${Date.now()}`,
+					runId: "prepared-final-fence",
 					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+					...preparedTerminalOptions("prepared-final-fence"),
 					beforeLaunch: () => {},
 					afterAuthorization: () => {
 						finalFenceCount++;
@@ -1088,6 +1110,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			{
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				...preparedTerminalOptions(candidate),
 				beforeLaunch: () => { callbackCount++; },
 				afterAuthorization: () => {
 					assert.equal(spawnState.count, 1, "bounded capacity must be reserved at the final boundary");
@@ -1154,6 +1177,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			{
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				...preparedTerminalOptions(candidate),
 				beforeLaunch: () => {},
 				afterAuthorization: () => undefined,
 				onRunnerReady: () => { readyCount++; },
@@ -1209,7 +1233,14 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		let callbackCount = 0;
 		const readyEvidence: PreparedRunnerAdmissionEvidenceV1[] = [];
 		const acceptedEvidence: PreparedRunnerAdmissionEvidenceV1[] = [];
-		const executor = makeExecutor([makeAgent("echo")]);
+		let terminalCallbackCount = 0;
+		const piEvents = createEventBus();
+		const emit = piEvents.emit.bind(piEvents);
+		piEvents.emit = (eventName: string, payload: unknown) => {
+			if (eventName === "subagent:process-terminal") throw new Error("throwing terminal listener");
+			return emit(eventName, payload);
+		};
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), piEvents);
 		const result = await executor.executePreparedSpawn(
 			"prepared-success-request",
 			{
@@ -1229,6 +1260,11 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			{
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				...preparedTerminalOptions(candidate),
+				onProcessTerminal: () => {
+					terminalCallbackCount++;
+					throw new Error("terminal callback failure must be contained");
+				},
 				beforeLaunch: () => { callbackCount++; },
 				afterAuthorization: () => undefined,
 				onRunnerReady: (evidence: PreparedRunnerAdmissionEvidenceV1) => { readyEvidence.push(evidence); },
@@ -1255,12 +1291,35 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 		assert.equal(fs.existsSync(resultPath), true);
+		assert.equal(terminalCallbackCount, 1, "durable terminal callback must run exactly once even when event emission and the callback throw");
 		assert.equal(fs.existsSync(path.join(sessionRoot, "run-0", "session.jsonl")), true);
 		assert.equal(fs.existsSync(resultReservationPath), false, "runner must release the candidate-bound result reservation after publication");
 		assert.equal(fs.existsSync(configPath), false, "runner must consume the candidate-bound transient config");
 		const retainedAdmission = JSON.parse(fs.readFileSync(admissionPaths.evidencePath, "utf8")) as PreparedRunnerAdmissionEvidenceV1;
 		assert.equal(retainedAdmission.state, "committed");
 		assert.equal(retainedAdmission.dispatchIdentityDigest, PREPARED_TEST_DISPATCH_DIGEST);
+		const terminalProof = JSON.parse(fs.readFileSync(path.join(asyncDir, "process-terminal.json"), "utf8")) as {
+			state?: string;
+			runId?: string;
+			runnerProcessInstanceId?: string;
+			managed?: Record<string, unknown>;
+			canonicalSession?: { canonicalSessionId?: string; freeAtObservation?: boolean };
+		};
+		assert.equal(terminalProof.state, "observed");
+		assert.equal(terminalProof.runId, candidate);
+		assert.equal(terminalProof.runnerProcessInstanceId, retainedAdmission.runnerProcessInstanceId);
+		assert.deepEqual(terminalProof.managed, {
+			version: 1,
+			parentSessionIdentityDigest: "c".repeat(64),
+			consumerId: "pi-signal",
+			operationId: Buffer.alloc(32, 9).toString("base64url"),
+			requestDigest: PREPARED_TEST_DISPATCH_DIGEST,
+			candidateRunId: candidate,
+			runnerAdmissionTokenDigest: computePreparedRunnerAdmissionTokenDigest(retainedAdmission.token),
+		});
+		assert.equal(terminalProof.canonicalSession?.freeAtObservation, true);
+		assert.equal(terminalProof.canonicalSession?.canonicalSessionId, canonicalSessionId(path.join(sessionRoot, "run-0", "session.jsonl")));
+		assert.equal(JSON.stringify(terminalProof).includes(retainedAdmission.token), false, "terminal proof must not expose the raw admission token");
 		assert.equal(fs.existsSync(admissionPaths.proceedPath), false);
 		assert.equal(fs.existsSync(admissionPaths.commitPath), false);
 		assert.equal(mockPi.callCount(), 1);

@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	SUBAGENT_MANAGED_DISPATCH_VERSION,
@@ -27,13 +26,18 @@ import {
 	type ManagedOperationJournalRecordV1,
 	type ManagedOperationJournalStateV1,
 } from "./operation-journal.ts";
-import { ASYNC_DIR } from "../shared/types.ts";
+import type { ManagedProcessTerminalBindingV1, ProcessTerminalV1 } from "../shared/types.ts";
 import {
 	computePreparedRunnerAdmissionTokenDigest,
 	preparedRunnerAdmissionPaths,
 	readPreparedRunnerAdmissionEvidenceForDispatch,
 	type PreparedRunnerAdmissionEvidenceV1,
 } from "../runs/background/prepared-runner-admission.ts";
+import {
+	computeManagedProcessTerminalProofDigest,
+	readProcessTerminal,
+} from "../runs/background/process-terminal.ts";
+import { canonicalSessionId } from "../runs/shared/session-lease.ts";
 import type {
 	PreparedSubagentSpawnOptions,
 	PreparedSubagentSpawnPlan,
@@ -330,8 +334,24 @@ export class ManagedSpawnCoordinator {
 				}
 				this.#options.journal.transition(parentDigest, consumerId, operationId, requestDigest, "dispatching", {
 					runId: request.expectedLaunch.candidateRunId,
+					terminalAsyncDir: plan.asyncDir,
+					canonicalSessionFile: plan.sessionFile,
 				});
+				// Recheck after the durable boundary write as well as before it. Node has
+				// no portable openat-relative creation, so this narrows rather than
+				// eliminates hostile same-UID path replacement (outside the trust model).
+				if (!managedLaunchRootProjectionsAreCurrent(authorizedContract)) {
+					return fail("contract_changed", "Managed launch root identity changed at the dispatch boundary.");
+				}
 				return undefined;
+			},
+			processTerminalBinding: {
+				version: 1,
+				parentSessionIdentityDigest: parentDigest,
+				consumerId,
+				operationId,
+				requestDigest,
+				candidateRunId: request.expectedLaunch.candidateRunId,
 			},
 			onRunnerReady: (evidence) => {
 				this.#assertAdmissionEvidence(evidence, request.expectedLaunch.candidateRunId, requestDigest);
@@ -355,6 +375,15 @@ export class ManagedSpawnCoordinator {
 				});
 				return undefined;
 			},
+			onProcessTerminal: () => {
+				try {
+					const current = this.#options.journal.read(parentDigest, consumerId, operationId);
+					if (current) this.#reconcileTerminal(current);
+				} catch {
+					// Durable proof remains available for replay; never throw from a close callback.
+				}
+				return undefined;
+			},
 		};
 
 		let executionResult: Awaited<ReturnType<ManagedSpawnExecutor["executePreparedSpawn"]>>;
@@ -375,6 +404,7 @@ export class ManagedSpawnCoordinator {
 		if (executionResult.isError === true) {
 			return receipt(this.#failCurrentOperation(current, requestDigest), claim.replayed);
 		}
+		if (current.state === "terminal") return receipt(current, claim.replayed);
 		if (current.state !== "accepted") {
 			return receipt(this.#failCurrentOperation(current, requestDigest), claim.replayed);
 		}
@@ -399,8 +429,8 @@ export class ManagedSpawnCoordinator {
 		if (!record.runId || !record.runnerProcessInstanceId || !record.runnerAdmissionTokenDigest || !record.expectedLaunch) return false;
 		try {
 			const evidence = readPreparedRunnerAdmissionEvidenceForDispatch(
-				record.expectedLaunch.candidateRunId === record.runId
-					? initialAdmissionPath(record)
+				record.expectedLaunch.candidateRunId === record.runId && record.terminalAsyncDir
+					? preparedRunnerAdmissionPaths(record.terminalAsyncDir).evidencePath
 					: "",
 				{ runId: record.runId, dispatchIdentityDigest: record.requestDigest },
 			);
@@ -412,10 +442,81 @@ export class ManagedSpawnCoordinator {
 		}
 	}
 
+	#managedTerminalBinding(record: Readonly<ManagedOperationJournalRecordV1>): ManagedProcessTerminalBindingV1 | undefined {
+		if (!record.runId || !record.runnerAdmissionTokenDigest) return undefined;
+		return {
+			version: 1,
+			parentSessionIdentityDigest: record.parentSessionIdentityDigest,
+			consumerId: record.consumerId,
+			operationId: record.operationId,
+			requestDigest: record.requestDigest,
+			candidateRunId: record.runId,
+			runnerAdmissionTokenDigest: record.runnerAdmissionTokenDigest,
+		};
+	}
+
+	#readTerminalProof(record: Readonly<ManagedOperationJournalRecordV1>): ProcessTerminalV1 | undefined {
+		if (!record.terminalAsyncDir || !record.runnerProcessInstanceId) return undefined;
+		const managed = this.#managedTerminalBinding(record);
+		if (!managed) return undefined;
+		try {
+			return readProcessTerminal(record.terminalAsyncDir, {
+				runId: record.runId,
+				runnerProcessInstanceId: record.runnerProcessInstanceId,
+				managed,
+			});
+		} catch {
+			return undefined;
+		}
+	}
+
+	#reconcileTerminal(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+		if (record.state === "terminal" || !["accepted", "uncertain", "reconciling"].includes(record.state)) return record;
+		if (!record.terminalAsyncDir || !record.canonicalSessionFile || !record.runnerProcessInstanceId || !this.#hasCommittedAdmission(record)) return record;
+		const proof = this.#readTerminalProof(record);
+		if (!proof) return record;
+		const proofIsExact = proof.state === "observed"
+			&& proof.runId === record.runId
+			&& proof.runnerProcessInstanceId === record.runnerProcessInstanceId
+			&& proof.managed !== undefined
+			&& proof.canonicalSession?.freeAtObservation === true;
+		let expectedCanonicalSessionId: string | undefined;
+		try {
+			expectedCanonicalSessionId = canonicalSessionId(record.canonicalSessionFile);
+		} catch {
+			expectedCanonicalSessionId = undefined;
+		}
+		if (!proofIsExact || !expectedCanonicalSessionId || proof.canonicalSession?.canonicalSessionId !== expectedCanonicalSessionId) {
+			if (record.state === "accepted") {
+				return this.#options.journal.transition(record.parentSessionIdentityDigest, record.consumerId, record.operationId, record.requestDigest, "uncertain");
+			}
+			if (record.state === "reconciling") {
+				return this.#options.journal.transition(record.parentSessionIdentityDigest, record.consumerId, record.operationId, record.requestDigest, "uncertain");
+			}
+			return record;
+		}
+		let current = record;
+		if (current.state === "uncertain") {
+			current = this.#options.journal.transition(current.parentSessionIdentityDigest, current.consumerId, current.operationId, current.requestDigest, "reconciling");
+		}
+		return this.#options.journal.transition(current.parentSessionIdentityDigest, current.consumerId, current.operationId, current.requestDigest, "terminal", {
+			terminalEvidence: {
+				version: 1,
+				proofDigest: computeManagedProcessTerminalProofDigest(proof),
+				observedAt: proof.observedAt!,
+				canonicalSessionId: expectedCanonicalSessionId,
+			},
+		});
+	}
+
 	#reconcileReplay(
 		record: Readonly<ManagedOperationJournalRecordV1>,
 		requestDigest: string,
 	): Readonly<ManagedOperationJournalRecordV1> {
+		const durableTerminalProofExists = this.#readTerminalProof(record) !== undefined;
+		const terminal = this.#reconcileTerminal(record);
+		if (terminal.state === "terminal" || terminal.state !== record.state) return terminal;
+		record = terminal;
 		const { parentSessionIdentityDigest, consumerId, operationId } = record;
 		if (record.state === "dispatching" || record.state === "runner-ready") {
 			return this.#options.journal.transition(parentSessionIdentityDigest, consumerId, operationId, requestDigest, "uncertain");
@@ -427,8 +528,8 @@ export class ManagedSpawnCoordinator {
 				runId: reconciling.runId,
 			});
 		}
-		if (record.state === "uncertain" && record.runnerProcessInstanceId && record.runnerAdmissionTokenDigest
-			&& this.#hasCommittedAdmission(record)) {
+		if (record.state === "uncertain" && !durableTerminalProofExists
+			&& record.runnerProcessInstanceId && record.runnerAdmissionTokenDigest && this.#hasCommittedAdmission(record)) {
 			this.#options.journal.transition(parentSessionIdentityDigest, consumerId, operationId, requestDigest, "reconciling");
 			return this.#options.journal.transition(parentSessionIdentityDigest, consumerId, operationId, requestDigest, "accepted");
 		}
@@ -457,8 +558,4 @@ export class ManagedSpawnCoordinator {
 		}
 		return record;
 	}
-}
-
-function initialAdmissionPath(record: Readonly<ManagedOperationJournalRecordV1>): string {
-	return preparedRunnerAdmissionPaths(path.join(ASYNC_DIR, record.runId!)).evidencePath;
 }

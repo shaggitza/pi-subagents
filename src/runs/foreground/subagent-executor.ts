@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "../../agents/agents.ts";
+import { assertManagedConsumerId, assertManagedOperationId } from "../../api/managed-dispatch.ts";
 import { getArtifactsDir, getProjectChainRunsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -136,6 +137,7 @@ import {
 	type IntercomEventBus,
 	type JsonSchemaObject,
 	type MaxOutputConfig,
+	type ManagedProcessTerminalBindingV1,
 	type NestedRouteInfo,
 	type NestedRunSummary,
 	type ResolvedControlConfig,
@@ -264,10 +266,14 @@ export interface PreparedSubagentSpawnOptions {
 	 * effects. Success makes later failures reconciliation cases.
 	 */
 	afterAuthorization(plan: Readonly<PreparedSubagentSpawnPlan>): undefined;
+	/** Journal identity completed with the private admission token digest at launch. */
+	processTerminalBinding: Readonly<Omit<ManagedProcessTerminalBindingV1, "runnerAdmissionTokenDigest">>;
 	/** Runs while the prepared runner is blocked before model/session execution. */
 	onRunnerReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 	/** Runs after accepted evidence while the runner remains blocked before execution. */
 	onRunnerAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+	/** Runs after durable process-terminal publication. Exceptions are contained. */
+	onProcessTerminal(proof: Readonly<import("../../shared/types.ts").ProcessTerminalV1>): undefined;
 }
 
 interface ExecutorDeps {
@@ -2275,8 +2281,10 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 				preparedResultReservation: data.preparedResultReservation,
 				preparedRunnerAdmission: {
 					dispatchIdentityDigest: data.preparedSpawn.dispatchIdentityDigest,
+					processTerminalBinding: data.preparedSpawn.processTerminalBinding,
 					onReady: data.preparedSpawn.onRunnerReady,
 					onAccepted: data.preparedSpawn.onRunnerAccepted,
+					onProcessTerminal: data.preparedSpawn.onProcessTerminal,
 				},
 			} : {}),
 			sessionFile: sessionFileForTask(params.agent!, 0, modelOverride),
@@ -3547,8 +3555,22 @@ function validatePreparedSpawnRequest(params: SubagentParamsLike, options: Prepa
 	if (typeof options.beforeLaunch !== "function" || typeof options.afterAuthorization !== "function") {
 		return "Prepared spawn requires asynchronous authorization and a synchronous final fence.";
 	}
-	if (typeof options.onRunnerReady !== "function" || typeof options.onRunnerAccepted !== "function") {
-		return "Prepared spawn requires runner-ready and runner-accepted callbacks.";
+	if (typeof options.onRunnerReady !== "function" || typeof options.onRunnerAccepted !== "function" || typeof options.onProcessTerminal !== "function") {
+		return "Prepared spawn requires runner-ready, runner-accepted, and process-terminal callbacks.";
+	}
+	try {
+		const binding = options.processTerminalBinding;
+		if (!binding || binding.version !== 1
+			|| !PREPARED_DISPATCH_DIGEST.test(binding.parentSessionIdentityDigest)
+			|| !PREPARED_DISPATCH_DIGEST.test(binding.requestDigest)
+			|| binding.requestDigest !== options.dispatchIdentityDigest
+			|| binding.candidateRunId !== options.runId) {
+			return "Prepared spawn requires an exact managed process-terminal binding.";
+		}
+		assertManagedConsumerId(binding.consumerId);
+		assertManagedOperationId(binding.operationId);
+	} catch {
+		return "Prepared spawn requires an exact managed process-terminal binding.";
 	}
 	if (params.action !== undefined || params.tasks !== undefined || params.chain !== undefined) {
 		return "Prepared spawn supports ordinary single-agent execution only.";

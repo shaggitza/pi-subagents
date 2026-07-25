@@ -289,6 +289,25 @@ export function managedLaunchRootProjectionsAreCurrent(contract: SubagentLaunchC
 	if (!attestations) return false;
 	try {
 		return Object.entries(attestations).every(([name, expected]) => {
+			let descriptor: number | undefined;
+			try {
+				const noFollow = "O_NOFOLLOW" in fs.constants
+					? (fs.constants as typeof fs.constants & { O_NOFOLLOW: number }).O_NOFOLLOW
+					: 0;
+				const ancestorMustBeDirectory = expected.relativeSuffix.length > 0 || MANAGED_DIRECTORY_ATTESTATIONS.has(name);
+				const directoryOnly = ancestorMustBeDirectory && "O_DIRECTORY" in fs.constants
+					? (fs.constants as typeof fs.constants & { O_DIRECTORY: number }).O_DIRECTORY
+					: 0;
+				if (noFollow === 0 && fs.lstatSync(expected.existingAncestor).isSymbolicLink()) return false;
+				descriptor = fs.openSync(expected.existingAncestor, fs.constants.O_RDONLY | noFollow | directoryOnly);
+				const expectedAncestorStats = fs.fstatSync(descriptor, { bigint: true });
+				if ((ancestorMustBeDirectory ? !expectedAncestorStats.isDirectory() : !expectedAncestorStats.isFile())
+					|| fs.realpathSync(expected.existingAncestor) !== expected.existingAncestorRealPath
+					|| String(expectedAncestorStats.dev) !== expected.existingAncestorDevice
+					|| String(expectedAncestorStats.ino) !== expected.existingAncestorInode) return false;
+			} finally {
+				if (descriptor !== undefined) fs.closeSync(descriptor);
+			}
 			const current = attestLaunchPath(
 				expected.path,
 				MANAGED_DIRECTORY_ATTESTATIONS.has(name) ? "directory" : "file",
