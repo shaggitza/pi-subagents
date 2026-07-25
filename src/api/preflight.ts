@@ -123,6 +123,8 @@ export interface SubagentLaunchRootAttestation {
 	path: string;
 	existingAncestor: string;
 	existingAncestorRealPath: string;
+	/** Stable projected real path: existing real ancestor plus the unresolved suffix. */
+	projectedRealPath: string;
 	existingAncestorDevice: string;
 	existingAncestorInode: string;
 	relativeSuffix: string;
@@ -204,7 +206,17 @@ function sha256StableJson(value: unknown): string {
 }
 
 function digestContract(contract: Omit<SubagentLaunchContract, "digest">): string {
-	return sha256StableJson(contract);
+	if (!contract.parentSessionIdentityDigest || !contract.roots.attestations) return sha256StableJson(contract);
+	const stableAttestations = Object.fromEntries(
+		Object.entries(contract.roots.attestations).map(([name, attestation]) => [name, {
+			path: attestation.path,
+			projectedRealPath: attestation.projectedRealPath,
+		}]),
+	);
+	return sha256StableJson({
+		...contract,
+		roots: { ...contract.roots, attestations: stableAttestations },
+	});
 }
 
 function digestAgentDefinition(agent: AgentConfig): string {
@@ -240,6 +252,7 @@ function attestLaunchPath(inputPath: string, expectedKind: "directory" | "file")
 	const existingAncestorRealPath = fs.realpathSync(existingAncestor);
 	const stats = fs.statSync(existingAncestorRealPath, { bigint: true });
 	const relativeSuffix = path.relative(existingAncestor, absolutePath);
+	const projectedRealPath = path.resolve(existingAncestorRealPath, relativeSuffix);
 	if (relativeSuffix && !stats.isDirectory()) throw new Error(`Existing launch-root ancestor is not a directory: ${existingAncestor}`);
 	if (!relativeSuffix && expectedKind === "directory" && !stats.isDirectory()) {
 		throw new Error(`Existing launch root is not a directory: ${absolutePath}`);
@@ -251,6 +264,7 @@ function attestLaunchPath(inputPath: string, expectedKind: "directory" | "file")
 		path: absolutePath,
 		existingAncestor,
 		existingAncestorRealPath,
+		projectedRealPath,
 		existingAncestorDevice: String(stats.dev),
 		existingAncestorInode: String(stats.ino),
 		relativeSuffix,
@@ -265,6 +279,25 @@ function attestLaunchRoots(
 			.filter((entry): entry is [string, { path: string; kind: "directory" | "file" }] => typeof entry[1].path === "string")
 			.map(([name, root]) => [name, attestLaunchPath(root.path, root.kind)]),
 	);
+}
+
+const MANAGED_DIRECTORY_ATTESTATIONS = new Set(["cwd", "sessionRoot", "sessionDir", "artifactsDir", "asyncDir"]);
+
+/** Synchronously re-attests stable real-path projections immediately before managed launch side effects. */
+export function managedLaunchRootProjectionsAreCurrent(contract: SubagentLaunchContract): boolean {
+	const attestations = contract.roots.attestations;
+	if (!attestations) return false;
+	try {
+		return Object.entries(attestations).every(([name, expected]) => {
+			const current = attestLaunchPath(
+				expected.path,
+				MANAGED_DIRECTORY_ATTESTATIONS.has(name) ? "directory" : "file",
+			);
+			return current.path === expected.path && current.projectedRealPath === expected.projectedRealPath;
+		});
+	} catch {
+		return false;
+	}
 }
 
 function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string): SubagentLaunchContractAgentCandidate[] {

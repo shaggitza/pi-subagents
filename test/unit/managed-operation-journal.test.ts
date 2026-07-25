@@ -146,6 +146,13 @@ describe("managed durable operation journal", () => {
 		assert.equal(dispatching.runId, "candidate-1");
 		assert.equal(store.transition(parentDigest, "pi-signal", operationId(), digest, "dispatching", { runId: "candidate-1" }).updatedAt, dispatching.updatedAt);
 		expectCode(
+			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "uncertain", {
+				runnerProcessInstanceId: "premature-runner",
+				runnerAdmissionTokenDigest: "d".repeat(64),
+			}),
+			"invalid_state",
+		);
+		expectCode(
 			() => store.transition(parentDigest, "pi-signal", operationId(), digest, "runner-ready", { runId: "other-run" }),
 			"operation_conflict",
 		);

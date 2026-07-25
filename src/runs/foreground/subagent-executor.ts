@@ -256,10 +256,14 @@ export interface PreparedSubagentSpawnOptions {
 	/** Durable request/operation identity bound into runner admission evidence. */
 	dispatchIdentityDigest: string;
 	/**
-	 * Final fail-closed authorization boundary. A successful callback means all
-	 * later failures are post-dispatch and must be reconciled, never relaunched.
+	 * Asynchronous contract authorization before the synchronous launch fence.
 	 */
 	beforeLaunch(plan: Readonly<PreparedSubagentSpawnPlan>): void | Promise<void>;
+	/**
+	 * Final fail-closed authorization boundary immediately before launch side
+	 * effects. Success makes later failures reconciliation cases.
+	 */
+	afterAuthorization(plan: Readonly<PreparedSubagentSpawnPlan>): undefined;
 	/** Runs while the prepared runner is blocked before model/session execution. */
 	onRunnerReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 	/** Runs after accepted evidence while the runner remains blocked before execution. */
@@ -3540,7 +3544,9 @@ function preparedExecutionEnvironmentIsClean(): boolean {
 function validatePreparedSpawnRequest(params: SubagentParamsLike, options: PreparedSubagentSpawnOptions): string | undefined {
 	if (!PREPARED_RUN_ID.test(options.runId)) return "Prepared spawn requires a safe host-generated run identity.";
 	if (!PREPARED_DISPATCH_DIGEST.test(options.dispatchIdentityDigest)) return "Prepared spawn requires a dispatch identity digest.";
-	if (typeof options.beforeLaunch !== "function") return "Prepared spawn requires a final authorization callback.";
+	if (typeof options.beforeLaunch !== "function" || typeof options.afterAuthorization !== "function") {
+		return "Prepared spawn requires asynchronous authorization and a synchronous final fence.";
+	}
 	if (typeof options.onRunnerReady !== "function" || typeof options.onRunnerAccepted !== "function") {
 		return "Prepared spawn requires runner-ready and runner-accepted callbacks.";
 	}
@@ -4168,7 +4174,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
 			const plan: PreparedSubagentSpawnPlan = Object.freeze({
 				runId,
-				parentSessionId: deps.state.currentSessionId,
+				parentSessionId: ctx.sessionManager.getSessionId() ?? deps.state.currentSessionId,
 				parentSessionFile,
 				cwd: effectiveCwd,
 				sessionRoot,
@@ -4188,13 +4194,38 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			} catch {
 				releaseSpawnBudgetReservation(
 					deps.state,
-					plan.parentSessionId,
+					deps.state.currentSessionId,
 					requestedSpawns,
 				);
 				return preparedSpawnError("Prepared spawn final authorization failed before launch.");
 			}
 			if (!preparedExecutionEnvironmentIsClean()) {
+				releaseSpawnBudgetReservation(
+					deps.state,
+					deps.state.currentSessionId,
+					requestedSpawns,
+				);
 				return preparedSpawnError("Prepared spawn environment changed after final authorization.");
+			}
+			try {
+				const finalFenceResult = preparedSpawn.afterAuthorization(plan) as unknown;
+				if (finalFenceResult !== undefined) {
+					if (
+						finalFenceResult !== null
+						&& (typeof finalFenceResult === "object" || typeof finalFenceResult === "function")
+						&& typeof (finalFenceResult as { then?: unknown }).then === "function"
+					) {
+						void Promise.resolve(finalFenceResult).catch(() => {});
+					}
+					throw new Error("Prepared spawn final fence must complete synchronously.");
+				}
+			} catch {
+				releaseSpawnBudgetReservation(
+					deps.state,
+					deps.state.currentSessionId,
+					requestedSpawns,
+				);
+				return preparedSpawnError("Prepared spawn final fence failed closed after authorization.");
 			}
 			try {
 				preparedResultReservation = createPreparedResultReservation(runId, resultPath);

@@ -94,6 +94,7 @@ function contract(input: SubagentLaunchContractInput): SubagentLaunchContract {
 		path: attestedPath,
 		existingAncestor: temporary,
 		existingAncestorRealPath: fs.realpathSync(temporary),
+		projectedRealPath: path.resolve(fs.realpathSync(temporary), path.relative(temporary, attestedPath)),
 		existingAncestorDevice: "1",
 		existingAncestorInode: "2",
 		relativeSuffix: path.relative(temporary, attestedPath),

@@ -182,6 +182,45 @@ Project prompt.
 			assert.equal(repeated.ok, true);
 			assert.equal(repeated.contract.digest, result.contract.digest);
 			assert.match(result.contract.parentSessionIdentityDigest, /^[a-f0-9]{64}$/);
+			assert.equal(result.contract.roots.attestations?.sessionRoot.projectedRealPath, path.join(fs.realpathSync(tempDir), "sessions", "run-123"));
+			fs.mkdirSync(path.join(sessionRoot, "run-123", "run-0"), { recursive: true });
+			const afterRootCreation = await resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				task: "Inspect the repo",
+				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
+				sessionRoot,
+				availableModels: [
+					{ provider: "test", id: "primary", fullId: "test/primary" },
+					{ provider: "test", id: "fallback", fullId: "test/fallback" },
+				],
+				capabilityCeiling: ceiling,
+			});
+			assert.equal(afterRootCreation.ok, true);
+			assert.equal(afterRootCreation.contract.digest, result.contract.digest);
+			fs.rmSync(sessionRoot, { recursive: true, force: true });
+			const redirectedSessionRoot = path.join(tempDir, "redirected-sessions");
+			fs.mkdirSync(redirectedSessionRoot);
+			fs.symlinkSync(redirectedSessionRoot, sessionRoot);
+			const afterSymlinkSubstitution = await resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				task: "Inspect the repo",
+				runId: "run-123",
+				identityMode: "managed-v1",
+				parentSessionId: "parent-session",
+				sessionRoot,
+				availableModels: [
+					{ provider: "test", id: "primary", fullId: "test/primary" },
+					{ provider: "test", id: "fallback", fullId: "test/fallback" },
+				],
+				capabilityCeiling: ceiling,
+			});
+			assert.equal(afterSymlinkSubstitution.ok, true);
+			assert.notEqual(afterSymlinkSubstitution.contract.digest, result.contract.digest);
+			fs.unlinkSync(sessionRoot);
 			fs.appendFileSync(path.join(cwd, ".pi", "skills", "project-skill", "SKILL.md"), "\nChanged skill content.\n", "utf8");
 			clearSkillCache();
 			const changedSkill = await resolveSubagentLaunchContract({

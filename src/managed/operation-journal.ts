@@ -608,6 +608,9 @@ export class ManagedOperationJournal {
 		if ((patchedRunnerInstance === undefined) !== (patchedAdmissionTokenDigest === undefined)) {
 			throw new ManagedOperationJournalError("invalid_state", "Managed runner admission correlation must be bound atomically.");
 		}
+		if (existing.runnerProcessInstanceId === undefined && patchedRunnerInstance !== undefined && nextState !== "runner-ready") {
+			throw new ManagedOperationJournalError("invalid_state", "Managed runner admission correlation may first bind only at runner-ready.");
+		}
 		if (existing.state === nextState) {
 			if (patchedRunId !== undefined && existing.runId === undefined) {
 				throw new ManagedOperationJournalError("invalid_state", "Managed run identity was not durably bound with the state transition.");

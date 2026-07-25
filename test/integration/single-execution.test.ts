@@ -834,7 +834,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			},
 		};
 		let callbackCount = 0;
-		const spawnState = { sessionId: "session-123", count: 0, configuredLimit: 1, granted: 0, grantHistory: [] };
+		const spawnState = { sessionId: parentSessionFile, count: 0, configuredLimit: 1, granted: 0, grantHistory: [] };
 		const executor = makeExecutor([makeAgent("echo")], { maxSubagentSpawnsPerSession: 1 }, false, spawnState);
 		const result = await executor.executePreparedSpawn(
 			"prepared-reject-request",
@@ -884,6 +884,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 					});
 					throw new Error("test rejection must not escape");
 				},
+				afterAuthorization: () => undefined,
 				onRunnerReady: () => assert.fail("rejected prepared spawn must not create a runner"),
 				onRunnerAccepted: () => assert.fail("rejected prepared spawn must not create a runner"),
 			},
@@ -892,6 +893,35 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(result.content[0]?.text ?? "", /final authorization failed before launch/);
 		assert.equal(callbackCount, 1);
 		assert.equal(spawnState.count, 0, "pre-launch authorization rejection must release bounded spawn capacity");
+		const fenceSessionRoot = path.join(tempDir, "prepared-reject-final-fence-session");
+		const fenceResult = await executor.executePreparedSpawn(
+			"prepared-reject-final-fence-request",
+			{
+				agent: "echo",
+				task: "Reject at final fence",
+				async: true,
+				clarify: false,
+				context: "fresh",
+				cwd: tempDir,
+				sessionDir: fenceSessionRoot,
+				artifacts: false,
+				output: false,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{
+				runId: `prepared-reject-final-fence-${Date.now()}`,
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				beforeLaunch: () => {},
+				afterAuthorization: () => { throw new Error("reject final fence"); },
+				onRunnerReady: () => assert.fail("rejected final fence must not create a runner"),
+				onRunnerAccepted: () => assert.fail("rejected final fence must not create a runner"),
+			},
+		);
+		assert.equal(fenceResult.isError, true);
+		assert.equal(spawnState.count, 0, "final-fence rejection must release bounded spawn capacity");
+		assert.equal(fs.existsSync(fenceSessionRoot), false);
 		assert.equal(fs.existsSync(sessionRoot), false);
 		assert.equal(fs.existsSync(asyncDir), false);
 		assert.equal(fs.existsSync(resultPath), false);
@@ -918,7 +948,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				getSessionFile: () => parentSessionFile,
 			},
 		};
-		const executor = makeExecutor([makeAgent("echo")]);
+		const spawnState = { sessionId: parentSessionFile, count: 0, configuredLimit: 1, granted: 0, grantHistory: [] };
+		const executor = makeExecutor([makeAgent("echo")], { maxSubagentSpawnsPerSession: 1 }, false, spawnState);
 		const originalDepth = process.env.PI_SUBAGENT_DEPTH;
 		const params = (sessionDir: string) => ({
 			agent: "echo",
@@ -944,6 +975,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 					runId: `prepared-inherited-${Date.now()}`,
 					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 					beforeLaunch: () => { initialCallbackCount++; },
+					afterAuthorization: () => undefined,
 					onRunnerReady: () => assert.fail("inherited prepared spawn must not create a runner"),
 					onRunnerAccepted: () => assert.fail("inherited prepared spawn must not create a runner"),
 				},
@@ -968,6 +1000,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 						changedCallbackCount++;
 						process.env.PI_SUBAGENT_DEPTH = "1";
 					},
+					afterAuthorization: () => undefined,
 					onRunnerReady: () => assert.fail("changed environment must stop before runner creation"),
 					onRunnerAccepted: () => assert.fail("changed environment must stop before runner creation"),
 				},
@@ -975,7 +1008,36 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			assert.equal(changed.isError, true);
 			assert.match(changed.content[0]?.text ?? "", /environment changed after final authorization/);
 			assert.equal(changedCallbackCount, 1);
+			assert.equal(spawnState.count, 0, "environment drift before the final fence must release bounded capacity");
 			assert.equal(fs.existsSync(changedSessionRoot), false);
+			assert.equal(mockPi.callCount(), 0);
+
+			delete process.env.PI_SUBAGENT_DEPTH;
+			const finalFenceSessionRoot = path.join(tempDir, "prepared-final-fence-session");
+			let finalFenceCount = 0;
+			const fenced = await executor.executePreparedSpawn(
+				"prepared-final-fence-request",
+				params(finalFenceSessionRoot),
+				new AbortController().signal,
+				undefined,
+				ctx,
+				{
+					runId: `prepared-final-fence-${Date.now()}`,
+					dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+					beforeLaunch: () => {},
+					afterAuthorization: () => {
+						finalFenceCount++;
+						throw new Error("session generation changed");
+					},
+					onRunnerReady: () => assert.fail("failed final fence must stop before runner creation"),
+					onRunnerAccepted: () => assert.fail("failed final fence must stop before runner creation"),
+				},
+			);
+			assert.equal(fenced.isError, true);
+			assert.match(fenced.content[0]?.text ?? "", /final fence failed closed after authorization/);
+			assert.equal(finalFenceCount, 1);
+			assert.equal(spawnState.count, 0, "final-fence rejection must release bounded capacity");
+			assert.equal(fs.existsSync(finalFenceSessionRoot), false);
 			assert.equal(mockPi.callCount(), 0);
 		} finally {
 			if (originalDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
@@ -1005,7 +1067,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			},
 		};
 		let callbackCount = 0;
-		const executor = makeExecutor([makeAgent("echo")]);
+		const spawnState = { sessionId: parentSessionFile, count: 0, configuredLimit: 1, granted: 0, grantHistory: [] };
+		const executor = makeExecutor([makeAgent("echo")], { maxSubagentSpawnsPerSession: 1 }, false, spawnState);
 		const result = await executor.executePreparedSpawn(
 			"prepared-config-collision-request",
 			{
@@ -1026,6 +1089,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 				beforeLaunch: () => { callbackCount++; },
+				afterAuthorization: () => {
+					assert.equal(spawnState.count, 1, "bounded capacity must be reserved at the final boundary");
+					return undefined;
+				},
 				onRunnerReady: () => assert.fail("config collision must prevent runner creation"),
 				onRunnerAccepted: () => assert.fail("config collision must prevent runner creation"),
 			},
@@ -1033,6 +1100,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /Failed to start async run/);
 		assert.equal(callbackCount, 1);
+		assert.equal(spawnState.count, 1, "post-boundary collision remains a consumed reconciliation case");
 		assert.equal(mockPi.callCount(), 0);
 		assert.equal(fs.existsSync(sessionRoot), true);
 		assert.equal(fs.existsSync(asyncDir), true);
@@ -1087,6 +1155,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 				beforeLaunch: () => {},
+				afterAuthorization: () => undefined,
 				onRunnerReady: () => { readyCount++; },
 				onRunnerAccepted: ((_: PreparedRunnerAdmissionEvidenceV1) => {
 					acceptedCount++;
@@ -1161,6 +1230,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				runId: candidate,
 				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
 				beforeLaunch: () => { callbackCount++; },
+				afterAuthorization: () => undefined,
 				onRunnerReady: (evidence: PreparedRunnerAdmissionEvidenceV1) => { readyEvidence.push(evidence); },
 				onRunnerAccepted: (evidence: PreparedRunnerAdmissionEvidenceV1) => { acceptedEvidence.push(evidence); },
 			},
