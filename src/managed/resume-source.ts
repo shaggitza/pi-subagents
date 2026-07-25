@@ -141,6 +141,7 @@ export function resolveManagedResumeSourceV1(input: {
 		requestDigest: record.requestDigest,
 		candidateRunId: record.runId!,
 		runnerAdmissionTokenDigest: record.runnerAdmissionTokenDigest!,
+		...(record.runnerSessionLeaseTokenDigest ? { sessionLeaseTokenDigest: record.runnerSessionLeaseTokenDigest } : {}),
 	};
 	let admission: ReturnType<typeof readPreparedRunnerAdmissionEvidenceForDispatch>;
 	try {

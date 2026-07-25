@@ -78,6 +78,7 @@ function sanitizeProcessTerminal(record: Readonly<ManagedOperationJournalRecordV
 		requestDigest: record.requestDigest,
 		candidateRunId: record.runId,
 		runnerAdmissionTokenDigest: record.runnerAdmissionTokenDigest,
+		...(record.runnerSessionLeaseTokenDigest ? { sessionLeaseTokenDigest: record.runnerSessionLeaseTokenDigest } : {}),
 	};
 	const proof = readProcessTerminal(record.terminalAsyncDir, {
 		runId: record.runId,

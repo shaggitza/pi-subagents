@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	computePreparedRunnerAdmissionTokenDigest,
+	computePreparedRunnerSessionLeaseTokenDigest,
 	createPreparedRunnerAdmission,
 	preparedRunnerAdmissionPaths,
 	readPreparedRunnerAdmissionControl,
@@ -51,6 +52,22 @@ describe("prepared runner admission", () => {
 		writePreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "committed", 123, "runner-1", 300);
 		const committed = readPreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "committed");
 		assert.equal(committed?.state, "committed");
+	});
+
+	it("binds exact resume session lease identity through evidence and controls", () => {
+		const resume = { version: 1 as const, sourceRunId: "source-1", sourceIndex: 0 as const, canonicalSessionId: "c".repeat(64) };
+		const admission = createPreparedRunnerAdmission("candidate-resume", "d".repeat(64), resume);
+		const leaseDigest = computePreparedRunnerSessionLeaseTokenDigest("private-lease-token");
+		const paths = preparedRunnerAdmissionPaths(temporary);
+		const ready = writePreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "ready", 123, "runner-resume", 100, leaseDigest);
+		assert.deepEqual(ready.resume, resume);
+		assert.equal(ready.sessionLeaseTokenDigest, leaseDigest);
+		writePreparedRunnerAdmissionControl(paths.proceedPath, admission, "proceed", ready);
+		assert.equal(readPreparedRunnerAdmissionControl(paths.proceedPath, admission, "proceed", leaseDigest)?.resume?.sessionLeaseTokenDigest, leaseDigest);
+		assert.throws(() => readPreparedRunnerAdmissionControl(paths.proceedPath, admission, "proceed", "e".repeat(64)), /control is invalid/);
+		assert.throws(() => writePreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "accepted", 123, "runner-resume"), /lease correlation/);
+		const wrongSource = createPreparedRunnerAdmission("candidate-resume", "d".repeat(64), { ...resume, sourceRunId: "source-2" });
+		assert.throws(() => readPreparedRunnerAdmissionEvidenceForDispatch(paths.evidencePath, wrongSource), /resume identity changed/);
 	});
 
 	it("fails closed for changed identity, state, controls, and unsafe descriptors", () => {

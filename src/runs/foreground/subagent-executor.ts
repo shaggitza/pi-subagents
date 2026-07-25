@@ -4,7 +4,8 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope } from "../../agents/agents.ts";
-import { assertManagedConsumerId, assertManagedOperationId } from "../../api/managed-dispatch.ts";
+import { assertManagedConsumerId, assertManagedOperationId, assertManagedResumeExecutorRequestV1 } from "../../api/managed-dispatch.ts";
+import type { ManagedResumeSourceV1 } from "../../managed/resume-source.ts";
 import { getArtifactsDir, getProjectChainRunsDir } from "../../shared/artifacts.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
 import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
@@ -61,6 +62,7 @@ import { buildAsyncRunnerSteps, executeAsyncChain, executeAsyncSingle, formatAsy
 import {
 	preparedRunnerAdmissionPaths,
 	type PreparedRunnerAdmissionEvidenceV1,
+	type PreparedRunnerResumeBindingV1,
 } from "../background/prepared-runner-admission.ts";
 import {
 	createPreparedResultReservation,
@@ -273,6 +275,38 @@ export interface PreparedSubagentSpawnOptions {
 	/** Runs after accepted evidence while the runner remains blocked before execution. */
 	onRunnerAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 	/** Runs after durable process-terminal publication. Exceptions are contained. */
+	onProcessTerminal(proof: Readonly<import("../../shared/types.ts").ProcessTerminalV1>): undefined;
+}
+
+export interface PreparedSubagentResumePlan {
+	runId: string;
+	sourceRunId: string;
+	sourceIndex: 0;
+	sourceOperationId: string;
+	sourceSessionFile: string;
+	sourceCanonicalSessionId: string;
+	sourceTerminalProofDigest: string;
+	parentSessionId: string;
+	parentSessionFile: string;
+	cwd: string;
+	asyncDir: string;
+	resultPath: string;
+	resultReservationPath: string;
+	runnerConfigPath: string;
+	runnerAdmissionPath: string;
+	runnerAdmissionProceedPath: string;
+	runnerAdmissionCommitPath: string;
+}
+
+export interface PreparedSubagentResumeOptions {
+	runId: string;
+	dispatchIdentityDigest: string;
+	source: Readonly<ManagedResumeSourceV1>;
+	beforeLaunch(plan: Readonly<PreparedSubagentResumePlan>): void | Promise<void>;
+	afterAuthorization(plan: Readonly<PreparedSubagentResumePlan>): undefined;
+	processTerminalBinding: Readonly<Omit<ManagedProcessTerminalBindingV1, "runnerAdmissionTokenDigest">>;
+	onRunnerReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
+	onRunnerAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 	onProcessTerminal(proof: Readonly<import("../../shared/types.ts").ProcessTerminalV1>): undefined;
 }
 
@@ -3594,6 +3628,29 @@ function validatePreparedSpawnRequest(params: SubagentParamsLike, options: Prepa
 	return undefined;
 }
 
+function validatePreparedResumeRequest(params: SubagentParamsLike, options: PreparedSubagentResumeOptions): string | undefined {
+	if (!PREPARED_RUN_ID.test(options.runId) || !PREPARED_DISPATCH_DIGEST.test(options.dispatchIdentityDigest)) {
+		return "Prepared resume requires safe candidate and dispatch identities.";
+	}
+	if (!options.source || options.source.sourceIndex !== 0 || options.source.canonicalSessionId.length !== 64) {
+		return "Prepared resume requires exact source authority.";
+	}
+	try {
+		assertManagedResumeExecutorRequestV1(params as unknown as import("../../api/managed-dispatch.ts").JsonObject, options.source.sourceRunId, 0);
+		const binding = options.processTerminalBinding;
+		if (!binding || binding.requestDigest !== options.dispatchIdentityDigest || binding.candidateRunId !== options.runId) throw new Error();
+		assertManagedConsumerId(binding.consumerId);
+		assertManagedOperationId(binding.operationId);
+	} catch {
+		return "Prepared resume request or process-terminal binding is invalid.";
+	}
+	if ([options.beforeLaunch, options.afterAuthorization, options.onRunnerReady, options.onRunnerAccepted, options.onProcessTerminal].some((entry) => typeof entry !== "function")) {
+		return "Prepared resume requires complete authorization and admission callbacks.";
+	}
+	if (!preparedExecutionEnvironmentIsClean()) return "Prepared resume is unavailable from inherited or nested execution.";
+	return undefined;
+}
+
 function preparedSpawnError(message: string): AgentToolResult<Details> {
 	return {
 		content: [{ type: "text", text: message }],
@@ -3630,6 +3687,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 		options: PreparedSubagentSpawnOptions,
+	) => Promise<AgentToolResult<Details>>;
+	/** Additive, unregistered exact prepared-resume seam. */
+	executePreparedResume: (
+		id: string,
+		params: SubagentParamsLike,
+		signal: AbortSignal,
+		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
+		ctx: ExtensionContext,
+		options: PreparedSubagentResumeOptions,
 	) => Promise<AgentToolResult<Details>>;
 } {
 	const delegatedThinkingOverrides = new WeakMap<object, AgentConfig["thinking"]>();
@@ -4496,5 +4562,137 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 	};
 
-	return { execute: executeWithSingleDispatchGuard, executeDelegated, executePreparedSpawn };
+	const executePreparedResume = async (
+		_id: string,
+		params: SubagentParamsLike,
+		signal: AbortSignal,
+		_onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
+		ctx: ExtensionContext,
+		options: PreparedSubagentResumeOptions,
+	): Promise<AgentToolResult<Details>> => {
+		if (!options || typeof options !== "object") return preparedSpawnError("Prepared resume options are invalid.");
+		const validationError = validatePreparedResumeRequest(params, options);
+		if (validationError) return preparedSpawnError(validationError);
+		const source = options.source;
+		const request = assertManagedResumeExecutorRequestV1(params as unknown as import("../../api/managed-dispatch.ts").JsonObject, source.sourceRunId, 0);
+		const parentSessionFile = ctx.sessionManager.getSessionFile();
+		const parentSessionId = ctx.sessionManager.getSessionId();
+		deps.state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		if (!parentSessionFile || !parentSessionId || !deps.state.currentSessionId) return preparedSpawnError("Prepared resume requires an active persisted parent session.");
+		const budget = reserveSpawnBudget(deps.state, deps.config, deps.state.currentSessionId, 1);
+		if (budget.error) return spawnBudgetErrorResult(budget.error, "single");
+		const asyncDir = path.join(ASYNC_DIR, options.runId);
+		const resultPath = path.join(RESULTS_DIR, `${options.runId}.json`);
+		const admissionPaths = preparedRunnerAdmissionPaths(asyncDir);
+		const plan: PreparedSubagentResumePlan = Object.freeze({
+			runId: options.runId,
+			sourceRunId: source.sourceRunId,
+			sourceIndex: 0,
+			sourceOperationId: source.sourceOperationId,
+			sourceSessionFile: source.canonicalSessionFile,
+			sourceCanonicalSessionId: source.canonicalSessionId,
+			sourceTerminalProofDigest: source.sourceTerminalProofDigest,
+			parentSessionId,
+			parentSessionFile,
+			cwd: source.cwd,
+			asyncDir,
+			resultPath,
+			resultReservationPath: preparedResultReservationPath(resultPath),
+			runnerConfigPath: getAsyncConfigPath(options.runId),
+			runnerAdmissionPath: admissionPaths.evidencePath,
+			runnerAdmissionProceedPath: admissionPaths.proceedPath,
+			runnerAdmissionCommitPath: admissionPaths.commitPath,
+		});
+		try {
+			await options.beforeLaunch(plan);
+			if (!preparedExecutionEnvironmentIsClean()) throw new Error("environment changed");
+			const fence = options.afterAuthorization(plan) as unknown;
+			if (fence !== undefined) {
+				if (fence !== null && (typeof fence === "object" || typeof fence === "function") && typeof (fence as { then?: unknown }).then === "function") void Promise.resolve(fence).catch(() => {});
+				throw new Error("final fence must be synchronous");
+			}
+		} catch {
+			releaseSpawnBudgetReservation(deps.state, deps.state.currentSessionId, 1);
+			return preparedSpawnError("Prepared resume authorization failed before launch.");
+		}
+		let resultReservation: PreparedResultReservationV1;
+		try {
+			resultReservation = createPreparedResultReservation(options.runId, resultPath);
+		} catch {
+			return preparedSpawnError("Prepared resume candidate ownership failed after authorization.");
+		}
+		const descriptor = source.recoveryDescriptor;
+		const baseAgent: AgentConfig = {
+			name: source.agent,
+			description: "Persisted managed resume contract",
+			systemPrompt: descriptor.systemPrompt ?? "",
+			systemPromptMode: descriptor.systemPromptMode,
+			inheritProjectContext: descriptor.inheritProjectContext,
+			inheritSkills: descriptor.inheritSkills,
+			source: "project",
+			filePath: descriptor.agentFilePath ?? path.join(source.cwd, ".pi-subagents-managed-resume-agent"),
+		};
+		const agentConfig = applySteeringRecoveryAgentConfig(baseAgent, descriptor);
+		const artifactConfig: ArtifactConfig = descriptor.artifactConfig ?? { ...DEFAULT_ARTIFACT_CONFIG, enabled: false };
+		const resumeBinding: PreparedRunnerResumeBindingV1 = {
+			version: 1,
+			sourceRunId: source.sourceRunId,
+			sourceIndex: 0,
+			canonicalSessionId: source.canonicalSessionId,
+		};
+		const result = executeAsyncSingle(options.runId, {
+			agent: source.agent,
+			task: buildRevivedAsyncTask({ kind: "revive", runId: source.sourceRunId, state: "complete", agent: source.agent, index: 0, cwd: source.cwd, sessionFile: source.canonicalSessionFile, model: source.model, thinking: source.thinking, recoveryDescriptor: descriptor }, request.message),
+			goal: request.message,
+			agentConfig,
+			ctx: {
+				pi: deps.pi,
+				cwd: ctx.cwd,
+				currentSessionId: deps.state.currentSessionId,
+				parentSessionId,
+				currentModelProvider: ctx.model?.provider,
+				currentModel: ctx.model,
+				modelScope: deps.discoverAgents(source.cwd, resolveExecutionAgentScope(undefined)).modelScope,
+				interactive: ctx.hasUI,
+			},
+			cwd: source.cwd,
+			artifactsDir: descriptor.artifactsDir,
+			artifactConfig,
+			shareEnabled: descriptor.share,
+			sessionRoot: path.dirname(path.dirname(source.canonicalSessionFile)),
+			sessionDir: descriptor.sessionDir,
+			sessionFile: source.canonicalSessionFile,
+			revivalLease: { sessionFile: source.canonicalSessionFile, runId: options.runId, sourceRunId: source.sourceRunId, parentSessionId: deps.state.currentSessionId },
+			modelOverride: source.model,
+			thinkingOverride: source.thinking,
+			maxSubagentDepth: descriptor.maxSubagentDepth,
+			waitToolEnabled: deps.waitToolEnabled,
+			availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
+			output: descriptor.outputPath,
+			outputMode: descriptor.outputMode,
+			...(descriptor.agentContract ? { agentContract: descriptor.agentContract } : {}),
+			...(descriptor.structuredOutputSchema ? { structuredOutputSchema: descriptor.structuredOutputSchema } : {}),
+			...(descriptor.skills ? { skills: [...descriptor.skills] } : {}),
+			...(descriptor.acceptance !== undefined ? { acceptance: descriptor.acceptance } : {}),
+			...(descriptor.initialTurnBudget ? { turnBudget: descriptor.initialTurnBudget } : {}),
+			...(descriptor.initialToolBudget ? { toolBudget: descriptor.initialToolBudget } : {}),
+			capabilityCeiling: descriptor.capabilityCeiling,
+			exclusiveRunPaths: true,
+			preparedResultReservation: resultReservation,
+			preparedRunnerAdmission: {
+				dispatchIdentityDigest: options.dispatchIdentityDigest,
+				resume: resumeBinding,
+				processTerminalBinding: options.processTerminalBinding,
+				onReady: options.onRunnerReady,
+				onAccepted: options.onRunnerAccepted,
+				onProcessTerminal: options.onProcessTerminal,
+			},
+		});
+		// The final fence already crossed the durable dispatch boundary. On any
+		// start error, retain candidate ownership for conservative reconciliation;
+		// only runner result publication may release the reservation.
+		return result;
+	};
+
+	return { execute: executeWithSingleDispatchGuard, executeDelegated, executePreparedSpawn, executePreparedResume };
 }

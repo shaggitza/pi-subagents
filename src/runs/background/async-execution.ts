@@ -69,6 +69,7 @@ import {
 	writePreparedRunnerAdmissionControl,
 	type PreparedRunnerAdmissionEvidenceV1,
 	type PreparedRunnerAdmissionV1,
+	type PreparedRunnerResumeBindingV1,
 } from "./prepared-runner-admission.ts";
 
 const require = createRequire(import.meta.url);
@@ -196,6 +197,7 @@ interface AsyncSingleParams {
 	preparedResultReservation?: PreparedResultReservationV1;
 	preparedRunnerAdmission?: {
 		dispatchIdentityDigest: string;
+		resume?: PreparedRunnerResumeBindingV1;
 		processTerminalBinding: Readonly<Omit<ManagedProcessTerminalBindingV1, "runnerAdmissionTokenDigest">>;
 		onReady(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
 		onAccepted(evidence: Readonly<PreparedRunnerAdmissionEvidenceV1>): undefined;
@@ -517,7 +519,8 @@ function spawnRunner(
 	}
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 	const nodeCommand = resolveAsyncRunnerNodeCommand();
-	const startupPath = typeof (launchConfig as { revivalLease?: unknown; asyncDir?: unknown }).revivalLease === "object"
+	const startupPath = !options.preparedAdmission
+		&& typeof (launchConfig as { revivalLease?: unknown; asyncDir?: unknown }).revivalLease === "object"
 		&& typeof (launchConfig as { asyncDir?: unknown }).asyncDir === "string"
 		? path.join((launchConfig as { asyncDir: string }).asyncDir, "runner-startup.json")
 		: undefined;
@@ -527,7 +530,12 @@ function spawnRunner(
 		&& typeof (launchConfig as { asyncDir?: unknown }).asyncDir === "string"
 		? preparedRunnerAdmissionPaths((launchConfig as { asyncDir: string }).asyncDir)
 		: undefined;
-	if (startupPath && preparedAdmissionPaths) return { error: "Prepared runner admission cannot be combined with revival startup." };
+	if (options.preparedAdmission?.admission.resume && typeof (launchConfig as { revivalLease?: unknown }).revivalLease !== "object") {
+		return { error: "Prepared resume admission requires a revival lease." };
+	}
+	if (!options.preparedAdmission?.admission.resume && options.preparedAdmission && typeof (launchConfig as { revivalLease?: unknown }).revivalLease === "object") {
+		return { error: "Prepared spawn admission cannot be combined with revival startup." };
+	}
 	if (preparedAdmissionPaths) {
 		for (const admissionPath of Object.values(preparedAdmissionPaths)) {
 			if (fs.existsSync(admissionPath)) return { error: `Prepared runner admission path already exists: ${admissionPath}` };
@@ -566,16 +574,29 @@ function spawnRunner(
 			const asyncDir = launch.asyncDir;
 			const runId = launch.id;
 			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
+			let expectedManaged = launch.managedProcessTerminalBinding;
+			if (expectedManaged && options.preparedAdmission?.admission.resume) {
+				try {
+					const evidence = readPreparedRunnerAdmissionEvidence(
+						preparedRunnerAdmissionPaths(asyncDir).evidencePath,
+						options.preparedAdmission.admission,
+						"committed",
+					);
+					if (evidence?.sessionLeaseTokenDigest) expectedManaged = { ...expectedManaged, sessionLeaseTokenDigest: evidence.sessionLeaseTokenDigest };
+				} catch {
+					// A missing or mismatched lease correlation makes final proof unknown.
+				}
+			}
 			finalizeProcessTerminal(asyncDir, runId, {
 				processInstanceId: runnerProcessInstanceId,
 				closeObservedAt: Date.now(),
 				exitCode,
 				signal,
-			}, launch.managedProcessTerminalBinding);
+			}, expectedManaged);
 			const persisted = readProcessTerminal(asyncDir, {
 				runId,
 				runnerProcessInstanceId,
-				...(launch.managedProcessTerminalBinding ? { managed: launch.managedProcessTerminalBinding } : {}),
+				...(expectedManaged ? { managed: expectedManaged } : {}),
 			});
 			if (!persisted) return;
 			if (launch.nestedRoute && launch.nestedSelf) {
@@ -662,7 +683,7 @@ function spawnRunner(
 			}
 			try {
 				invokePreparedAdmissionCallback(onReady, ready.evidence);
-				writePreparedRunnerAdmissionControl(preparedAdmissionPaths.proceedPath, admission, "proceed");
+				writePreparedRunnerAdmissionControl(preparedAdmissionPaths.proceedPath, admission, "proceed", ready.evidence);
 			} catch {
 				terminateRunnerBeforeProceed(proc.pid);
 				return { error: "Prepared runner-ready admission failed closed." };
@@ -679,7 +700,7 @@ function spawnRunner(
 			}
 			try {
 				invokePreparedAdmissionCallback(onAccepted, accepted.evidence);
-				writePreparedRunnerAdmissionControl(preparedAdmissionPaths.commitPath, admission, "commit");
+				writePreparedRunnerAdmissionControl(preparedAdmissionPaths.commitPath, admission, "commit", accepted.evidence);
 			} catch {
 				terminateRunnerBeforeProceed(proc.pid);
 				return { error: "Prepared runner-accepted admission failed closed." };
@@ -1337,7 +1358,7 @@ export function executeAsyncSingle(
 	let managedProcessTerminalBinding: ManagedProcessTerminalBindingV1 | undefined;
 	try {
 		preparedAdmission = params.preparedRunnerAdmission
-			? createPreparedRunnerAdmission(id, params.preparedRunnerAdmission.dispatchIdentityDigest)
+			? createPreparedRunnerAdmission(id, params.preparedRunnerAdmission.dispatchIdentityDigest, params.preparedRunnerAdmission.resume)
 			: undefined;
 		managedProcessTerminalBinding = preparedAdmission && params.preparedRunnerAdmission
 			? {

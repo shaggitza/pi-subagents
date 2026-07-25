@@ -1383,6 +1383,97 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		fs.rmSync(configPath, { force: true });
 	});
 
+	it("prepared managed resume reuses the exact canonical JSONL with combined lease admission", async () => {
+		mockPi.onCall({ output: "managed resume finished" });
+		const candidate = `prepared-resume-${Date.now()}`;
+		const sourceRunId = `prepared-source-${Date.now()}`;
+		const sourceSessionFile = path.join(tempDir, "prepared-resume-source", "run-0", "session.jsonl");
+		fs.mkdirSync(path.dirname(sourceSessionFile), { recursive: true });
+		fs.writeFileSync(sourceSessionFile, `${JSON.stringify({ type: "session", version: 3, id: "source" })}\n`, "utf8");
+		const parentSessionFile = path.join(tempDir, "prepared-resume-parent.jsonl");
+		fs.writeFileSync(parentSessionFile, "", "utf8");
+		const asyncDir = path.join(ASYNC_DIR, candidate);
+		const resultPath = path.join(RESULTS_DIR, `${candidate}.json`);
+		const configPath = getAsyncConfigPath(candidate);
+		for (const target of [resultPath, preparedResultReservationPath(resultPath), configPath]) fs.rmSync(target, { force: true });
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		const baseCtx = makeMinimalCtx(tempDir);
+		const ctx = { ...baseCtx, sessionManager: { getSessionId: () => "session-123", getSessionFile: () => parentSessionFile } };
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ready: PreparedRunnerAdmissionEvidenceV1[] = [];
+		const accepted: PreparedRunnerAdmissionEvidenceV1[] = [];
+		const source = Object.freeze({
+			version: 1 as const,
+			consumerId: "pi-signal" as never,
+			sourceOperationId: Buffer.alloc(32, 7).toString("base64url"),
+			sourceRequestDigest: "1".repeat(64),
+			sourceRunId,
+			sourceIndex: 0 as const,
+			sourceTerminalProofDigest: "2".repeat(64),
+			canonicalSessionFile: sourceSessionFile,
+			canonicalSessionId: canonicalSessionId(sourceSessionFile),
+			sessionDevice: "1",
+			sessionInode: "1",
+			recoveryDescriptorDigest: "3".repeat(64),
+			agent: "echo",
+			cwd: tempDir,
+			recoveryDescriptor: Object.freeze({
+				version: 1 as const,
+				sourceRunId,
+				agent: "echo",
+				sessionFile: sourceSessionFile,
+				cwd: tempDir,
+				systemPromptMode: "replace" as const,
+				inheritProjectContext: false,
+				inheritSkills: false,
+				outputMode: "inline" as const,
+				maxSubagentDepth: 1,
+				share: false,
+			}),
+		});
+		const result = await executor.executePreparedResume(
+			"prepared-resume-request",
+			{ action: "resume", runId: sourceRunId, index: 0, message: "Continue exactly once", async: true, clarify: false, context: "fresh" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+			{
+				runId: candidate,
+				dispatchIdentityDigest: PREPARED_TEST_DISPATCH_DIGEST,
+				source,
+				...preparedTerminalOptions(candidate),
+				beforeLaunch: (plan) => {
+					assert.equal(plan.sourceSessionFile, sourceSessionFile);
+					assert.equal(plan.sourceRunId, sourceRunId);
+				},
+				afterAuthorization: () => undefined,
+				onRunnerReady: (evidence) => { ready.push(evidence); },
+				onRunnerAccepted: (evidence) => { accepted.push(evidence); },
+			},
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text);
+		assert.equal(result.details?.asyncId, candidate);
+		assert.equal(ready.length, 1);
+		assert.equal(accepted.length, 1);
+		assert.equal(ready[0]?.resume?.sourceRunId, sourceRunId);
+		assert.equal(ready[0]?.resume?.canonicalSessionId, canonicalSessionId(sourceSessionFile));
+		assert.match(ready[0]?.sessionLeaseTokenDigest ?? "", /^[a-f0-9]{64}$/);
+		assert.equal(accepted[0]?.sessionLeaseTokenDigest, ready[0]?.sessionLeaseTokenDigest);
+		const deadline = Date.now() + 30_000;
+		while ((!fs.existsSync(resultPath) || !fs.existsSync(path.join(asyncDir, "process-terminal.json"))) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(mockPi.callCount(), 1);
+		assert.ok(readCallArgs().includes(sourceSessionFile), "runner must open the exact source JSONL");
+		assert.equal(fs.readdirSync(path.dirname(sourceSessionFile)).filter((entry) => entry.endsWith(".jsonl")).length, 1, "prepared resume must not create a replacement JSONL");
+		const proof = JSON.parse(fs.readFileSync(path.join(asyncDir, "process-terminal.json"), "utf8"));
+		assert.equal(proof.state, "observed");
+		assert.equal(proof.canonicalSession.canonicalSessionId, canonicalSessionId(sourceSessionFile));
+		assert.equal(proof.canonicalSession.canonicalSessionLeaseReleased, true);
+		assert.equal(proof.managed.sessionLeaseTokenDigest, ready[0]?.sessionLeaseTokenDigest);
+		assert.equal(fs.existsSync(configPath), false);
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
+	});
+
 	it("does not impose a cumulative spawn cap by default", async () => {
 		mockPi.onCall({ output: "continued after forty launches" });
 		const spawnState = { sessionId: "session-123", count: 40 };

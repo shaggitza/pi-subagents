@@ -359,6 +359,8 @@ export interface ManagedProcessTerminalBindingV1 {
 	requestDigest: string;
 	candidateRunId: string;
 	runnerAdmissionTokenDigest: string;
+	/** Present only for exact prepared resume and bound to the acquired canonical-session lease. */
+	sessionLeaseTokenDigest?: string;
 }
 
 export interface ProcessTerminalV1 {

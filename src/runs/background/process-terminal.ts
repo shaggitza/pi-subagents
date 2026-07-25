@@ -77,12 +77,13 @@ function boundedJson(filePath: string): unknown {
 }
 
 function parseManagedBinding(value: unknown, runId?: string): ManagedProcessTerminalBindingV1 {
-	if (!isRecord(value) || !hasOnlyKeys(value, ["version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "candidateRunId", "runnerAdmissionTokenDigest"])) {
+	if (!isRecord(value) || !hasOnlyKeys(value, ["version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "candidateRunId", "runnerAdmissionTokenDigest"], ["sessionLeaseTokenDigest"])) {
 		throw new Error("Invalid managed process-terminal binding.");
 	}
 	if (value.version !== 1 || typeof value.parentSessionIdentityDigest !== "string" || !SHA256.test(value.parentSessionIdentityDigest)
 		|| typeof value.requestDigest !== "string" || !SHA256.test(value.requestDigest)
 		|| typeof value.runnerAdmissionTokenDigest !== "string" || !SHA256.test(value.runnerAdmissionTokenDigest)
+		|| (value.sessionLeaseTokenDigest !== undefined && (typeof value.sessionLeaseTokenDigest !== "string" || !SHA256.test(value.sessionLeaseTokenDigest)))
 		|| typeof value.candidateRunId !== "string" || !SAFE_ID.test(value.candidateRunId)
 		|| (runId !== undefined && value.candidateRunId !== runId)) {
 		throw new Error("Invalid managed process-terminal binding identity.");
@@ -95,6 +96,7 @@ function parseManagedBinding(value: unknown, runId?: string): ManagedProcessTerm
 		requestDigest: value.requestDigest,
 		candidateRunId: value.candidateRunId,
 		runnerAdmissionTokenDigest: value.runnerAdmissionTokenDigest,
+		...(typeof value.sessionLeaseTokenDigest === "string" ? { sessionLeaseTokenDigest: value.sessionLeaseTokenDigest } : {}),
 	};
 }
 
@@ -105,7 +107,8 @@ function managedBindingsEqual(a: ManagedProcessTerminalBindingV1, b: ManagedProc
 		&& a.operationId === b.operationId
 		&& a.requestDigest === b.requestDigest
 		&& a.candidateRunId === b.candidateRunId
-		&& a.runnerAdmissionTokenDigest === b.runnerAdmissionTokenDigest;
+		&& a.runnerAdmissionTokenDigest === b.runnerAdmissionTokenDigest
+		&& a.sessionLeaseTokenDigest === b.sessionLeaseTokenDigest;
 }
 
 export function computeManagedProcessTerminalProofDigest(proof: Readonly<ProcessTerminalV1>): string {

@@ -105,8 +105,9 @@ import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.t
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup } from "../shared/parallel-handoff.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
-import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
+import { acquireSessionLease, canonicalSessionId, type SessionLeaseRequest } from "../shared/session-lease.ts";
 import {
+	computePreparedRunnerSessionLeaseTokenDigest,
 	preparedRunnerAdmissionPaths,
 	readPreparedRunnerAdmissionControl,
 	writePreparedRunnerAdmissionEvidence,
@@ -4021,7 +4022,14 @@ async function runSubagent(
 				? { sessionFile: effectiveSessionFile }
 				: config.revivalLease?.sessionFile ? { sessionFile: config.revivalLease.sessionFile } : {}),
 			...(config.revivalLeaseToken ? { revivalLeaseToken: config.revivalLeaseToken } : {}),
-			...(config.managedProcessTerminalBinding ? { managed: config.managedProcessTerminalBinding } : {}),
+			...(config.managedProcessTerminalBinding ? {
+				managed: {
+					...config.managedProcessTerminalBinding,
+					...(config.preparedRunnerAdmission?.resume && config.revivalLeaseToken
+						? { sessionLeaseTokenDigest: computePreparedRunnerSessionLeaseTokenDigest(config.revivalLeaseToken) }
+						: {}),
+				},
+			} : {}),
 		};
 		try {
 			writeProcessTerminalCandidate(asyncDir, candidate);
@@ -4059,11 +4067,12 @@ async function waitForPreparedAdmissionControl(
 	controlPath: string,
 	admission: PreparedRunnerAdmissionV1,
 	action: "proceed" | "commit",
+	sessionLeaseTokenDigest?: string,
 	timeoutMs = 30_000,
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() <= deadline) {
-		const control = readPreparedRunnerAdmissionControl(controlPath, admission, action);
+		const control = readPreparedRunnerAdmissionControl(controlPath, admission, action, sessionLeaseTokenDigest);
 		if (control) return;
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
@@ -4087,8 +4096,19 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 	process.once("exit", releaseOnExit);
 	try {
 		if (config.preparedResultReservation) assertPreparedResultReservation(config.preparedResultReservation);
-		if (config.preparedRunnerAdmission && config.revivalLease) {
-			throw new Error("Prepared runner admission cannot be combined with revival startup.");
+		const preparedResume = config.preparedRunnerAdmission?.resume;
+		if ((preparedResume === undefined) !== !(config.preparedRunnerAdmission && config.revivalLease)) {
+			throw new Error("Prepared runner lease/admission mode is inconsistent.");
+		}
+		let sessionLeaseTokenDigest: string | undefined;
+		if (preparedResume && config.revivalLease) {
+			lease = acquireSessionLease(config.revivalLease);
+			config.revivalLeaseToken = lease.owner.token;
+			if (canonicalSessionId(lease.owner.canonicalSessionFile) !== preparedResume.canonicalSessionId
+				|| config.revivalLease.sourceRunId !== preparedResume.sourceRunId) {
+				throw new Error("Prepared resume lease identity differs from admission authority.");
+			}
+			sessionLeaseTokenDigest = computePreparedRunnerSessionLeaseTokenDigest(lease.owner.token);
 		}
 		if (config.preparedRunnerAdmission) {
 			if (!config.runnerProcessInstanceId) throw new Error("Prepared runner admission lacks a runner process identity.");
@@ -4098,23 +4118,30 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 				"ready",
 				process.pid,
 				config.runnerProcessInstanceId,
+				Date.now(),
+				sessionLeaseTokenDigest,
 			);
-			await waitForPreparedAdmissionControl(admissionPaths.proceedPath, config.preparedRunnerAdmission, "proceed");
+			await waitForPreparedAdmissionControl(admissionPaths.proceedPath, config.preparedRunnerAdmission, "proceed", sessionLeaseTokenDigest);
 			writePreparedRunnerAdmissionEvidence(
 				admissionPaths.evidencePath,
 				config.preparedRunnerAdmission,
 				"accepted",
 				process.pid,
 				config.runnerProcessInstanceId,
+				Date.now(),
+				sessionLeaseTokenDigest,
 			);
-			await waitForPreparedAdmissionControl(admissionPaths.commitPath, config.preparedRunnerAdmission, "commit");
+			await waitForPreparedAdmissionControl(admissionPaths.commitPath, config.preparedRunnerAdmission, "commit", sessionLeaseTokenDigest);
 			writePreparedRunnerAdmissionEvidence(
 				admissionPaths.evidencePath,
 				config.preparedRunnerAdmission,
 				"committed",
 				process.pid,
 				config.runnerProcessInstanceId,
+				Date.now(),
+				sessionLeaseTokenDigest,
 			);
+			startupCommitted = true;
 			for (const controlPath of [admissionPaths.proceedPath, admissionPaths.commitPath]) {
 				try {
 					fs.rmSync(controlPath, { force: true });
@@ -4123,7 +4150,7 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 			}
 		}
-		if (config.revivalLease) {
+		if (config.revivalLease && !preparedResume) {
 			lease = acquireSessionLease(config.revivalLease);
 			config.revivalLeaseToken = lease.owner.token;
 			writeAtomicJson(startupPath, { state: "ready", token: lease.owner.token, pid: process.pid, owner: lease.owner });
@@ -4141,7 +4168,7 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 		await runSubagent(config, lease ? (writer) => lease!.updateWriter(writer) : undefined);
 	} catch (error) {
-		if (config.revivalLease && !startupCommitted) {
+		if (config.revivalLease && !config.preparedRunnerAdmission?.resume && !startupCommitted) {
 			try {
 				writeAtomicJson(startupPath, { state: "error", pid: process.pid, error: error instanceof Error ? error.message : String(error) });
 			} catch {
