@@ -73,7 +73,7 @@ function initialExecutorRequest() {
 function spawnRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return mutationBase(
 		"spawn",
-		{ profile: profile(), request: initialExecutorRequest() },
+		{ request: initialExecutorRequest() },
 		{ expectedLaunch: expectedLaunch(), ...overrides },
 	);
 }
@@ -82,7 +82,6 @@ function resumeRequest(overrides: Record<string, unknown> = {}): Record<string, 
 	return mutationBase(
 		"resume",
 		{
-			profile: profile(),
 			sourceRunId: "source-1",
 			index: 0,
 			request: { action: "resume", id: "source-1", index: 0, message: "continue" },
@@ -322,6 +321,7 @@ describe("managed-dispatch public protocol foundation", () => {
 		assert.notEqual(rootA, computeManagedProfileIdentityDigest(identityWithChangedContent));
 		assert.notEqual(rootA, contentA, "profile-content and profile-identity domains must differ");
 		assert.throws(() => computeManagedProfileIdentityDigest({ ...identityA, root: { ...identityA.root, device: undefined } }));
+		assert.throws(() => computeManagedProfileIdentityDigest({ ...identityA, root: { ...identityA.root, realPath: "/repo\nother" } }));
 	});
 
 	it("exports preflight-to-launch binding vocabulary", () => {
@@ -330,7 +330,7 @@ describe("managed-dispatch public protocol foundation", () => {
 			requestId: "preflight-1",
 			method: "preflight",
 			consumerId: assertManagedConsumerId("pi-signal"),
-			input: { kind: "spawn", profile: profile(), request: initialExecutorRequest() },
+			input: { kind: "spawn", request: initialExecutorRequest() },
 		};
 		const result: ManagedPreflightResultV1 = {
 			version: 1,
@@ -362,33 +362,32 @@ describe("managed-dispatch public protocol foundation", () => {
 					task: "inspect",
 					agent: "worker",
 				},
-				profile: { content: { retries: 2, flags: [true, null] }, root: "/repo", version: 1 },
 			},
 		});
 		const operationChanged = spawnRequest({
 			managed: { version: 1, consumerId: "pi-signal", operationId: operationId(8) },
 		});
-		assert.equal(computeManagedRequestDigest(first), "512706c65aaadf8231134c49a636822513387572e385179e269074d12f40f4a7");
+		assert.equal(computeManagedRequestDigest(first), "d56ca3a6832fe9de4c1a932ae397d67e45e0c923367bc5e64ffa3a7b0bac9b0b");
 		assert.equal(computeManagedRequestDigest(first), computeManagedRequestDigest(requestIdChanged));
 		assert.equal(computeManagedRequestDigest(first), computeManagedRequestDigest(inputReordered));
 		assert.notEqual(computeManagedRequestDigest(first), computeManagedRequestDigest(operationChanged));
 		assert.notEqual(
 			computeManagedRequestDigest(first),
 			computeManagedRequestDigest(
-				spawnRequest({ input: { profile: profile(), request: { ...initialExecutorRequest(), model: "provider/other" } } }),
+				spawnRequest({ input: { request: { ...initialExecutorRequest(), model: "provider/other" } } }),
 			),
 		);
 		assert.notEqual(
 			computeManagedRequestDigest(first),
 			computeManagedRequestDigest(
-				spawnRequest({ input: { profile: profile(), request: { ...initialExecutorRequest(), sessionDir: "/private/sessions/other" } } }),
+				spawnRequest({ input: { request: { ...initialExecutorRequest(), sessionDir: "/private/sessions/other" } } }),
 			),
 		);
 		assert.match(computeManagedRequestDigest(first), /^[a-f0-9]{64}$/);
 	});
 
 	it("uses a contract-valid resume input and exact contracts for every mutation method", () => {
-		assert.equal(computeManagedRequestDigest(resumeRequest()), "24fa1e90fad32de9478f753eb9e11e0785feebefcf638ee1b6eb0f847662818d");
+		assert.equal(computeManagedRequestDigest(resumeRequest()), "c9bef0c1d7b4501382fc269313513372e97e2ad06f17592c39b3c8547ceafbf1");
 		for (const method of ["steer", "interrupt", "stop", "retire"] as const) {
 			assert.match(computeManagedRequestDigest(controlRequest(method)), /^[a-f0-9]{64}$/);
 		}
@@ -425,19 +424,16 @@ describe("managed-dispatch public protocol foundation", () => {
 			spawnRequest({ method: "status" }),
 			spawnRequest({ managed: { version: 2, consumerId: "pi-signal", operationId: operationId() } }),
 			spawnRequest({ managed: { version: 1, consumerId: "pi-signal", operationId: operationId(), extra: true } }),
-			spawnRequest({ input: { profile: profile() } }),
-			spawnRequest({ input: { profile: { root: "/repo", content: {} }, request: {} } }),
-			spawnRequest({ input: { profile: { version: 1, root: "/repo", content: {}, extra: true }, request: {} } }),
-			spawnRequest({ input: { profile: { version: 1, root: "/repo", content: undefined }, request: {} } }),
-			spawnRequest({ input: { profile: profile(), request: {}, contractDigest: "b".repeat(64) } }),
-			spawnRequest({ input: { profile: profile(), request: null } }),
-			spawnRequest({ input: { profile: profile(), request: [] } }),
-			spawnRequest({ input: { profile: profile(), request: undefined } }),
-			spawnRequest({ input: { profile: { ...profile(), root: "/repo\nother" }, request: {} } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: -1, request: {} } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: 1_000_001, request: {} } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source/unsafe", index: 0, request: {} } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: 0 } }),
+			spawnRequest({ input: {} }),
+			spawnRequest({ input: { request: {}, profile: profile() } }),
+			spawnRequest({ input: { request: {}, contractDigest: "b".repeat(64) } }),
+			spawnRequest({ input: { request: null } }),
+			spawnRequest({ input: { request: [] } }),
+			spawnRequest({ input: { request: undefined } }),
+			resumeRequest({ input: { sourceRunId: "source-1", index: -1, request: {} } }),
+			resumeRequest({ input: { sourceRunId: "source-1", index: 1_000_001, request: {} } }),
+			resumeRequest({ input: { sourceRunId: "source/unsafe", index: 0, request: {} } }),
+			resumeRequest({ input: { sourceRunId: "source-1", index: 0 } }),
 			controlRequest("steer", { input: { target: { consumerId: "pi-signal", operationId: operationId() }, message: "" } }),
 			controlRequest("interrupt", { input: { target: { consumerId: "other-consumer", operationId: operationId() } } }),
 			controlRequest("interrupt", { input: { target: { consumerId: "pi-signal", operationId: operationId(), runId: "run-1" } } }),

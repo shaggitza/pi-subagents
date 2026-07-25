@@ -49,6 +49,7 @@ export interface ManagedHostIdentityV1 {
 	hostId: string;
 }
 
+/** Provider-derived launch profile material. It is never accepted from mutation callers. */
 export interface ManagedProfileSnapshotV1 {
 	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
 	root: string;
@@ -76,13 +77,11 @@ export interface ManagedMutationContextV1 {
 }
 
 export interface ManagedSpawnInputV1 {
-	profile: ManagedProfileSnapshotV1;
 	/** Exact ordinary single-agent execution request; the future host provider validates its schema. */
 	request: JsonObject;
 }
 
 export interface ManagedResumeInputV1 {
-	profile: ManagedProfileSnapshotV1;
 	sourceRunId: string;
 	index: number;
 	/** Exact ordinary resume request; the future host provider validates source/index equality. */
@@ -642,21 +641,19 @@ function normalizeExecutorRequest(value: unknown, label: string): JsonObject {
 
 function normalizeSpawnInput(value: unknown): JsonValue {
 	if (!value || typeof value !== "object") throw new TypeError("Managed spawn input must be an object.");
-	const input = assertExactKeys(value, ["profile", "request"], "Managed spawn input");
+	const input = assertExactKeys(value, ["request"], "Managed spawn input");
 	return {
-		profile: normalizeProfileSnapshot(input.profile),
 		request: normalizeExecutorRequest(input.request, "Managed spawn executor request"),
 	};
 }
 
 function normalizeResumeInput(value: unknown): JsonValue {
 	if (!value || typeof value !== "object") throw new TypeError("Managed resume input must be an object.");
-	const input = assertExactKeys(value, ["profile", "sourceRunId", "index", "request"], "Managed resume input");
+	const input = assertExactKeys(value, ["sourceRunId", "index", "request"], "Managed resume input");
 	if (!Number.isSafeInteger(input.index) || (input.index as number) < 0 || (input.index as number) > 1_000_000) {
 		throw new TypeError("Managed resume index must be an integer between 0 and 1000000.");
 	}
 	return {
-		profile: normalizeProfileSnapshot(input.profile),
 		sourceRunId: assertSafeIdentifier(input.sourceRunId, "Managed resume sourceRunId"),
 		index: input.index as number,
 		request: normalizeExecutorRequest(input.request, "Managed resume executor request"),
