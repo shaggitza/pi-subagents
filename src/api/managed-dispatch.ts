@@ -231,6 +231,17 @@ export interface ManagedChildIdentityV1 {
 }
 
 export interface ManagedOperationStatusV1 extends ManagedDispatchReceiptV1 {
+	method: ManagedMutationMethodV1;
+	/** Exact caller-supplied command target; only one is present for command records. */
+	targetOperationId?: ManagedOperationId;
+	targetRunId?: string;
+	/** Exact launch actor resolved by the provider for a command. */
+	actorOperationId?: ManagedOperationId;
+	actorRunId?: string;
+	controlOutcome?: "acknowledged" | "failed" | "unknown";
+	retirementAcknowledgedUncertain?: true;
+	/** Command identity that durably retired this launch actor. */
+	retiredByOperationId?: ManagedOperationId;
 	runOutcome?: "running" | "completed" | "failed" | "interrupted" | "unknown";
 	processTerminal?: JsonValue;
 	child?: ManagedChildIdentityV1;
@@ -256,10 +267,10 @@ export interface ManagedDispatchCapabilitiesV1 {
 		status: boolean;
 		details: boolean;
 		resume: boolean;
-		steer: false;
-		interrupt: false;
-		stop: false;
-		retire: false;
+		steer: boolean;
+		interrupt: boolean;
+		stop: boolean;
+		retire: boolean;
 	};
 	durability: "journal-v1";
 	lifecycle: { version: 3; managedTerminalCorrelation: boolean };

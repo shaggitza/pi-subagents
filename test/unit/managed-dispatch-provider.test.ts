@@ -9,12 +9,14 @@ import { SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, computeManagedRequestDigest, m
 import { computeParentSessionIdentityDigest, type SubagentLaunchContract } from "../../src/api/preflight.ts";
 import { ManagedDispatchProvider } from "../../src/extension/managed-dispatch-provider.ts";
 import { ManagedOperationJournal } from "../../src/managed/operation-journal.ts";
+import { ManagedControlCoordinator } from "../../src/managed/control-coordinator.ts";
 import { createPreparedRunnerAdmission, computePreparedRunnerAdmissionTokenDigest, writePreparedRunnerAdmissionEvidence } from "../../src/runs/background/prepared-runner-admission.ts";
 import type { ManagedSpawnExecutor } from "../../src/managed/spawn-coordinator.ts";
 import type { ManagedResumeExecutor } from "../../src/managed/resume-coordinator.ts";
 import type { ResolvedManagedResumeLaunchV1 } from "../../src/managed/resume-contract.ts";
 import type { ManagedResumeSourceV1 } from "../../src/managed/resume-source.ts";
 import { computeManagedProcessTerminalProofDigest } from "../../src/runs/background/process-terminal.ts";
+import { consumeManagedControlRequests, managedControlAckPath, managedControlRequestPath } from "../../src/runs/background/control-channel.ts";
 import { preparedResultReservationPath } from "../../src/runs/background/prepared-result-reservation.ts";
 import { canonicalSessionId } from "../../src/runs/shared/session-lease.ts";
 import { getAsyncConfigPath, type ProcessTerminalV1 } from "../../src/shared/types.ts";
@@ -154,6 +156,41 @@ function inertExecutor(): ManagedSpawnExecutor & ManagedResumeExecutor {
 	return {
 		executePreparedSpawn: async () => ({ content: [] }),
 		executePreparedResume: async () => ({ content: [] }),
+	};
+}
+
+function seedControlActor(store: ManagedOperationJournal, byte: number, runId: string, state: "accepted" | "terminal" | "uncertain"): string {
+	const payload = request(runId, operationId(byte));
+	const parentDigest = (payload.expectedLaunch as { parentSessionIdentityDigest: string }).parentSessionIdentityDigest;
+	const digest = computeManagedRequestDigest(payload);
+	const id = operationId(byte);
+	const asyncDir = path.join(temporary, "control-async", runId);
+	const sessionFile = path.join(temporary, "control-sessions", runId, "session.jsonl");
+	fs.mkdirSync(asyncDir, { recursive: true });
+	store.claim(parentDigest, payload);
+	store.transition(parentDigest, "pi-signal", id, digest, "prepared");
+	store.transition(parentDigest, "pi-signal", id, digest, "dispatching", { runId, terminalAsyncDir: asyncDir, canonicalSessionFile: sessionFile });
+	if (state === "uncertain") {
+		store.transition(parentDigest, "pi-signal", id, digest, "uncertain");
+		return id;
+	}
+	store.transition(parentDigest, "pi-signal", id, digest, "runner-ready", { runnerProcessInstanceId: `runner-${byte}`, runnerAdmissionTokenDigest: "c".repeat(64) });
+	store.transition(parentDigest, "pi-signal", id, digest, "accepted");
+	if (state === "terminal") {
+		store.transition(parentDigest, "pi-signal", id, digest, "terminal", { terminalEvidence: { version: 1, proofDigest: "d".repeat(64), observedAt: 100, canonicalSessionId: "e".repeat(64) } });
+	} else {
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId, mode: "single", state: "running", steps: [] }));
+	}
+	return id;
+}
+
+function managedControl(method: "steer" | "interrupt" | "stop" | "retire", byte: number, target: Record<string, unknown>, extra: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		version: 1,
+		requestId: `${method}-${byte}`,
+		method,
+		managed: { version: 1, consumerId: "pi-signal", operationId: operationId(byte) },
+		input: { target: { consumerId: "pi-signal", ...target }, ...(method === "steer" ? { message: "private startup steer" } : {}), ...extra },
 	};
 }
 
@@ -317,12 +354,12 @@ function successfulResumeExecutor(calls: { value: number }, terminal = true): Ma
 }
 
 describe("managed dispatch provider", () => {
-	it("advertises only recovery-complete spawn/status/details capabilities", async () => {
+	it("advertises all managed methods only after recovery completes", async () => {
 		const { bus, provider } = await readyProvider();
 		const reply = await bus.request({ version: 1, requestId: "cap-1", method: "capabilities" }) as any;
 		assert.equal(reply.success, true);
 		assert.equal(reply.data.state, "ready");
-		assert.deepEqual(reply.data.methods, { preflight: true, spawn: true, status: true, details: true, resume: true, steer: false, interrupt: false, stop: false, retire: false });
+		assert.deepEqual(reply.data.methods, { preflight: true, spawn: true, status: true, details: true, resume: true, steer: true, interrupt: true, stop: true, retire: true });
 		assert.equal(reply.data.lifecycle.managedTerminalCorrelation, true);
 		const spawnInput = (request("ignored").input as { request: Record<string, unknown> }).request;
 		let preflightReplies = 0;
@@ -336,6 +373,145 @@ describe("managed dispatch provider", () => {
 		assert.equal(invalid.success, false);
 		assert.equal(invalid.error.code, "invalid_request");
 		provider.dispose();
+	});
+
+	it("routes steer, interrupt, and stop exactly once and exposes bounded command status", async () => {
+		const { bus, provider, spawn } = await readyProvider();
+		assert.equal((await bus.request(spawn) as any).success, true);
+		const asyncDir = path.join(temporary, "async", "live-run");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "live-run", mode: "single", state: "running", steps: [] }));
+		const methods = ["steer", "interrupt", "stop"] as const;
+		for (const [offset, method] of methods.entries()) {
+			const commandId = operationId(40 + offset);
+			const payload = {
+				version: 1,
+				requestId: `${method}-first`,
+				method,
+				managed: { version: 1, consumerId: "pi-signal", operationId: commandId },
+				input: {
+					target: { consumerId: "pi-signal", operationId: operationId() },
+					...(method === "steer" ? { message: "private provider steering text" } : {}),
+				},
+			};
+			const first = await bus.request(payload) as any;
+			assert.equal(first.success, true, method);
+			assert.equal(first.data.state, "accepted", method);
+			assert.equal(fs.existsSync(managedControlRequestPath(asyncDir, commandId)), true, method);
+			const retry = await bus.request({ ...payload, requestId: `${method}-retry` }) as any;
+			assert.equal(retry.success, true, method);
+			assert.equal(retry.data.replayed, true, method);
+			assert.equal(retry.data.state, "accepted", method);
+			consumeManagedControlRequests(asyncDir, () => ({ outcome: "acknowledged" }));
+			const status = await bus.request({ version: 1, requestId: `${method}-status`, method: "status", target: { consumerId: "pi-signal", operationId: commandId } }) as any;
+			assert.equal(status.success, true, method);
+			assert.equal(status.data.state, "terminal", method);
+			assert.equal(status.data.method, method);
+			assert.equal(status.data.targetOperationId, operationId());
+			assert.equal(status.data.actorOperationId, operationId());
+			assert.equal(status.data.actorRunId, "live-run");
+			assert.equal(status.data.runId, "live-run");
+			assert.equal(status.data.controlOutcome, "acknowledged");
+			const serialized = JSON.stringify(status.data);
+			assert.doesNotMatch(serialized, /private provider steering text|controlRequestPath|controlAckPath|runnerProcess|token|asyncDir/);
+		}
+		const conflict = await bus.request({
+			version: 1,
+			requestId: "steer-conflict",
+			method: "stop",
+			managed: { version: 1, consumerId: "pi-signal", operationId: operationId(40) },
+			input: { target: { consumerId: "pi-signal", operationId: operationId() } },
+		}) as any;
+		assert.equal(conflict.success, false);
+		assert.equal(conflict.error.code, "operation_conflict");
+		provider.unbindSession();
+		assert.equal(provider.capabilities().methods.steer, false);
+		assert.equal(provider.capabilities().methods.retire, false);
+		provider.dispose();
+		assert.equal(provider.capabilities().methods.stop, false);
+	});
+
+	it("reconciles command crash windows on startup without republishing", async () => {
+		const journalRoot = path.join(temporary, "journal-control-recovery");
+		const hostIdPath = path.join(temporary, "control-recovery-host-id");
+		fs.writeFileSync(hostIdPath, "host-1\n", { mode: 0o600 });
+		const store = new ManagedOperationJournal({ root: journalRoot });
+		const actorId = seedControlActor(store, 79, "control-recovery-actor", "accepted");
+		const control = new ManagedControlCoordinator({ journal: store, getContext: () => context(), getSessionGeneration: () => generation });
+		const actorDir = path.join(temporary, "control-async", "control-recovery-actor");
+		await control.dispatchControl(managedControl("interrupt", 81, { operationId: actorId }));
+		consumeManagedControlRequests(actorDir, () => ({ outcome: "acknowledged" }));
+		await control.dispatchControl(managedControl("stop", 82, { operationId: actorId }));
+		consumeManagedControlRequests(actorDir, () => ({ outcome: "acknowledged" }));
+		fs.rmSync(managedControlAckPath(actorDir, operationId(82)));
+		await control.dispatchControl(managedControl("steer", 80, { operationId: actorId }));
+		await control.dispatchControl(managedControl("stop", 83, { operationId: actorId }));
+		fs.rmSync(managedControlRequestPath(actorDir, operationId(83)));
+		store.close();
+
+		const bus = new Bus();
+		const ctx = context();
+		const provider = new ManagedDispatchProvider({ events: bus, executor: inertExecutor(), getContext: () => ctx, getSessionGeneration: () => generation, journalRoot, hostIdPath });
+		await provider.bindSession(ctx, generation);
+		assert.equal(provider.capabilities().methods.steer, true);
+		for (const [byte, expected] of [[80, "accepted"], [81, "terminal"], [82, "uncertain"], [83, "uncertain"]] as const) {
+			const status = await bus.request({ version: 1, requestId: `recovered-command-${byte}`, method: "status", target: { consumerId: "pi-signal", operationId: operationId(byte) } }) as any;
+			assert.equal(status.success, true, String(byte));
+			assert.equal(status.data.state, expected, String(byte));
+		}
+		assert.equal(fs.existsSync(managedControlRequestPath(actorDir, operationId(80))), true, "published commands remain in place and are never republished");
+		provider.dispose();
+	});
+
+	it("completes retirement sagas and requires explicit uncertainty acknowledgment through the provider", async () => {
+		const journalRoot = path.join(temporary, "journal-retirement-provider");
+		const hostIdPath = path.join(temporary, "retirement-provider-host-id");
+		fs.writeFileSync(hostIdPath, "host-1\n", { mode: 0o600 });
+		const store = new ManagedOperationJournal({ root: journalRoot });
+		const terminalActor = seedControlActor(store, 70, "retirement-terminal", "terminal");
+		const uncertainActor = seedControlActor(store, 71, "retirement-uncertain", "uncertain");
+		const half = managedControl("retire", 72, { operationId: terminalActor });
+		const halfDigest = computeManagedRequestDigest(half);
+		const parentDigest = computeParentSessionIdentityDigest("parent-session", path.join(temporary, "parent.jsonl"));
+		store.claim(parentDigest, half);
+		const actor = store.read(parentDigest, "pi-signal", terminalActor)!;
+		store.prepareControl(parentDigest, "pi-signal", operationId(72), halfDigest, { operationId: actor.operationId, requestDigest: actor.requestDigest, runId: actor.runId });
+		store.close();
+
+		const bus = new Bus();
+		const ctx = context();
+		const provider = new ManagedDispatchProvider({ events: bus, executor: inertExecutor(), getContext: () => ctx, getSessionGeneration: () => generation, journalRoot, hostIdPath });
+		await provider.bindSession(ctx, generation);
+		const saga = await bus.request({ version: 1, requestId: "retirement-saga-status", method: "details", target: { consumerId: "pi-signal", operationId: operationId(72) } }) as any;
+		assert.equal(saga.success, true);
+		assert.equal(saga.data.state, "terminal");
+		assert.equal(saga.data.method, "retire");
+		assert.equal(saga.data.actorOperationId, terminalActor);
+		assert.equal(saga.data.actorRunId, "retirement-terminal");
+		assert.doesNotMatch(JSON.stringify(saga.data), /actorRequestDigest|path|token|message/i);
+		const retiredActor = await bus.request({ version: 1, requestId: "retired-actor-status", method: "status", target: { consumerId: "pi-signal", operationId: terminalActor } }) as any;
+		assert.equal(retiredActor.data.state, "retired");
+		assert.equal(retiredActor.data.retiredByOperationId, operationId(72));
+
+		const refused = await bus.request(managedControl("retire", 73, { operationId: uncertainActor })) as any;
+		assert.equal(refused.success, false);
+		assert.equal(refused.error.code, "operation_uncertain");
+		const acknowledged = await bus.request(managedControl("retire", 74, { operationId: uncertainActor }, { acknowledgeUncertain: true })) as any;
+		assert.equal(acknowledged.success, true);
+		assert.equal(acknowledged.data.state, "terminal");
+		const acknowledgedStatus = await bus.request({ version: 1, requestId: "retirement-ack-status", method: "status", target: { consumerId: "pi-signal", operationId: operationId(74) } }) as any;
+		assert.equal(acknowledgedStatus.data.retirementAcknowledgedUncertain, true);
+		assert.equal(acknowledgedStatus.data.actorOperationId, uncertainActor);
+		provider.dispose();
+
+		const restartedBus = new Bus();
+		const restarted = new ManagedDispatchProvider({ events: restartedBus, executor: inertExecutor(), getContext: () => ctx, getSessionGeneration: () => generation, journalRoot, hostIdPath });
+		await restarted.bindSession(ctx, generation);
+		assert.equal(restarted.capabilities().state, "ready", "a rejected prepared retirement must not revoke the provider on restart");
+		const rejectedStatus = await restartedBus.request({ version: 1, requestId: "rejected-retirement-status", method: "status", target: { consumerId: "pi-signal", operationId: operationId(73) } }) as any;
+		assert.equal(rejectedStatus.success, true);
+		assert.equal(rejectedStatus.data.state, "prepared");
+		restarted.dispose();
 	});
 
 	it("routes exact resume preflight, mutation, terminal status, and replay once", async () => {

@@ -120,7 +120,7 @@ function expectCode(error: unknown, code: string): boolean {
 	return (error instanceof ManagedControlCoordinatorError || error instanceof ManagedOperationJournalError) && error.code === code;
 }
 
-describe("unregistered managed control coordinator", () => {
+describe("managed control coordinator", () => {
 	it("binds same-parent and consumer exact actor authority and never republishes replay", async () => {
 		const actorId = createActor(1, "actor-one");
 		let published = 0;

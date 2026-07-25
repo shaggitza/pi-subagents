@@ -21,7 +21,7 @@ import {
 	readManagedControlRequest,
 	type ManagedControlBinding,
 } from "../runs/background/control-channel.ts";
-import { ManagedOperationJournal, type ManagedOperationJournalRecordV1 } from "./operation-journal.ts";
+import { ManagedOperationJournal, ManagedOperationJournalError, type ManagedOperationJournalRecordV1 } from "./operation-journal.ts";
 
 interface ActiveParentSnapshot {
 	ctx: ExtensionContext;
@@ -68,10 +68,7 @@ function receipt(record: Readonly<ManagedOperationJournalRecordV1>, replayed: bo
 	});
 }
 
-/**
- * Unregistered managed control/retirement authority. The event provider deliberately
- * does not expose this coordinator until a separate availability review enables it.
- */
+/** Durable managed control/retirement authority for the consolidated event provider. */
 export class ManagedControlCoordinator {
 	readonly #options: ManagedControlCoordinatorOptions;
 	readonly #inFlight = new Map<string, { digest: string; promise: Promise<ManagedDispatchReceiptV1> }>();
@@ -142,6 +139,38 @@ export class ManagedControlCoordinator {
 			release();
 			if (this.#actorQueues.get(key) === queued) this.#actorQueues.delete(key);
 		}
+	}
+
+	/**
+	 * Reconcile one already parsed command without ever publishing it. This is used
+	 * during provider startup and public reads, so transport loss after publication
+	 * fails closed to sticky uncertainty while an exact consumed+ack pair terminalizes.
+	 */
+	reconcileExisting(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+		if (record.method === "spawn" || record.method === "resume") {
+			return fail("invalid_state", "Managed control reconciliation requires a command record.");
+		}
+		if (record.method === "retire") {
+			if (record.state === "prepared") {
+				try {
+					return this.#options.journal.completeRetirement(
+						record.parentSessionIdentityDigest,
+						record.consumerId,
+						record.operationId,
+						record.requestDigest,
+					).command;
+				} catch (error) {
+					// A rejected retirement can durably retain its prepared intent. It is
+					// safe to expose that state and retry reconciliation later; identity
+					// mismatch/corruption remains fatal to provider recovery.
+					if (error instanceof ManagedOperationJournalError
+						&& (error.code === "invalid_state" || error.code === "operation_uncertain" || error.code === "retired")) return record;
+					throw error;
+				}
+			}
+			return record;
+		}
+		return this.#reconcileTransport(record);
 	}
 
 	async dispatchControl(payload: unknown): Promise<ManagedDispatchReceiptV1> {

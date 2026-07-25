@@ -26,6 +26,7 @@ import { ManagedSpawnCoordinator, ManagedSpawnCoordinatorError, type ManagedSpaw
 import { ManagedResumeCoordinator, ManagedResumeCoordinatorError, type ManagedResumeExecutor } from "../managed/resume-coordinator.ts";
 import { resolveManagedResumeLaunchV1, type ManagedResumeLaunchResolverOptions } from "../managed/resume-contract.ts";
 import { ManagedResumeSourceError, resolveManagedResumeSourceV1 } from "../managed/resume-source.ts";
+import { ManagedControlCoordinator, ManagedControlCoordinatorError } from "../managed/control-coordinator.ts";
 import {
 	loadOrCreateManagedDispatchHostId,
 	performManagedSpawnPreflightV1,
@@ -129,10 +130,19 @@ function projectRecord(record: Readonly<ManagedOperationJournalRecordV1>, detail
 		operationId: assertManagedOperationId(record.operationId),
 		requestDigest: record.requestDigest,
 		state: publicState(record),
-		...(record.runId ? { runId: record.runId } : {}),
+		method: record.method,
+		...(record.runId || record.actorRunId ? { runId: record.runId ?? record.actorRunId } : {}),
 		...(record.sourceRunId ? { sourceRunId: record.sourceRunId } : {}),
+		...(record.targetOperationId ? { targetOperationId: assertManagedOperationId(record.targetOperationId) } : {}),
+		...(record.targetRunId ? { targetRunId: record.targetRunId } : {}),
+		...(record.actorOperationId ? { actorOperationId: assertManagedOperationId(record.actorOperationId) } : {}),
+		...(record.actorRunId ? { actorRunId: record.actorRunId } : {}),
+		...(record.controlOutcome ? { controlOutcome: record.controlOutcome } : {}),
+		...(record.retirementAcknowledgedUncertain ? { retirementAcknowledgedUncertain: true as const } : {}),
+		...(record.retiredByOperationId ? { retiredByOperationId: assertManagedOperationId(record.retiredByOperationId) } : {}),
 		replayed: true,
-		...(["accepted", "terminal", "uncertain", "reconciling"].includes(record.state) ? { runOutcome: "unknown" as const } : {}),
+		...((record.method === "spawn" || record.method === "resume")
+			&& ["accepted", "terminal", "uncertain", "reconciling"].includes(record.state) ? { runOutcome: "unknown" as const } : {}),
 		...(processTerminal ? { processTerminal } : {}),
 		...(canonicalId ? {
 			child: {
@@ -155,7 +165,8 @@ function projectRecord(record: Readonly<ManagedOperationJournalRecordV1>, detail
 }
 
 function errorCode(error: unknown): ManagedDispatchErrorCodeV1 {
-	if (error instanceof ManagedSpawnCoordinatorError || error instanceof ManagedResumeCoordinatorError || error instanceof ManagedResumeSourceError) return error.code;
+	if (error instanceof ManagedSpawnCoordinatorError || error instanceof ManagedResumeCoordinatorError
+		|| error instanceof ManagedResumeSourceError || error instanceof ManagedControlCoordinatorError) return error.code;
 	if (error instanceof TypeError) return "invalid_request";
 	if (error instanceof ManagedOperationJournalError) {
 		if (error.code === "busy" || error.code === "corrupt") return "operation_uncertain";
@@ -170,6 +181,7 @@ export class ManagedDispatchProvider {
 	#journal?: ManagedOperationJournal;
 	#coordinator?: ManagedSpawnCoordinator;
 	#resumeCoordinator?: ManagedResumeCoordinator;
+	#controlCoordinator?: ManagedControlCoordinator;
 	#state: ProviderState = "inactive";
 	#parentDigest?: string;
 	#sessionId?: string;
@@ -187,6 +199,7 @@ export class ManagedDispatchProvider {
 
 	capabilities(): ManagedDispatchCapabilitiesV1 {
 		const ready = this.#state === "ready";
+		const controlsReady = ready && this.#controlCoordinator !== undefined;
 		const state = ready ? "ready" : this.#state === "recovering" ? "recovering" : "unavailable";
 		return Object.freeze({
 			version: 1,
@@ -201,10 +214,10 @@ export class ManagedDispatchProvider {
 				status: ready,
 				details: ready,
 				resume: ready && this.#resumeCoordinator !== undefined,
-				steer: false,
-				interrupt: false,
-				stop: false,
-				retire: false,
+				steer: controlsReady,
+				interrupt: controlsReady,
+				stop: controlsReady,
+				retire: controlsReady,
 			}),
 			durability: "journal-v1",
 			lifecycle: Object.freeze({ version: 3, managedTerminalCorrelation: ready }),
@@ -267,6 +280,7 @@ export class ManagedDispatchProvider {
 			let cursor: { consumerId: string; operationId: string } | undefined;
 			let recovered = 0;
 			const runBindings = new Map<string, string>();
+			const commandRecords: Array<Readonly<ManagedOperationJournalRecordV1>> = [];
 			const maximum = this.#options.maxRecoveryRecords ?? 10_000;
 			do {
 				if (!this.#isCurrent(epoch)) throw new Error("stale managed recovery");
@@ -281,6 +295,10 @@ export class ManagedDispatchProvider {
 						}
 						runBindings.set(key, record.operationId);
 					}
+					if (record.method !== "spawn" && record.method !== "resume") {
+						commandRecords.push(record);
+						continue;
+					}
 					// A newly bound provider cannot inherit the former parent's live close
 					// observer. Accepted-without-proof is therefore durably uncertain;
 					// it is never inferred terminal and never relaunched.
@@ -291,6 +309,17 @@ export class ManagedDispatchProvider {
 				await Promise.resolve();
 			} while (cursor);
 			if (!this.#isCurrent(epoch)) throw new Error("stale managed recovery");
+			const controlCoordinator = new ManagedControlCoordinator({
+				journal,
+				getContext: this.#options.getContext,
+				getSessionGeneration: this.#options.getSessionGeneration,
+			});
+			for (const record of commandRecords) {
+				if (!this.#isCurrent(epoch)) throw new Error("stale managed recovery");
+				controlCoordinator.reconcileExisting(record);
+			}
+			if (!this.#isCurrent(epoch)) throw new Error("stale managed recovery");
+			this.#controlCoordinator = controlCoordinator;
 			this.#state = "ready";
 		} catch {
 			if (epoch === this.#epoch && this.#state !== "disposed") {
@@ -298,6 +327,7 @@ export class ManagedDispatchProvider {
 				this.#journal = undefined;
 				this.#coordinator = undefined;
 				this.#resumeCoordinator = undefined;
+				this.#controlCoordinator = undefined;
 				this.#state = "unavailable";
 			}
 		}
@@ -334,6 +364,7 @@ export class ManagedDispatchProvider {
 		this.#journal = undefined;
 		this.#coordinator = undefined;
 		this.#resumeCoordinator = undefined;
+		this.#controlCoordinator = undefined;
 		this.#parentDigest = undefined;
 		this.#sessionId = undefined;
 		this.#sessionFile = undefined;
@@ -355,7 +386,7 @@ export class ManagedDispatchProvider {
 
 	#handle(payload: unknown): void {
 		const method = safeMethod(payload);
-		if (!method || !["preflight", "capabilities", "spawn", "resume", "status", "details"].includes(method)) return;
+		if (!method || !["preflight", "capabilities", "spawn", "resume", "steer", "interrupt", "stop", "retire", "status", "details"].includes(method)) return;
 		const replyEvent = safeReplyEvent(payload);
 		const requestId = ownDataValue(payload, "requestId");
 		if (!replyEvent || typeof requestId !== "string" || this.#seenRequestIds.has(requestId)) return;
@@ -373,7 +404,7 @@ export class ManagedDispatchProvider {
 					this.#options.events.emit(replyEvent, data);
 					return;
 				}
-				this.#emit(replyEvent, { version: 1, requestId, method: method as "capabilities" | "spawn" | "resume" | "status" | "details", success: true, data });
+				this.#emit(replyEvent, { version: 1, requestId, method: method as "capabilities" | "spawn" | "resume" | "steer" | "interrupt" | "stop" | "retire" | "status" | "details", success: true, data });
 			})
 			.catch((error) => {
 				if (requestEpoch !== this.#epoch) return;
@@ -389,7 +420,7 @@ export class ManagedDispatchProvider {
 				this.#emit(replyEvent, {
 					version: 1,
 					requestId,
-					method: method as "capabilities" | "spawn" | "resume" | "status" | "details",
+					method: method as "capabilities" | "spawn" | "resume" | "steer" | "interrupt" | "stop" | "retire" | "status" | "details",
 					success: false,
 					error: { code: errorCode(error), message: "Managed dispatch request failed closed." },
 				});
@@ -476,17 +507,19 @@ export class ManagedDispatchProvider {
 			parseManagedReadRequestV1(payload);
 			return this.capabilities();
 		}
-		if (this.#state !== "ready" || !this.#journal || !this.#coordinator || !this.#resumeCoordinator || !this.#parentDigest) {
+		if (this.#state !== "ready" || !this.#journal || !this.#coordinator || !this.#resumeCoordinator || !this.#controlCoordinator || !this.#parentDigest) {
 			throw new ManagedSpawnCoordinatorError("unsupported_host", this.#state === "recovering" ? "Managed provider is recovering." : "Managed provider is unavailable.");
 		}
 		const epoch = this.#epoch;
-		if (method === "spawn" || method === "resume") {
+		if (["spawn", "resume", "steer", "interrupt", "stop", "retire"].includes(method)) {
 			const request = parseManagedMutationRequestV1(payload);
 			const result = method === "spawn" && request.method === "spawn"
 				? await this.#coordinator.dispatchSpawn(request)
 				: method === "resume" && request.method === "resume"
 					? await this.#resumeCoordinator.dispatchResume(request)
-					: (() => { throw new ManagedSpawnCoordinatorError("unsupported_method", "Managed provider method is unavailable."); })();
+					: request.method === method && request.method !== "spawn" && request.method !== "resume"
+						? await this.#controlCoordinator.dispatchControl(request)
+						: (() => { throw new ManagedSpawnCoordinatorError("unsupported_method", "Managed provider method is unavailable."); })();
 			if (!this.#isCurrent(epoch)) throw new ManagedSpawnCoordinatorError("no_active_session", "Managed parent session changed during dispatch.");
 			return result;
 		}
@@ -498,7 +531,9 @@ export class ManagedDispatchProvider {
 		if (!record) throw new ManagedSpawnCoordinatorError("not_found", "Managed operation was not found.");
 		const reconciled = record.method === "resume"
 			? this.#resumeCoordinator.reconcileExisting(record)
-			: this.#coordinator.reconcileExisting(record);
+			: record.method === "spawn"
+				? this.#coordinator.reconcileExisting(record)
+				: this.#controlCoordinator.reconcileExisting(record);
 		if (!this.#isCurrent(epoch)) throw new ManagedSpawnCoordinatorError("no_active_session", "Managed parent session changed during read.");
 		return projectRecord(reconciled, method === "details");
 	}
