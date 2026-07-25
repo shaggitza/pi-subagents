@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Added the host-neutral `pi-subagents/managed-dispatch` v1 contract foundation with strict canonical JSON, identifiers, semantic digests, and static single-host/fail-closed requirements vocabulary, plus a non-launching spawn-preflight listener that derives agent-content/root identity without creating child/session/run state (it may lazily persist one stable non-secret host-ID file); mutation methods, durability, and managed capability advertisement remain unavailable.
+- Added the host-neutral `pi-subagents/managed-dispatch` v1 contract foundation with strict canonical JSON, identifiers, semantic digests, and static single-host/fail-closed requirements vocabulary, plus a non-launching spawn-preflight listener that derives agent-content/root identity without creating child/session/run state (it may lazily persist one stable non-secret host-ID file); a private single-host durable operation journal is present but not yet wired to the listener, while mutation methods and managed capability advertisement remain unavailable.
 - Added a public `pi-subagents/preflight` API that resolves an ordinary single-agent launch contract without creating child sessions, temp prompt files, structured-output runtimes, or run artifacts. Thanks to @shaggitza for #634.
 - Added an out-of-band, session-scoped capability-ceiling API for monotonic child tool and extension restrictions, with inherited async/nested propagation and bounded audit metadata. Thanks to aoguai for #585.
 - Added durable v3 process-terminal proof for detached async runners, with exact close observation, conservative unknown states after observer loss, and status/RPC projections. Thanks to shaggitza for #626.
