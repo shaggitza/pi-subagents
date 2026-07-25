@@ -11,6 +11,7 @@ import {
 	SUBAGENT_MANAGED_DISPATCH_VERSION,
 	assertManagedConsumerId,
 	assertManagedOperationId,
+	assertManagedResumeExecutorRequestV1,
 	canonicalizeManagedJson,
 	computeManagedProfileContentDigest,
 	computeManagedProfileIdentityDigest,
@@ -88,7 +89,7 @@ function resumeRequest(overrides: Record<string, unknown> = {}): Record<string, 
 		{
 			sourceRunId: "source-1",
 			index: 0,
-			request: { action: "resume", id: "source-1", index: 0, message: "continue" },
+			request: { action: "resume", runId: "source-1", index: 0, message: "continue", async: true, clarify: false, context: "fresh" },
 		},
 		{ expectedLaunch: expectedLaunch(), ...overrides },
 	);
@@ -145,6 +146,23 @@ describe("managed-dispatch public protocol foundation", () => {
 			assert.throws(() => assertManagedOperationId(invalid), /canonical 43-character base64url/);
 		}
 		assert.throws(() => assertManagedOperationId(nonCanonicalTrailingBits), /canonical 43-character base64url/);
+	});
+
+	it("accepts only a closed exact managed resume executor request", () => {
+		const valid = { action: "resume", runId: "source-1", index: 0, message: "continue", async: true, clarify: false, context: "fresh" };
+		const parsed = assertManagedResumeExecutorRequestV1(valid, "source-1", 0);
+		assert.deepEqual(parsed, valid);
+		assert.equal(Object.isFrozen(parsed), true);
+		for (const invalid of [
+			{ ...valid, id: "source-1" },
+			{ ...valid, runId: "source-prefix" },
+			{ ...valid, index: 1 },
+			{ ...valid, message: "" },
+			{ ...valid, context: "fork" },
+			{ ...valid, chain: [] },
+			{ ...valid, dir: "/tmp/run" },
+		]) assert.throws(() => assertManagedResumeExecutorRequestV1(invalid, "source-1", 0));
+		assert.throws(() => assertManagedResumeExecutorRequestV1(valid, "source-1", 1));
 	});
 
 	it("bounds consumer IDs to safe namespace-only tokens", () => {
@@ -442,7 +460,7 @@ describe("managed-dispatch public protocol foundation", () => {
 	});
 
 	it("uses a contract-valid resume input and exact contracts for every mutation method", () => {
-		assert.equal(computeManagedRequestDigest(resumeRequest()), "78a614da8566809a5dc537c44602b894534761f986c8b35f041ca4e004132c6e");
+		assert.equal(computeManagedRequestDigest(resumeRequest()), "6f0ee02699fc3b136d065eb4060d0f518abc0fec9f2903a59022b24370f14cc7");
 		for (const method of ["steer", "interrupt", "stop", "retire"] as const) {
 			assert.match(computeManagedRequestDigest(controlRequest(method)), /^[a-f0-9]{64}$/);
 		}

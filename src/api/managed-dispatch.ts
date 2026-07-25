@@ -86,8 +86,19 @@ export interface ManagedSpawnInputV1 {
 export interface ManagedResumeInputV1 {
 	sourceRunId: string;
 	index: number;
-	/** Exact ordinary resume request; the future host provider validates source/index equality. */
+	/** Exact ordinary resume request; the host validates source/index equality. */
 	request: JsonObject;
+}
+
+/** Narrow host-accepted request for exact managed revival. */
+export interface ManagedResumeExecutorRequestV1 extends JsonObject {
+	action: "resume";
+	runId: string;
+	index: 0;
+	message: string;
+	async: true;
+	clarify: false;
+	context: "fresh";
 }
 
 export interface ManagedPreflightRequestV1 {
@@ -346,6 +357,35 @@ export function assertManagedOperationId(value: unknown): ManagedOperationId {
 		throw new TypeError("Managed operationId must be canonical 43-character base64url encoding of 32 bytes.");
 	}
 	return value as ManagedOperationId;
+}
+
+/** Strict closed-schema validation for the ordinary request nested in managed resume. */
+export function assertManagedResumeExecutorRequestV1(
+	value: unknown,
+	sourceRunId: string,
+	index: number,
+): Readonly<ManagedResumeExecutorRequestV1> {
+	const normalized = canonicalizeManagedJson(value).normalized;
+	if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) {
+		throw new TypeError("Managed resume executor request must be an object.");
+	}
+	const record = normalized as Record<string, JsonValue>;
+	const expected = ["action", "async", "clarify", "context", "index", "message", "runId"].sort();
+	if (Object.keys(record).sort().join("\0") !== expected.join("\0")) {
+		throw new TypeError("Managed resume executor request contains missing or unknown fields.");
+	}
+	if (record.action !== "resume" || record.async !== true || record.clarify !== false || record.context !== "fresh") {
+		throw new TypeError("Managed resume executor request fixed fields are invalid.");
+	}
+	if (typeof sourceRunId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/.test(sourceRunId)
+		|| record.runId !== sourceRunId || index !== 0 || record.index !== 0) {
+		throw new TypeError("Managed resume executor request source identity is invalid.");
+	}
+	if (typeof record.message !== "string" || !record.message.trim() || record.message.includes("\0")
+		|| hasUnpairedSurrogate(record.message) || Buffer.byteLength(record.message, "utf8") > 65_536) {
+		throw new TypeError("Managed resume executor request message is invalid.");
+	}
+	return normalized as unknown as Readonly<ManagedResumeExecutorRequestV1>;
 }
 
 function rejectProxy(value: object, location: string): void {

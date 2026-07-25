@@ -34,8 +34,17 @@ export interface ManagedOperationJournalRecordV1 {
 	expectedLaunch?: ManagedExpectedLaunchV1;
 	runId?: string;
 	sourceRunId?: string;
+	/** Host-derived immutable authority for exact managed resume. */
+	sourceOperationId?: string;
+	sourceRequestDigest?: string;
+	sourceTerminalProofDigest?: string;
+	sourceCanonicalSessionId?: string;
+	sourceRecoveryDescriptorDigest?: string;
 	runnerProcessInstanceId?: string;
 	runnerAdmissionTokenDigest?: string;
+	/** Bound only by the future combined prepared-resume admission seam. */
+	runnerSessionLeaseTokenDigest?: string;
+	runnerCanonicalSessionId?: string;
 	/** Host-authorized paths retained for exact admission/terminal recovery. */
 	terminalAsyncDir?: string;
 	canonicalSessionFile?: string;
@@ -328,8 +337,9 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	const record = value as Record<string, unknown>;
 	const allowed = new Set([
 		"version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "method", "state",
-		"expectedLaunch", "runId", "sourceRunId", "runnerProcessInstanceId", "runnerAdmissionTokenDigest",
-		"terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "createdAt", "updatedAt",
+		"expectedLaunch", "runId", "sourceRunId", "sourceOperationId", "sourceRequestDigest", "sourceTerminalProofDigest",
+		"sourceCanonicalSessionId", "sourceRecoveryDescriptorDigest", "runnerProcessInstanceId", "runnerAdmissionTokenDigest",
+		"runnerSessionLeaseTokenDigest", "runnerCanonicalSessionId", "terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "createdAt", "updatedAt",
 	]);
 	if (Object.keys(record).some((key) => !allowed.has(key))) throw new ManagedOperationJournalError("corrupt", "Managed operation record has unknown fields.");
 	if (record.version !== MANAGED_OPERATION_JOURNAL_VERSION) throw new ManagedOperationJournalError("corrupt", "Managed operation record version is unsupported.");
@@ -355,12 +365,19 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	if (record.expectedLaunch !== undefined) parsed.expectedLaunch = parseExpectedLaunch(record.expectedLaunch);
 	if (record.runId !== undefined) parsed.runId = assertRunId(record.runId, "Managed run id");
 	if (record.sourceRunId !== undefined) parsed.sourceRunId = assertRunId(record.sourceRunId, "Managed source run id");
+	if (record.sourceOperationId !== undefined) parsed.sourceOperationId = assertManagedOperationId(record.sourceOperationId);
+	if (record.sourceRequestDigest !== undefined) parsed.sourceRequestDigest = assertDigest(record.sourceRequestDigest, "Managed source request digest");
+	if (record.sourceTerminalProofDigest !== undefined) parsed.sourceTerminalProofDigest = assertDigest(record.sourceTerminalProofDigest, "Managed source terminal proof digest");
+	if (record.sourceCanonicalSessionId !== undefined) parsed.sourceCanonicalSessionId = assertDigest(record.sourceCanonicalSessionId, "Managed source canonical session id");
+	if (record.sourceRecoveryDescriptorDigest !== undefined) parsed.sourceRecoveryDescriptorDigest = assertDigest(record.sourceRecoveryDescriptorDigest, "Managed source recovery descriptor digest");
 	if (record.runnerProcessInstanceId !== undefined) {
 		parsed.runnerProcessInstanceId = assertRunId(record.runnerProcessInstanceId, "Managed runner process instance id");
 	}
 	if (record.runnerAdmissionTokenDigest !== undefined) {
 		parsed.runnerAdmissionTokenDigest = assertDigest(record.runnerAdmissionTokenDigest, "Managed runner admission token digest");
 	}
+	if (record.runnerSessionLeaseTokenDigest !== undefined) parsed.runnerSessionLeaseTokenDigest = assertDigest(record.runnerSessionLeaseTokenDigest, "Managed runner session lease token digest");
+	if (record.runnerCanonicalSessionId !== undefined) parsed.runnerCanonicalSessionId = assertDigest(record.runnerCanonicalSessionId, "Managed runner canonical session id");
 	if (record.terminalAsyncDir !== undefined) parsed.terminalAsyncDir = assertAbsolutePath(record.terminalAsyncDir, "Managed terminal async directory");
 	if (record.canonicalSessionFile !== undefined) parsed.canonicalSessionFile = assertAbsolutePath(record.canonicalSessionFile, "Managed canonical session file");
 	if (record.terminalEvidence !== undefined) parsed.terminalEvidence = parseTerminalEvidence(record.terminalEvidence);
@@ -380,6 +397,29 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 	}
 	if (parsed.method === "resume" ? !parsed.sourceRunId : parsed.sourceRunId !== undefined) {
 		throw new ManagedOperationJournalError("corrupt", "Managed source run identity is inconsistent with the operation method.");
+	}
+	const resumeSourceFields = [parsed.sourceOperationId, parsed.sourceRequestDigest, parsed.sourceTerminalProofDigest, parsed.sourceCanonicalSessionId, parsed.sourceRecoveryDescriptorDigest];
+	const hasCompleteResumeSource = resumeSourceFields.every((field) => field !== undefined);
+	const hasAnyResumeSource = resumeSourceFields.some((field) => field !== undefined);
+	const resumeSourceRequired = parsed.method === "resume" && !["claimed", "failed-before-launch"].includes(parsed.state);
+	const resumeSourceOptional = parsed.method === "resume" && parsed.state === "failed-before-launch";
+	if ((parsed.method !== "resume" && hasAnyResumeSource) || (resumeSourceRequired && !hasCompleteResumeSource)
+		|| (!resumeSourceRequired && !resumeSourceOptional && hasAnyResumeSource) || (resumeSourceOptional && hasAnyResumeSource && !hasCompleteResumeSource)) {
+		throw new ManagedOperationJournalError("corrupt", "Managed resume source correlation is inconsistent with the operation state.");
+	}
+	const hasLeaseDigest = parsed.runnerSessionLeaseTokenDigest !== undefined;
+	const hasRunnerCanonical = parsed.runnerCanonicalSessionId !== undefined;
+	if (hasLeaseDigest !== hasRunnerCanonical || (parsed.method !== "resume" && hasLeaseDigest)) {
+		throw new ManagedOperationJournalError("corrupt", "Managed resume lease correlation is incomplete.");
+	}
+	if (hasRunnerCanonical && parsed.sourceCanonicalSessionId !== parsed.runnerCanonicalSessionId) {
+		throw new ManagedOperationJournalError("corrupt", "Managed resume runner canonical session differs from its source.");
+	}
+	if (parsed.method === "resume" && ["runner-ready", "accepted", "terminal"].includes(parsed.state) && !hasLeaseDigest) {
+		throw new ManagedOperationJournalError("corrupt", "Managed resume runner lease correlation is missing.");
+	}
+	if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasLeaseDigest) {
+		throw new ManagedOperationJournalError("corrupt", "Managed resume runner lease correlation is premature.");
 	}
 	if (parsed.updatedAt < parsed.createdAt) {
 		throw new ManagedOperationJournalError("corrupt", "Managed operation chronology is invalid.");
@@ -612,8 +652,15 @@ export class ManagedOperationJournal {
 		patch: {
 			runId?: string;
 			sourceRunId?: string;
+			sourceOperationId?: string;
+			sourceRequestDigest?: string;
+			sourceTerminalProofDigest?: string;
+			sourceCanonicalSessionId?: string;
+			sourceRecoveryDescriptorDigest?: string;
 			runnerProcessInstanceId?: string;
 			runnerAdmissionTokenDigest?: string;
+			runnerSessionLeaseTokenDigest?: string;
+			runnerCanonicalSessionId?: string;
 			terminalAsyncDir?: string;
 			canonicalSessionFile?: string;
 			terminalEvidence?: ManagedOperationTerminalEvidenceV1;
@@ -638,11 +685,22 @@ export class ManagedOperationJournal {
 		if (existing.requestDigest !== requestDigest) throw new ManagedOperationJournalError("operation_conflict", "Managed request digest does not match the durable operation.");
 		const patchedRunId = patch.runId !== undefined ? assertRunId(patch.runId, "Managed run id") : undefined;
 		const patchedSourceRunId = patch.sourceRunId !== undefined ? assertRunId(patch.sourceRunId, "Managed source run id") : undefined;
+		const patchedSourceOperationId = patch.sourceOperationId !== undefined ? assertManagedOperationId(patch.sourceOperationId) : undefined;
+		const patchedSourceRequestDigest = patch.sourceRequestDigest !== undefined ? assertDigest(patch.sourceRequestDigest, "Managed source request digest") : undefined;
+		const patchedSourceTerminalProofDigest = patch.sourceTerminalProofDigest !== undefined ? assertDigest(patch.sourceTerminalProofDigest, "Managed source terminal proof digest") : undefined;
+		const patchedSourceCanonicalSessionId = patch.sourceCanonicalSessionId !== undefined ? assertDigest(patch.sourceCanonicalSessionId, "Managed source canonical session id") : undefined;
+		const patchedSourceRecoveryDescriptorDigest = patch.sourceRecoveryDescriptorDigest !== undefined ? assertDigest(patch.sourceRecoveryDescriptorDigest, "Managed source recovery descriptor digest") : undefined;
 		const patchedRunnerInstance = patch.runnerProcessInstanceId !== undefined
 			? assertRunId(patch.runnerProcessInstanceId, "Managed runner process instance id")
 			: undefined;
 		const patchedAdmissionTokenDigest = patch.runnerAdmissionTokenDigest !== undefined
 			? assertDigest(patch.runnerAdmissionTokenDigest, "Managed runner admission token digest")
+			: undefined;
+		const patchedRunnerSessionLeaseTokenDigest = patch.runnerSessionLeaseTokenDigest !== undefined
+			? assertDigest(patch.runnerSessionLeaseTokenDigest, "Managed runner session lease token digest")
+			: undefined;
+		const patchedRunnerCanonicalSessionId = patch.runnerCanonicalSessionId !== undefined
+			? assertDigest(patch.runnerCanonicalSessionId, "Managed runner canonical session id")
 			: undefined;
 		const patchedTerminalAsyncDir = patch.terminalAsyncDir !== undefined
 			? assertAbsolutePath(patch.terminalAsyncDir, "Managed terminal async directory")
@@ -656,6 +714,14 @@ export class ManagedOperationJournal {
 		if (patchedSourceRunId !== undefined && existing.method !== "resume") {
 			throw new ManagedOperationJournalError("invalid_state", "Managed source run identity is valid only for resume operations.");
 		}
+		const patchedResumeSource = [patchedSourceOperationId, patchedSourceRequestDigest, patchedSourceTerminalProofDigest, patchedSourceCanonicalSessionId, patchedSourceRecoveryDescriptorDigest];
+		if (patchedResumeSource.some((field) => field !== undefined) && (existing.method !== "resume" || !patchedResumeSource.every((field) => field !== undefined) || nextState !== "prepared")) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed resume source correlation must bind atomically at prepared.");
+		}
+		if ((patchedRunnerSessionLeaseTokenDigest === undefined) !== (patchedRunnerCanonicalSessionId === undefined)
+			|| (patchedRunnerSessionLeaseTokenDigest !== undefined && (existing.method !== "resume" || nextState !== "runner-ready"))) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed resume lease correlation must bind atomically at runner-ready.");
+		}
 		if (patchedRunId !== undefined && existing.runId !== undefined && patchedRunId !== existing.runId) {
 			throw new ManagedOperationJournalError("operation_conflict", "Managed run identity is immutable.");
 		}
@@ -664,6 +730,19 @@ export class ManagedOperationJournal {
 		}
 		if (patchedSourceRunId !== undefined && existing.sourceRunId !== undefined && patchedSourceRunId !== existing.sourceRunId) {
 			throw new ManagedOperationJournalError("operation_conflict", "Managed source run identity is immutable.");
+		}
+		for (const [existingValue, patchedValue] of [
+			[existing.sourceOperationId, patchedSourceOperationId],
+			[existing.sourceRequestDigest, patchedSourceRequestDigest],
+			[existing.sourceTerminalProofDigest, patchedSourceTerminalProofDigest],
+			[existing.sourceCanonicalSessionId, patchedSourceCanonicalSessionId],
+			[existing.sourceRecoveryDescriptorDigest, patchedSourceRecoveryDescriptorDigest],
+			[existing.runnerSessionLeaseTokenDigest, patchedRunnerSessionLeaseTokenDigest],
+			[existing.runnerCanonicalSessionId, patchedRunnerCanonicalSessionId],
+		] as const) {
+			if (existingValue !== undefined && patchedValue !== undefined && existingValue !== patchedValue) {
+				throw new ManagedOperationJournalError("operation_conflict", "Managed resume correlation is immutable.");
+			}
 		}
 		if (patchedRunnerInstance !== undefined && existing.runnerProcessInstanceId !== undefined
 			&& patchedRunnerInstance !== existing.runnerProcessInstanceId) {
@@ -707,9 +786,27 @@ export class ManagedOperationJournal {
 		const effectiveRunId = existing.runId ?? patchedRunId;
 		const effectiveRunnerInstance = existing.runnerProcessInstanceId ?? patchedRunnerInstance;
 		const effectiveAdmissionTokenDigest = existing.runnerAdmissionTokenDigest ?? patchedAdmissionTokenDigest;
+		const effectiveSourceOperationId = existing.sourceOperationId ?? patchedSourceOperationId;
+		const effectiveSourceRequestDigest = existing.sourceRequestDigest ?? patchedSourceRequestDigest;
+		const effectiveSourceTerminalProofDigest = existing.sourceTerminalProofDigest ?? patchedSourceTerminalProofDigest;
+		const effectiveSourceCanonicalSessionId = existing.sourceCanonicalSessionId ?? patchedSourceCanonicalSessionId;
+		const effectiveSourceRecoveryDescriptorDigest = existing.sourceRecoveryDescriptorDigest ?? patchedSourceRecoveryDescriptorDigest;
+		const effectiveRunnerSessionLeaseTokenDigest = existing.runnerSessionLeaseTokenDigest ?? patchedRunnerSessionLeaseTokenDigest;
+		const effectiveRunnerCanonicalSessionId = existing.runnerCanonicalSessionId ?? patchedRunnerCanonicalSessionId;
 		const effectiveTerminalAsyncDir = existing.terminalAsyncDir ?? patchedTerminalAsyncDir;
 		const effectiveCanonicalSessionFile = existing.canonicalSessionFile ?? patchedCanonicalSessionFile;
 		const effectiveTerminalEvidence = existing.terminalEvidence ?? patchedTerminalEvidence;
+		if (existing.method === "resume" && !["claimed", "failed-before-launch"].includes(nextState)
+			&& (!effectiveSourceOperationId || !effectiveSourceRequestDigest || !effectiveSourceTerminalProofDigest || !effectiveSourceCanonicalSessionId || !effectiveSourceRecoveryDescriptorDigest)) {
+			throw new ManagedOperationJournalError("invalid_state", `Managed resume state ${nextState} requires source correlation.`);
+		}
+		if (existing.method !== "resume" && (effectiveSourceOperationId || effectiveSourceRequestDigest || effectiveSourceTerminalProofDigest || effectiveSourceCanonicalSessionId || effectiveSourceRecoveryDescriptorDigest)) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed resume source correlation is forbidden for this method.");
+		}
+		if (existing.method === "resume" && ["runner-ready", "accepted", "terminal"].includes(nextState)
+			&& (!effectiveRunnerSessionLeaseTokenDigest || effectiveRunnerCanonicalSessionId !== effectiveSourceCanonicalSessionId)) {
+			throw new ManagedOperationJournalError("invalid_state", `Managed resume state ${nextState} requires runner lease correlation.`);
+		}
 		if (["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(nextState) && !effectiveRunId) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed state ${nextState} requires a durable run identity.`);
 		}
@@ -748,8 +845,15 @@ export class ManagedOperationJournal {
 			state: nextState,
 			...(patchedRunId !== undefined ? { runId: patchedRunId } : {}),
 			...(patchedSourceRunId !== undefined ? { sourceRunId: patchedSourceRunId } : {}),
+			...(patchedSourceOperationId !== undefined ? { sourceOperationId: patchedSourceOperationId } : {}),
+			...(patchedSourceRequestDigest !== undefined ? { sourceRequestDigest: patchedSourceRequestDigest } : {}),
+			...(patchedSourceTerminalProofDigest !== undefined ? { sourceTerminalProofDigest: patchedSourceTerminalProofDigest } : {}),
+			...(patchedSourceCanonicalSessionId !== undefined ? { sourceCanonicalSessionId: patchedSourceCanonicalSessionId } : {}),
+			...(patchedSourceRecoveryDescriptorDigest !== undefined ? { sourceRecoveryDescriptorDigest: patchedSourceRecoveryDescriptorDigest } : {}),
 			...(patchedRunnerInstance !== undefined ? { runnerProcessInstanceId: patchedRunnerInstance } : {}),
 			...(patchedAdmissionTokenDigest !== undefined ? { runnerAdmissionTokenDigest: patchedAdmissionTokenDigest } : {}),
+			...(patchedRunnerSessionLeaseTokenDigest !== undefined ? { runnerSessionLeaseTokenDigest: patchedRunnerSessionLeaseTokenDigest } : {}),
+			...(patchedRunnerCanonicalSessionId !== undefined ? { runnerCanonicalSessionId: patchedRunnerCanonicalSessionId } : {}),
 			...(patchedTerminalAsyncDir !== undefined ? { terminalAsyncDir: patchedTerminalAsyncDir } : {}),
 			...(patchedCanonicalSessionFile !== undefined ? { canonicalSessionFile: patchedCanonicalSessionFile } : {}),
 			...(patchedTerminalEvidence !== undefined ? { terminalEvidence: patchedTerminalEvidence } : {}),

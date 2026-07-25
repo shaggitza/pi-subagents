@@ -58,6 +58,28 @@ function spawnRequest(overrides: Record<string, unknown> = {}): Record<string, u
 	};
 }
 
+function resumeRequest(): Record<string, unknown> {
+	return {
+		version: 1,
+		requestId: "resume-transport",
+		method: "resume",
+		managed: { version: 1, consumerId: "pi-signal", operationId: operationId(22) },
+		expectedLaunch: {
+			version: 1,
+			hostId: "host-1",
+			candidateRunId: "resume-candidate",
+			profileIdentityDigest: "a".repeat(64),
+			parentSessionIdentityDigest: parentDigest,
+			contractDigest: "b".repeat(64),
+		},
+		input: {
+			sourceRunId: "source-run",
+			index: 0,
+			request: { action: "resume", runId: "source-run", index: 0, message: "continue", async: true, clarify: false, context: "fresh" },
+		},
+	};
+}
+
 function journal(root = path.join(temporary, "journal"), now = () => 100): ManagedOperationJournal {
 	return new ManagedOperationJournal({ root, now });
 }
@@ -179,6 +201,51 @@ describe("managed durable operation journal", () => {
 		assert.equal(store.read(parentDigest, "pi-signal", secondOperationId)?.runId, undefined);
 		assert.equal(store.transition(parentDigest, "pi-signal", secondOperationId, secondDigest, "failed-before-launch").state, "failed-before-launch");
 		assert.equal(store.readByRun(parentDigest, "pi-signal", "candidate-1")?.operationId, operationId());
+		store.close();
+	});
+
+	it("binds exact resume source authority at prepared and lease correlation at runner-ready", () => {
+		const root = path.join(temporary, "resume-journal");
+		let store = journal(root);
+		const request = resumeRequest();
+		const digest = computeManagedRequestDigest(request);
+		store.claim(parentDigest, request);
+		expectCode(() => store.transition(parentDigest, "pi-signal", operationId(22), digest, "prepared"), "invalid_state");
+		const prepared = store.transition(parentDigest, "pi-signal", operationId(22), digest, "prepared", {
+			sourceOperationId: operationId(21),
+			sourceRequestDigest: "1".repeat(64),
+			sourceTerminalProofDigest: "2".repeat(64),
+			sourceCanonicalSessionId: "3".repeat(64),
+			sourceRecoveryDescriptorDigest: "4".repeat(64),
+		});
+		assert.equal(prepared.sourceOperationId, operationId(21));
+		const asyncDir = path.join(temporary, "async", "resume-candidate");
+		const sessionFile = path.join(temporary, "sessions", "source", "run-0", "session.jsonl");
+		store.transition(parentDigest, "pi-signal", operationId(22), digest, "dispatching", {
+			runId: "resume-candidate",
+			terminalAsyncDir: asyncDir,
+			canonicalSessionFile: sessionFile,
+		});
+		expectCode(() => store.transition(parentDigest, "pi-signal", operationId(22), digest, "runner-ready", {
+			runnerProcessInstanceId: "runner-resume",
+			runnerAdmissionTokenDigest: "5".repeat(64),
+		}), "invalid_state");
+		const ready = store.transition(parentDigest, "pi-signal", operationId(22), digest, "runner-ready", {
+			runnerProcessInstanceId: "runner-resume",
+			runnerAdmissionTokenDigest: "5".repeat(64),
+			runnerSessionLeaseTokenDigest: "6".repeat(64),
+			runnerCanonicalSessionId: "3".repeat(64),
+		});
+		assert.equal(ready.runnerSessionLeaseTokenDigest, "6".repeat(64));
+		store.close();
+		store = journal(root);
+		const reopened = store.read(parentDigest, "pi-signal", operationId(22));
+		assert.equal(reopened?.sourceTerminalProofDigest, "2".repeat(64));
+		assert.equal(reopened?.runnerCanonicalSessionId, "3".repeat(64));
+		expectCode(() => store.transition(parentDigest, "pi-signal", operationId(22), digest, "accepted", {
+			runnerSessionLeaseTokenDigest: "7".repeat(64),
+			runnerCanonicalSessionId: "3".repeat(64),
+		}), "invalid_state");
 		store.close();
 	});
 
