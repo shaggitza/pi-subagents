@@ -118,7 +118,7 @@ function projectRecord(record: Readonly<ManagedOperationJournalRecordV1>, detail
 		...(record.runId ? { runId: record.runId } : {}),
 		...(record.sourceRunId ? { sourceRunId: record.sourceRunId } : {}),
 		replayed: true,
-		...(record.state === "accepted" ? { runOutcome: "running" as const } : record.state === "terminal" || record.state === "uncertain" || record.state === "reconciling" ? { runOutcome: "unknown" as const } : {}),
+		...(["accepted", "terminal", "uncertain", "reconciling"].includes(record.state) ? { runOutcome: "unknown" as const } : {}),
 		...(processTerminal ? { processTerminal } : {}),
 		...(canonicalId ? {
 			child: {
@@ -239,12 +239,21 @@ export class ManagedDispatchProvider {
 			await Promise.resolve();
 			let cursor: { consumerId: string; operationId: string } | undefined;
 			let recovered = 0;
+			const runBindings = new Map<string, string>();
 			const maximum = this.#options.maxRecoveryRecords ?? 10_000;
 			do {
 				if (!this.#isCurrent(epoch)) throw new Error("stale managed recovery");
 				const page = journal.list(parentDigest, { limit: 256, ...(cursor ? { after: cursor } : {}) });
 				for (const record of page.records) {
 					if (++recovered > maximum) throw new ManagedOperationJournalError("busy", "Managed recovery exceeds the bounded active-session limit.");
+					if (record.runId) {
+						const key = `${record.consumerId}\0${record.runId}`;
+						const boundOperationId = runBindings.get(key);
+						if (boundOperationId && boundOperationId !== record.operationId) {
+							throw new ManagedOperationJournalError("corrupt", "Managed run identity is bound to multiple operations.");
+						}
+						runBindings.set(key, record.operationId);
+					}
 					coordinator.reconcileExisting(record);
 				}
 				cursor = page.nextCursor;

@@ -151,6 +151,37 @@ describe("managed durable operation journal", () => {
 		store.close();
 	});
 
+	it("binds each candidate run to only one operation before dispatch side effects", () => {
+		const store = journal();
+		const first = spawnRequest();
+		const secondOperationId = operationId(12);
+		const second = spawnRequest({
+			requestId: "transport-2",
+			managed: { version: 1, consumerId: "pi-signal", operationId: secondOperationId },
+		});
+		const firstDigest = computeManagedRequestDigest(first);
+		const secondDigest = computeManagedRequestDigest(second);
+		store.claim(parentDigest, first);
+		store.claim(parentDigest, second);
+		store.transition(parentDigest, "pi-signal", operationId(), firstDigest, "prepared");
+		store.transition(parentDigest, "pi-signal", secondOperationId, secondDigest, "prepared");
+		store.transition(parentDigest, "pi-signal", operationId(), firstDigest, "dispatching", {
+			runId: "candidate-1",
+			terminalAsyncDir: path.join(temporary, "async", "candidate-1"),
+			canonicalSessionFile: path.join(temporary, "sessions", "candidate-1", "session.jsonl"),
+		});
+		expectCode(() => store.transition(parentDigest, "pi-signal", secondOperationId, secondDigest, "dispatching", {
+			runId: "candidate-1",
+			terminalAsyncDir: path.join(temporary, "async", "candidate-1"),
+			canonicalSessionFile: path.join(temporary, "sessions", "candidate-1", "session.jsonl"),
+		}), "operation_conflict");
+		assert.equal(store.read(parentDigest, "pi-signal", secondOperationId)?.state, "prepared");
+		assert.equal(store.read(parentDigest, "pi-signal", secondOperationId)?.runId, undefined);
+		assert.equal(store.transition(parentDigest, "pi-signal", secondOperationId, secondDigest, "failed-before-launch").state, "failed-before-launch");
+		assert.equal(store.readByRun(parentDigest, "pi-signal", "candidate-1")?.operationId, operationId());
+		store.close();
+	});
+
 	it("requires parent-session binding before creating a launch operation directory", () => {
 		const store = journal();
 		const missing = spawnRequest();

@@ -172,7 +172,7 @@ async function readyProvider(options: { seed?: boolean } = {}) {
 		resolveLaunch: async () => resolved("live-run", spawn),
 	});
 	await provider.bindSession(ctx, generation);
-	return { bus, provider, calls, spawn };
+	return { bus, provider, calls, spawn, journalRoot, hostIdPath, ctx };
 }
 
 describe("managed dispatch provider", () => {
@@ -205,15 +205,96 @@ describe("managed dispatch provider", () => {
 		provider.dispose();
 	});
 
-	it("routes spawn once and never advertises unsupported resume or controls", async () => {
-		const { bus, provider, calls, spawn } = await readyProvider();
+	it("routes spawn once and projects admitted runs without liveness proof as unknown", async () => {
+		const { bus, provider, calls, spawn, journalRoot, hostIdPath, ctx } = await readyProvider();
 		const reply = await bus.request(spawn) as any;
 		assert.equal(reply.success, true);
 		assert.equal(reply.data.state, "accepted");
 		assert.equal(calls.value, 1);
+		const status = await bus.request({
+			version: 1,
+			requestId: "accepted-status",
+			method: "status",
+			target: { consumerId: "pi-signal", operationId: operationId() },
+		}) as any;
+		assert.equal(status.success, true);
+		assert.equal(status.data.state, "accepted");
+		assert.equal(status.data.runOutcome, "unknown", "committed admission alone is not current liveness proof");
 		bus.emit(SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, spawn);
 		await Promise.resolve();
 		assert.equal(calls.value, 1, "same transport request must not execute twice");
+		provider.dispose();
+
+		const restartedBus = new Bus();
+		const restarted = new ManagedDispatchProvider({
+			events: restartedBus,
+			executor: { executePreparedSpawn: async () => ({ content: [] }) } as ManagedSpawnExecutor,
+			getContext: () => ctx,
+			getSessionGeneration: () => generation,
+			journalRoot,
+			hostIdPath,
+			resolveLaunch: async () => resolved("live-run", spawn),
+		});
+		await restarted.bindSession(ctx, generation);
+		const recovered = await restartedBus.request({
+			version: 1,
+			requestId: "recovered-accepted-status",
+			method: "status",
+			target: { consumerId: "pi-signal", operationId: operationId() },
+		}) as any;
+		assert.equal(recovered.success, true);
+		assert.equal(recovered.data.state, "accepted");
+		assert.equal(recovered.data.runOutcome, "unknown", "recovered admission cannot substitute for current liveness proof");
+		assert.equal(calls.value, 1, "recovery must not launch another runner");
+		restarted.dispose();
+	});
+
+	it("keeps capability unavailable when recovery finds a legacy duplicate run binding", async () => {
+		const bus = new Bus();
+		const root = path.join(temporary, "journal-duplicate-recovery");
+		const ctx = context();
+		const parentDigest = computeParentSessionIdentityDigest("parent-session", path.join(temporary, "parent.jsonl"));
+		const firstOperationId = operationId(8);
+		const secondOperationId = operationId(9);
+		const first = request("duplicate-run", firstOperationId);
+		const second = request("duplicate-run", secondOperationId);
+		const store = new ManagedOperationJournal({ root });
+		for (const [payload, id] of [[first, firstOperationId], [second, secondOperationId]] as const) {
+			const digest = computeManagedRequestDigest(payload);
+			store.claim(parentDigest, payload);
+			store.transition(parentDigest, "pi-signal", id, digest, "prepared");
+		}
+		const firstDigest = computeManagedRequestDigest(first);
+		store.transition(parentDigest, "pi-signal", firstOperationId, firstDigest, "dispatching", {
+			runId: "duplicate-run",
+			terminalAsyncDir: path.join(temporary, "duplicate-async-first"),
+			canonicalSessionFile: path.join(temporary, "duplicate-session-first.jsonl"),
+		});
+		store.transition(parentDigest, "pi-signal", firstOperationId, firstDigest, "uncertain");
+		store.close();
+
+		// Simulate a pre-fix durable record. Current writes cannot create this duplicate.
+		const secondRecordPath = path.join(root, "operations", parentDigest, "pi-signal", secondOperationId, "record.json");
+		const secondRecord = JSON.parse(fs.readFileSync(secondRecordPath, "utf8")) as Record<string, unknown>;
+		fs.writeFileSync(secondRecordPath, `${JSON.stringify({
+			...secondRecord,
+			state: "uncertain",
+			runId: "duplicate-run",
+			terminalAsyncDir: path.join(temporary, "duplicate-async-second"),
+			canonicalSessionFile: path.join(temporary, "duplicate-session-second.jsonl"),
+		})}\n`, { mode: 0o600 });
+
+		const provider = new ManagedDispatchProvider({
+			events: bus,
+			executor: { executePreparedSpawn: async () => ({ content: [] }) } as ManagedSpawnExecutor,
+			getContext: () => ctx,
+			getSessionGeneration: () => generation,
+			journalRoot: root,
+			hostIdPath: path.join(temporary, "duplicate-host-id"),
+		});
+		await provider.bindSession(ctx, generation);
+		assert.equal(provider.capabilities().state, "unavailable");
+		assert.equal(provider.capabilities().available, false);
 		provider.dispose();
 	});
 

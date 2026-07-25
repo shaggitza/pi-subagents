@@ -65,12 +65,12 @@ function executorRequest(runId: string): JsonObject {
 	};
 }
 
-function spawnRequest(runId: string, requestId = "transport-1"): Record<string, unknown> {
+function spawnRequest(runId: string, requestId = "transport-1", managedOperationId = operationId()): Record<string, unknown> {
 	return {
 		version: 1,
 		requestId,
 		method: "spawn",
-		managed: { version: 1, consumerId: "pi-signal", operationId: operationId() },
+		managed: { version: 1, consumerId: "pi-signal", operationId: managedOperationId },
 		expectedLaunch: {
 			version: 1,
 			hostId,
@@ -434,6 +434,22 @@ describe("unregistered managed spawn coordinator", () => {
 		assert.equal(firstReceipt.state, "accepted");
 		assert.equal(secondReceipt.state, "accepted");
 		assert.equal([firstReceipt.replayed, secondReceipt.replayed].filter(Boolean).length, 1);
+		store.close();
+	});
+
+	it("fails a duplicate candidate operation before binding the dispatch boundary", async () => {
+		const runId = candidate("duplicate-binding");
+		const store = new ManagedOperationJournal({ root: path.join(temporary, "journal-duplicate-binding") });
+		const calls = { value: 0 };
+		const coordinator = makeCoordinator(store, successfulExecutor(runId, calls), async () => resolved(runId));
+		const first = await coordinator.dispatchSpawn(spawnRequest(runId, "duplicate-first", operationId()));
+		assert.equal(first.state, "accepted");
+		const secondOperationId = operationId(12);
+		const second = await coordinator.dispatchSpawn(spawnRequest(runId, "duplicate-second", secondOperationId));
+		assert.equal(second.state, "failed-before-launch");
+		assert.equal(store.read(parentDigest, "pi-signal", secondOperationId)?.runId, undefined);
+		assert.equal(store.readByRun(parentDigest, "pi-signal", runId)?.operationId, operationId());
+		assert.equal(calls.value, 2, "the loser may enter authorization but must not create a second runner");
 		store.close();
 	});
 

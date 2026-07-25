@@ -737,6 +737,12 @@ export class ManagedOperationJournal {
 		if (!TRANSITIONS[existing.state].has(nextState)) {
 			throw new ManagedOperationJournalError("invalid_state", `Managed operation cannot transition from ${existing.state} to ${nextState}.`);
 		}
+		if (existing.runId === undefined && effectiveRunId !== undefined) {
+			const bound = this.readByRun(sessionDigest, consumerId, effectiveRunId);
+			if (bound && bound.operationId !== operationId) {
+				throw new ManagedOperationJournalError("operation_conflict", "Managed run identity is already bound to another operation.");
+			}
+		}
 		const record: ManagedOperationJournalRecordV1 = {
 			...existing,
 			state: nextState,
