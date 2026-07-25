@@ -91,6 +91,9 @@ describe("subagent extension RPC bridge", () => {
 			(reply as { data: { capabilities?: { nonRecoveringSteer?: boolean } } }).data.capabilities?.nonRecoveringSteer,
 			true,
 		);
+		const capabilities = (reply as { data: { capabilities?: Record<string, unknown> } }).data.capabilities;
+		assert.equal(capabilities?.managedDispatch, undefined, "Phase 1 must not advertise managed availability or durability");
+		assert.equal(capabilities?.durable, undefined);
 
 		bridge.dispose();
 	});

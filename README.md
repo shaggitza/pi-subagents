@@ -8,6 +8,8 @@
 
 `pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
+The additive `pi-subagents/managed-dispatch` subpath currently exports the inert managed-dispatch v1 contract foundation only. It registers no listener or provider and does not advertise runtime availability or durability; its exported requirements are static protocol semantics, not capabilities. Its reserved transport constants are `subagents:managed-dispatch:v1:request` and `subagents:managed-dispatch:v1:reply:`; ordinary RPC remains unchanged. A managed `consumerId` is only a namespace component, not authentication. Any future process-local event-bus provider assumes trusted installed extensions: the bus provides no confidentiality, authentication, or isolation between extensions.
+
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 
 ## Installation

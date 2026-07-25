@@ -59,6 +59,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
 		"./delegation": "./src/api/delegation.ts",
 		"./preflight": "./src/api/preflight.ts",
+		"./managed-dispatch": "./src/api/managed-dispatch.ts",
 	});
 	const backgroundWork = await import("pi-subagents/background-work");
 	assert.equal(backgroundWork.BACKGROUND_WORK_PROTOCOL_VERSION, 1);
@@ -73,6 +74,9 @@ test("published extension APIs use supported package entrypoints", async () => {
 	const preflight = await import("pi-subagents/preflight");
 	assert.equal(preflight.SUBAGENT_LAUNCH_CONTRACT_VERSION, 1);
 	assert.equal(typeof preflight.resolveSubagentLaunchContract, "function");
+	const managedDispatch = await import("pi-subagents/managed-dispatch");
+	assert.equal(managedDispatch.SUBAGENT_MANAGED_DISPATCH_VERSION, 1);
+	assert.equal(typeof managedDispatch.createManagedOperationId, "function");
 });
 
 test("public fork metadata and legacy installer remain fork-owned", () => {

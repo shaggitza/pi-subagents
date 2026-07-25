@@ -59,6 +59,17 @@ function resolveRelativeImport(fromFile: string, specifier: string): string | un
 	return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
 }
 
+test("managed-dispatch public runtime is host-peer and UI independent", async () => {
+	const entryPoint = path.join(projectRoot, "src", "api", "managed-dispatch.ts");
+	const source = fs.readFileSync(entryPoint, "utf-8");
+	const specifiers = extractStaticImportSpecifiers(source);
+	assert.deepEqual(specifiers.sort(), ["node:crypto", "node:util"]);
+	assert.equal(specifiers.some((specifier) => matchingHostPeerPackage(specifier) !== undefined), false);
+
+	const api = await import("pi-subagents/managed-dispatch");
+	assert.equal(api.SUBAGENT_MANAGED_DISPATCH_VERSION, 1);
+});
+
 test("detached async runner's runtime import graph never reaches a host peer package (issues #334, #526)", () => {
 	const entryPoint = path.join(projectRoot, "src", "runs", "background", "subagent-runner.ts");
 	const visited = new Set<string>([entryPoint]);
