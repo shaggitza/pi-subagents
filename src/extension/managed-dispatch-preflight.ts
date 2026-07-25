@@ -15,6 +15,7 @@ import {
 	parseManagedPreflightRequestV1,
 	type JsonObject,
 	type ManagedDispatchErrorCodeV1,
+	type ManagedPreflightReplyV1,
 	type ManagedPreflightResultV1,
 	type ManagedProfileIdentityV1,
 } from "../api/managed-dispatch.ts";
@@ -345,16 +346,29 @@ export async function performManagedSpawnPreflightV1(
 /** Registers non-launching managed preflight. Mutation methods remain unhandled. */
 export function registerManagedDispatchPreflightBridge(options: ManagedDispatchPreflightBridgeOptions): () => void {
 	let disposed = false;
-	const emitIfCurrent = (replyEvent: string, result: ManagedPreflightResultV1): void => {
-		if (!disposed) options.events.emit(replyEvent, result);
+	const emitIfCurrent = (replyEvent: string, reply: ManagedPreflightReplyV1): void => {
+		if (!disposed) options.events.emit(replyEvent, reply);
 	};
 	const handler = (payload: unknown): void => {
 		if (disposed || ownDataValue(payload, "method") !== "preflight") return;
 		const replyEvent = safeReplyEvent(payload);
-		if (!replyEvent) return;
+		const requestId = ownDataValue(payload, "requestId");
+		if (!replyEvent || typeof requestId !== "string") return;
 		void performManagedSpawnPreflightV1(payload, options)
-			.then((result) => emitIfCurrent(replyEvent, result))
-			.catch(() => emitIfCurrent(replyEvent, failure("execution_failed", "Managed preflight failed closed.")));
+			.then((data) => emitIfCurrent(replyEvent, {
+				version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+				requestId,
+				method: "preflight",
+				success: true,
+				data,
+			}))
+			.catch(() => emitIfCurrent(replyEvent, {
+				version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+				requestId,
+				method: "preflight",
+				success: false,
+				error: { code: "execution_failed", message: "Managed preflight failed closed." },
+			}));
 	};
 	const unsubscribe = options.events.on(SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, handler);
 	return () => {

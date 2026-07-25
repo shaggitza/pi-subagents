@@ -54,6 +54,15 @@ class Bus {
 	}
 }
 
+function preflightData(reply: any, requestId: string): any {
+	assert.deepEqual(Object.keys(reply).sort(), ["data", "method", "requestId", "success", "version"]);
+	assert.equal(reply.version, 1);
+	assert.equal(reply.requestId, requestId);
+	assert.equal(reply.method, "preflight");
+	assert.equal(reply.success, true);
+	return reply.data;
+}
+
 function context(): ExtensionContext {
 	return {
 		cwd: temporary,
@@ -364,7 +373,10 @@ describe("managed dispatch provider", () => {
 		const spawnInput = (request("ignored").input as { request: Record<string, unknown> }).request;
 		let preflightReplies = 0;
 		const off = bus.on(managedDispatchReplyEvent("provider-spawn-preflight"), () => { preflightReplies++; });
-		const preflight = await bus.request({ version: 1, requestId: "provider-spawn-preflight", method: "preflight", consumerId: "pi-signal", input: { kind: "spawn", request: { ...spawnInput, sessionDir: path.join(temporary, "session-provider-spawn-preflight-candidate") } } }) as any;
+		const preflight = preflightData(
+			await bus.request({ version: 1, requestId: "provider-spawn-preflight", method: "preflight", consumerId: "pi-signal", input: { kind: "spawn", request: { ...spawnInput, sessionDir: path.join(temporary, "session-provider-spawn-preflight-candidate") } } }),
+			"provider-spawn-preflight",
+		);
 		off();
 		assert.equal(preflight.ok, true);
 		assert.equal(preflight.candidateRunId, "provider-spawn-preflight-candidate");
@@ -382,6 +394,27 @@ describe("managed dispatch provider", () => {
 		const invalid = await bus.request({ version: 1, requestId: "cap-invalid", method: "capabilities", extra: true }) as any;
 		assert.equal(invalid.success, false);
 		assert.equal(invalid.error.code, "invalid_request");
+		provider.dispose();
+	});
+
+	it("emits a correlated preflight envelope while failing closed without an active session", async () => {
+		const bus = new Bus();
+		const provider = new ManagedDispatchProvider({
+			events: bus,
+			executor: inertExecutor(),
+			getContext: () => null,
+			getSessionGeneration: () => generation,
+		});
+		const payload = request("inactive-candidate");
+		const data = preflightData(await bus.request({
+			version: 1,
+			requestId: "inactive-preflight",
+			method: "preflight",
+			consumerId: "pi-signal",
+			input: { kind: "spawn", request: (payload.input as { request: Record<string, unknown> }).request },
+		}), "inactive-preflight");
+		assert.equal(data.ok, false);
+		assert.equal(data.code, "no_active_session");
 		provider.dispose();
 	});
 
@@ -548,7 +581,10 @@ describe("managed dispatch provider", () => {
 		await provider.bindSession(ctx, generation);
 		assert.equal(provider.capabilities().methods.resume, true);
 		const executorRequest = { action: "resume", runId: source.runId, index: 0, message: "continue", async: true, clarify: false, context: "fresh" };
-		const preflight = await bus.request({ version: 1, requestId: "resume-preflight", method: "preflight", consumerId: "pi-signal", input: { kind: "resume", sourceRunId: source.runId, index: 0, request: executorRequest } }) as any;
+		const preflight = preflightData(
+			await bus.request({ version: 1, requestId: "resume-preflight", method: "preflight", consumerId: "pi-signal", input: { kind: "resume", sourceRunId: source.runId, index: 0, request: executorRequest } }),
+			"resume-preflight",
+		);
 		assert.equal(preflight.ok, true);
 		assert.equal(preflight.candidateRunId, candidateRunId);
 		assert.equal(preflight.parentSessionIdentityDigest, computeParentSessionIdentityDigest("parent-session", path.join(temporary, "parent.jsonl")));
@@ -621,7 +657,10 @@ describe("managed dispatch provider", () => {
 		const provider = new ManagedDispatchProvider({ events: bus, executor: successfulResumeExecutor(calls, false), getContext: () => ctx, getSessionGeneration: () => generation, journalRoot, hostIdPath, createRunId: () => candidateRunId, resolveResumeLaunch: async (_request, runId, resolvedSource) => resolvedResume(runId, resolvedSource) });
 		await provider.bindSession(ctx, generation);
 		const executorRequest = { action: "resume", runId: source.runId, index: 0, message: "continue", async: true, clarify: false, context: "fresh" };
-		const preflight = await bus.request({ version: 1, requestId: "observer-preflight", method: "preflight", consumerId: "pi-signal", input: { kind: "resume", sourceRunId: source.runId, index: 0, request: executorRequest } }) as any;
+		const preflight = preflightData(
+			await bus.request({ version: 1, requestId: "observer-preflight", method: "preflight", consumerId: "pi-signal", input: { kind: "resume", sourceRunId: source.runId, index: 0, request: executorRequest } }),
+			"observer-preflight",
+		);
 		assert.equal(preflight.ok, true);
 		const mutation = { version: 1, requestId: "observer-resume", method: "resume", managed: { version: 1, consumerId: "pi-signal", operationId: resumeOperationId }, expectedLaunch: { version: 1, hostId: preflight.host.hostId, candidateRunId, profileIdentityDigest: preflight.profileIdentityDigest, parentSessionIdentityDigest: preflight.parentSessionIdentityDigest, contractDigest: preflight.contractDigest }, input: { sourceRunId: source.runId, index: 0, request: executorRequest } };
 		const accepted = await bus.request(mutation) as any;

@@ -22,6 +22,7 @@ import {
 	parseManagedPreflightRequestV1,
 	parseManagedReadRequestV1,
 	projectManagedChildCapabilityV1,
+	type ManagedPreflightReplyV1,
 	type ManagedPreflightRequestV1,
 	type ManagedPreflightResultV1,
 } from "../../src/api/managed-dispatch.ts";
@@ -408,6 +409,22 @@ describe("managed-dispatch public protocol foundation", () => {
 		assert.equal(Object.isFrozen(parsed), true);
 		assert.equal(Object.isFrozen(parsed.input.request), true);
 		assert.equal(result.ok && result.profileIdentityDigest, "a".repeat(64));
+		const successReply: ManagedPreflightReplyV1 = {
+			version: 1,
+			requestId: preflight.requestId,
+			method: "preflight",
+			success: true,
+			data: result,
+		};
+		const failureReply: ManagedPreflightReplyV1 = {
+			version: 1,
+			requestId: preflight.requestId,
+			method: "preflight",
+			success: false,
+			error: { code: "execution_failed", message: "Managed preflight failed closed." },
+		};
+		assert.deepEqual(Object.keys(successReply), ["version", "requestId", "method", "success", "data"]);
+		assert.deepEqual(Object.keys(failureReply), ["version", "requestId", "method", "success", "error"]);
 		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, method: "spawn" }));
 		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, extra: true }));
 		assert.throws(() => parseManagedPreflightRequestV1({ ...preflight, input: { kind: "spawn", request: {}, extra: true } }));

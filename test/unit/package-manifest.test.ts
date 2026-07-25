@@ -59,8 +59,13 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
 		"./delegation": "./src/api/delegation.ts",
 		"./preflight": "./src/api/preflight.ts",
-		"./managed-dispatch": "./src/api/managed-dispatch.ts",
+		"./managed-dispatch": {
+			types: "./src/api/managed-dispatch.ts",
+			import: "./src/api/managed-dispatch.js",
+			default: "./src/api/managed-dispatch.js",
+		},
 	});
+	assert.equal(packageJson.files?.includes("src/api/managed-dispatch.js"), true);
 	const backgroundWork = await import("pi-subagents/background-work");
 	assert.equal(backgroundWork.BACKGROUND_WORK_PROTOCOL_VERSION, 1);
 	assert.equal(backgroundWork.BACKGROUND_WORK_REGISTRY_KEY, "pi-subagents.background-work.v1");

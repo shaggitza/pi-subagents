@@ -8,6 +8,7 @@ import {
 	SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT,
 	managedDispatchReplyEvent,
 	type JsonObject,
+	type ManagedPreflightReplyV1,
 	type ManagedPreflightResultV1,
 } from "../../src/api/managed-dispatch.ts";
 import type { SubagentLaunchContract, SubagentLaunchContractInput } from "../../src/api/preflight.ts";
@@ -169,7 +170,14 @@ function nextReply(events: TestEvents, requestId: string): Promise<ManagedPrefli
 	return new Promise((resolve) => {
 		const dispose = events.on(managedDispatchReplyEvent(requestId), (payload) => {
 			dispose();
-			resolve(payload as ManagedPreflightResultV1);
+			const reply = payload as ManagedPreflightReplyV1;
+			assert.deepEqual(Object.keys(reply).sort(), ["data", "method", "requestId", "success", "version"]);
+			assert.equal(reply.version, 1);
+			assert.equal(reply.requestId, requestId);
+			assert.equal(reply.method, "preflight");
+			assert.equal(reply.success, true);
+			if (!reply.success) return assert.fail("preflight result must use the success data envelope");
+			resolve(reply.data);
 		});
 	});
 }

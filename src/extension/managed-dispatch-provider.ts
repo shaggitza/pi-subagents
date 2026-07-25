@@ -401,29 +401,25 @@ export class ManagedDispatchProvider {
 		void dispatched
 			.then((data) => {
 				if (requestEpoch !== this.#epoch) return;
-				if (method === "preflight") {
-					this.#options.events.emit(replyEvent, data);
-					return;
-				}
-				this.#emit(replyEvent, { version: 1, requestId, method: method as "capabilities" | "spawn" | "resume" | "steer" | "interrupt" | "stop" | "retire" | "status" | "details", success: true, data });
+				this.#emit(replyEvent, {
+					version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+					requestId,
+					method: method as "preflight" | "capabilities" | "spawn" | "resume" | "steer" | "interrupt" | "stop" | "retire" | "status" | "details",
+					success: true,
+					data,
+				});
 			})
 			.catch((error) => {
 				if (requestEpoch !== this.#epoch) return;
-				if (method === "preflight") {
-					this.#options.events.emit(replyEvent, {
-						version: SUBAGENT_MANAGED_DISPATCH_VERSION,
-						ok: false,
-						code: errorCode(error),
-						message: "Managed preflight failed closed.",
-					} satisfies ManagedPreflightResultV1);
-					return;
-				}
 				this.#emit(replyEvent, {
-					version: 1,
+					version: SUBAGENT_MANAGED_DISPATCH_VERSION,
 					requestId,
-					method: method as "capabilities" | "spawn" | "resume" | "steer" | "interrupt" | "stop" | "retire" | "status" | "details",
+					method: method as "preflight" | "capabilities" | "spawn" | "resume" | "steer" | "interrupt" | "stop" | "retire" | "status" | "details",
 					success: false,
-					error: { code: errorCode(error), message: "Managed dispatch request failed closed." },
+					error: {
+						code: errorCode(error),
+						message: method === "preflight" ? "Managed preflight failed closed." : "Managed dispatch request failed closed.",
+					},
 				});
 			});
 	}

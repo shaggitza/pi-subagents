@@ -320,19 +320,24 @@ export type ManagedDispatchErrorCodeV1 =
 	| "unsupported_host"
 	| "execution_failed";
 
-export type ManagedDispatchReplyV1<T = unknown> = {
+export type ManagedDispatchReplyV1<
+	T = unknown,
+	TMethod extends ManagedDispatchMethodV1 = ManagedDispatchMethodV1,
+> = {
 	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
 	requestId: string;
-	method: ManagedDispatchMethodV1;
+	method: TMethod;
 	success: true;
 	data: T;
 } | {
 	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
 	requestId: string;
-	method?: ManagedDispatchMethodV1;
+	method: TMethod;
 	success: false;
 	error: { code: ManagedDispatchErrorCodeV1; message: string };
 };
+
+export type ManagedPreflightReplyV1 = ManagedDispatchReplyV1<ManagedPreflightResultV1, "preflight">;
 
 export interface ManagedDispatchRequirementsV1 {
 	version: typeof SUBAGENT_MANAGED_DISPATCH_VERSION;
