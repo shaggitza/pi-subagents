@@ -75,6 +75,16 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(typeof preflight.resolveSubagentLaunchContract, "function");
 });
 
+test("public fork metadata and legacy installer remain fork-owned", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
+	const installer = fs.readFileSync(path.join(projectRoot, "install.mjs"), "utf-8");
+
+	assert.equal(packageJson.repository?.url, "git+https://github.com/shaggitza/pi-subagents.git");
+	assert.equal(packageJson.homepage, "https://github.com/shaggitza/pi-subagents#readme");
+	assert.equal(packageJson.bugs?.url, "https://github.com/shaggitza/pi-subagents/issues");
+	assert.match(installer, /const REPO_URL = "https:\/\/github\.com\/shaggitza\/pi-subagents\.git";/);
+});
+
 test("direct @earendil-works runtime imports are declared for CI installs", () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 	const declared = new Set([

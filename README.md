@@ -1,8 +1,10 @@
 <p>
-  <img src="https://raw.githubusercontent.com/nicobailon/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
+  <img src="https://raw.githubusercontent.com/shaggitza/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
 </p>
 
 # pi-subagents
+
+> This public compatibility fork tracks `nicobailon/pi-subagents` and keeps its ordinary tools, exports, and workflows intact. Fork-specific managed-dispatch work is additive, capability-negotiated, and developed on separate branches before release.
 
 `pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
