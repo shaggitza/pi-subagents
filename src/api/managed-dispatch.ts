@@ -255,7 +255,7 @@ export interface ManagedDispatchCapabilitiesV1 {
 		spawn: boolean;
 		status: boolean;
 		details: boolean;
-		resume: false;
+		resume: boolean;
 		steer: false;
 		interrupt: false;
 		stop: false;

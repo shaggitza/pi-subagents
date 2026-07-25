@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -8,6 +9,7 @@ import {
 	assertManagedOperationId,
 	managedDispatchReplyEvent,
 	parseManagedMutationRequestV1,
+	parseManagedPreflightRequestV1,
 	parseManagedReadRequestV1,
 	type JsonObject,
 	type ManagedDispatchCapabilitiesV1,
@@ -16,11 +18,20 @@ import {
 	type ManagedOperationDetailsV1,
 	type ManagedOperationStatusV1,
 	type ManagedOperationTargetV1,
+	type ManagedPreflightResultV1,
 } from "../api/managed-dispatch.ts";
 import { computeParentSessionIdentityDigest } from "../api/preflight.ts";
 import { ManagedOperationJournal, ManagedOperationJournalError, type ManagedOperationJournalRecordV1 } from "../managed/operation-journal.ts";
 import { ManagedSpawnCoordinator, ManagedSpawnCoordinatorError, type ManagedSpawnExecutor } from "../managed/spawn-coordinator.ts";
-import { loadOrCreateManagedDispatchHostId, resolveManagedSpawnLaunchV1, type ManagedSpawnLaunchResolverOptions } from "./managed-dispatch-preflight.ts";
+import { ManagedResumeCoordinator, ManagedResumeCoordinatorError, type ManagedResumeExecutor } from "../managed/resume-coordinator.ts";
+import { resolveManagedResumeLaunchV1, type ManagedResumeLaunchResolverOptions } from "../managed/resume-contract.ts";
+import { ManagedResumeSourceError, resolveManagedResumeSourceV1 } from "../managed/resume-source.ts";
+import {
+	loadOrCreateManagedDispatchHostId,
+	performManagedSpawnPreflightV1,
+	resolveManagedSpawnLaunchV1,
+	type ManagedSpawnLaunchResolverOptions,
+} from "./managed-dispatch-preflight.ts";
 import { readProcessTerminal } from "../runs/background/process-terminal.ts";
 import { canonicalSessionId } from "../runs/shared/session-lease.ts";
 
@@ -29,15 +40,17 @@ interface EventBus {
 	emit(event: string, data: unknown): void;
 }
 
-export interface ManagedDispatchProviderOptions extends ManagedSpawnLaunchResolverOptions {
+export interface ManagedDispatchProviderOptions extends ManagedSpawnLaunchResolverOptions, ManagedResumeLaunchResolverOptions {
 	events: EventBus;
-	executor: ManagedSpawnExecutor;
+	executor: ManagedSpawnExecutor & ManagedResumeExecutor;
 	getContext: () => ExtensionContext | null;
 	getSessionGeneration: () => number;
 	journalRoot?: string;
 	hostIdPath?: string;
 	maxRecoveryRecords?: number;
 	resolveLaunch?: typeof resolveManagedSpawnLaunchV1;
+	resolveResumeLaunch?: typeof resolveManagedResumeLaunchV1;
+	createRunId?: () => string;
 }
 
 type ProviderState = "inactive" | "recovering" | "ready" | "unavailable" | "disposed";
@@ -142,7 +155,7 @@ function projectRecord(record: Readonly<ManagedOperationJournalRecordV1>, detail
 }
 
 function errorCode(error: unknown): ManagedDispatchErrorCodeV1 {
-	if (error instanceof ManagedSpawnCoordinatorError) return error.code;
+	if (error instanceof ManagedSpawnCoordinatorError || error instanceof ManagedResumeCoordinatorError || error instanceof ManagedResumeSourceError) return error.code;
 	if (error instanceof TypeError) return "invalid_request";
 	if (error instanceof ManagedOperationJournalError) {
 		if (error.code === "busy" || error.code === "corrupt") return "operation_uncertain";
@@ -156,6 +169,7 @@ export class ManagedDispatchProvider {
 	readonly #unsubscribe?: () => void;
 	#journal?: ManagedOperationJournal;
 	#coordinator?: ManagedSpawnCoordinator;
+	#resumeCoordinator?: ManagedResumeCoordinator;
 	#state: ProviderState = "inactive";
 	#parentDigest?: string;
 	#sessionId?: string;
@@ -186,7 +200,7 @@ export class ManagedDispatchProvider {
 				spawn: ready,
 				status: ready,
 				details: ready,
-				resume: false,
+				resume: ready && this.#resumeCoordinator !== undefined,
 				steer: false,
 				interrupt: false,
 				stop: false,
@@ -234,8 +248,20 @@ export class ManagedDispatchProvider {
 				resolveCapabilityCeiling: this.#options.resolveCapabilityCeiling,
 				resolveLaunch: this.#options.resolveLaunch,
 			});
+			const resumeCoordinator = new ManagedResumeCoordinator({
+				journal,
+				executor: this.#options.executor,
+				getContext: this.#options.getContext,
+				getSessionGeneration: this.#options.getSessionGeneration,
+				hostIdPath: this.#options.hostIdPath,
+				artifactDir: this.#options.artifactDir,
+				resolveContract: this.#options.resolveContract,
+				resolveCapabilityCeiling: this.#options.resolveCapabilityCeiling,
+				resolveLaunch: this.#options.resolveResumeLaunch,
+			});
 			this.#journal = journal;
 			this.#coordinator = coordinator;
+			this.#resumeCoordinator = resumeCoordinator;
 			this.#hostId = loadOrCreateManagedDispatchHostId(this.#options.hostIdPath);
 			await Promise.resolve();
 			let cursor: { consumerId: string; operationId: string } | undefined;
@@ -258,7 +284,8 @@ export class ManagedDispatchProvider {
 					// A newly bound provider cannot inherit the former parent's live close
 					// observer. Accepted-without-proof is therefore durably uncertain;
 					// it is never inferred terminal and never relaunched.
-					coordinator.reconcileExisting(record, { observerLost: true });
+					if (record.method === "resume") resumeCoordinator.reconcileExisting(record, { observerLost: true });
+					else coordinator.reconcileExisting(record, { observerLost: true });
 				}
 				cursor = page.nextCursor;
 				await Promise.resolve();
@@ -270,6 +297,7 @@ export class ManagedDispatchProvider {
 				this.#journal?.close();
 				this.#journal = undefined;
 				this.#coordinator = undefined;
+				this.#resumeCoordinator = undefined;
 				this.#state = "unavailable";
 			}
 		}
@@ -305,6 +333,7 @@ export class ManagedDispatchProvider {
 		this.#journal?.close();
 		this.#journal = undefined;
 		this.#coordinator = undefined;
+		this.#resumeCoordinator = undefined;
 		this.#parentDigest = undefined;
 		this.#sessionId = undefined;
 		this.#sessionFile = undefined;
@@ -326,7 +355,7 @@ export class ManagedDispatchProvider {
 
 	#handle(payload: unknown): void {
 		const method = safeMethod(payload);
-		if (!method || !["capabilities", "spawn", "status", "details"].includes(method)) return;
+		if (!method || !["preflight", "capabilities", "spawn", "resume", "status", "details"].includes(method)) return;
 		const replyEvent = safeReplyEvent(payload);
 		const requestId = ownDataValue(payload, "requestId");
 		if (!replyEvent || typeof requestId !== "string" || this.#seenRequestIds.has(requestId)) return;
@@ -336,21 +365,110 @@ export class ManagedDispatchProvider {
 			if (oldest !== undefined) this.#seenRequestIds.delete(oldest);
 		}
 		const requestEpoch = this.#epoch;
-		void this.#dispatch(payload, method)
+		const dispatched = method === "preflight" ? this.#preflight(payload, requestEpoch) : this.#dispatch(payload, method);
+		void dispatched
 			.then((data) => {
 				if (requestEpoch !== this.#epoch) return;
-				this.#emit(replyEvent, { version: 1, requestId, method: method as "capabilities" | "spawn" | "status" | "details", success: true, data });
+				if (method === "preflight") {
+					this.#options.events.emit(replyEvent, data);
+					return;
+				}
+				this.#emit(replyEvent, { version: 1, requestId, method: method as "capabilities" | "spawn" | "resume" | "status" | "details", success: true, data });
 			})
 			.catch((error) => {
 				if (requestEpoch !== this.#epoch) return;
+				if (method === "preflight") {
+					this.#options.events.emit(replyEvent, {
+						version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+						ok: false,
+						code: errorCode(error),
+						message: "Managed preflight failed closed.",
+					} satisfies ManagedPreflightResultV1);
+					return;
+				}
 				this.#emit(replyEvent, {
 					version: 1,
 					requestId,
-					method: method as "capabilities" | "spawn" | "status" | "details",
+					method: method as "capabilities" | "spawn" | "resume" | "status" | "details",
 					success: false,
 					error: { code: errorCode(error), message: "Managed dispatch request failed closed." },
 				});
 			});
+	}
+
+	async #preflight(payload: unknown, epoch: number): Promise<ManagedPreflightResultV1> {
+		let request;
+		try {
+			request = parseManagedPreflightRequestV1(payload);
+		} catch {
+			return { version: 1, ok: false, code: "invalid_request", message: "Managed preflight request is invalid." };
+		}
+		if (request.input.kind === "spawn") {
+			return performManagedSpawnPreflightV1(payload, {
+				events: this.#options.events,
+				getContext: this.#options.getContext,
+				getSessionGeneration: this.#options.getSessionGeneration,
+				artifactDir: this.#options.artifactDir,
+				hostIdPath: this.#options.hostIdPath,
+				createRunId: this.#options.createRunId,
+				resolveContract: this.#options.resolveContract,
+				resolveCapabilityCeiling: this.#options.resolveCapabilityCeiling,
+			});
+		}
+		if (this.#state !== "ready" || !this.#journal || !this.#resumeCoordinator || !this.#parentDigest) {
+			return { version: 1, ok: false, code: "unsupported_host", message: "Managed resume preflight is unavailable." };
+		}
+		let ctx: ExtensionContext | null;
+		let parentSessionId: string | null | undefined;
+		let parentSessionFile: string | null | undefined;
+		try {
+			ctx = this.#options.getContext();
+			parentSessionId = ctx?.sessionManager.getSessionId();
+			parentSessionFile = ctx?.sessionManager.getSessionFile();
+		} catch {
+			return { version: 1, ok: false, code: "no_active_session", message: "Managed resume preflight requires an active persisted parent session." };
+		}
+		if (!ctx || !parentSessionId || !parentSessionFile || !this.#isCurrent(epoch)) {
+			return { version: 1, ok: false, code: "no_active_session", message: "Managed resume preflight requires an active persisted parent session." };
+		}
+		try {
+			const source = resolveManagedResumeSourceV1({
+				journal: this.#journal,
+				parentSessionIdentityDigest: this.#parentDigest,
+				consumerId: request.consumerId,
+				sourceRunId: request.input.sourceRunId,
+				index: request.input.index,
+			});
+			const candidateRunId = (this.#options.createRunId ?? randomUUID)();
+			const resolved = await (this.#options.resolveResumeLaunch ?? resolveManagedResumeLaunchV1)(
+				request.input.request,
+				candidateRunId,
+				source,
+				ctx,
+				parentSessionId,
+				parentSessionFile,
+				{
+					artifactDir: this.#options.artifactDir,
+					resolveContract: this.#options.resolveContract,
+					resolveCapabilityCeiling: this.#options.resolveCapabilityCeiling,
+				},
+			);
+			if (!this.#isCurrent(epoch)) {
+				return { version: 1, ok: false, code: "no_active_session", message: "Managed resume preflight parent session changed before completion." };
+			}
+			return {
+				version: 1,
+				ok: true,
+				host: { version: 1, hostId: loadOrCreateManagedDispatchHostId(this.#options.hostIdPath) },
+				profile: resolved.profile,
+				profileIdentityDigest: resolved.profileIdentityDigest,
+				parentSessionIdentityDigest: resolved.contract.parentSessionIdentityDigest,
+				candidateRunId,
+				contractDigest: resolved.contract.digest,
+			};
+		} catch (error) {
+			return { version: 1, ok: false, code: errorCode(error), message: "Managed resume preflight failed closed." };
+		}
 	}
 
 	async #dispatch(payload: unknown, method: string): Promise<unknown> {
@@ -358,14 +476,17 @@ export class ManagedDispatchProvider {
 			parseManagedReadRequestV1(payload);
 			return this.capabilities();
 		}
-		if (this.#state !== "ready" || !this.#journal || !this.#coordinator || !this.#parentDigest) {
+		if (this.#state !== "ready" || !this.#journal || !this.#coordinator || !this.#resumeCoordinator || !this.#parentDigest) {
 			throw new ManagedSpawnCoordinatorError("unsupported_host", this.#state === "recovering" ? "Managed provider is recovering." : "Managed provider is unavailable.");
 		}
 		const epoch = this.#epoch;
-		if (method === "spawn") {
+		if (method === "spawn" || method === "resume") {
 			const request = parseManagedMutationRequestV1(payload);
-			if (request.method !== "spawn") throw new ManagedSpawnCoordinatorError("unsupported_method", "Managed provider method is unavailable.");
-			const result = await this.#coordinator.dispatchSpawn(request);
+			const result = method === "spawn" && request.method === "spawn"
+				? await this.#coordinator.dispatchSpawn(request)
+				: method === "resume" && request.method === "resume"
+					? await this.#resumeCoordinator.dispatchResume(request)
+					: (() => { throw new ManagedSpawnCoordinatorError("unsupported_method", "Managed provider method is unavailable."); })();
 			if (!this.#isCurrent(epoch)) throw new ManagedSpawnCoordinatorError("no_active_session", "Managed parent session changed during dispatch.");
 			return result;
 		}
@@ -375,7 +496,9 @@ export class ManagedDispatchProvider {
 		}
 		const record = this.#resolveTarget(request.target);
 		if (!record) throw new ManagedSpawnCoordinatorError("not_found", "Managed operation was not found.");
-		const reconciled = this.#coordinator.reconcileExisting(record);
+		const reconciled = record.method === "resume"
+			? this.#resumeCoordinator.reconcileExisting(record)
+			: this.#coordinator.reconcileExisting(record);
 		if (!this.#isCurrent(epoch)) throw new ManagedSpawnCoordinatorError("no_active_session", "Managed parent session changed during read.");
 		return projectRecord(reconciled, method === "details");
 	}

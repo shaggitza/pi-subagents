@@ -273,7 +273,7 @@ export async function resolveManagedSpawnLaunchV1(
 	return Object.freeze({ params, contract: contractResult.contract, profile, profileIdentityDigest });
 }
 
-async function preflight(
+export async function performManagedSpawnPreflightV1(
 	payload: unknown,
 	options: ManagedDispatchPreflightBridgeOptions,
 ): Promise<ManagedPreflightResultV1> {
@@ -350,7 +350,7 @@ export function registerManagedDispatchPreflightBridge(options: ManagedDispatchP
 		if (disposed || ownDataValue(payload, "method") !== "preflight") return;
 		const replyEvent = safeReplyEvent(payload);
 		if (!replyEvent) return;
-		void preflight(payload, options)
+		void performManagedSpawnPreflightV1(payload, options)
 			.then((result) => emitIfCurrent(replyEvent, result))
 			.catch(() => emitIfCurrent(replyEvent, failure("execution_failed", "Managed preflight failed closed.")));
 	};

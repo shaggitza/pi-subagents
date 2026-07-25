@@ -50,6 +50,7 @@ export interface ManagedResumeCoordinatorOptions {
 	hostIdPath?: string;
 	loadHostId?: (filePath?: string) => string;
 	artifactDir?: "project" | "session" | "temp";
+	resolveContract?: ManagedResumeLaunchResolverOptions["resolveContract"];
 	resolveCapabilityCeiling?: ManagedResumeLaunchResolverOptions["resolveCapabilityCeiling"];
 	resolveLaunch?: typeof resolveManagedResumeLaunchV1;
 }
@@ -120,6 +121,15 @@ export class ManagedResumeCoordinator {
 
 	constructor(options: ManagedResumeCoordinatorOptions) { this.#options = options; }
 
+	/** Reconciles an already-claimed resume operation without ever launching it. */
+	reconcileExisting(
+		record: Readonly<ManagedOperationJournalRecordV1>,
+		options: { observerLost?: boolean } = {},
+	): Readonly<ManagedOperationJournalRecordV1> {
+		if (record.method !== "resume") return record;
+		return options.observerLost ? this.reconcileAfterObserverLoss(record) : this.#reconcile(record);
+	}
+
 	#snapshot(): ParentSnapshot {
 		try {
 			const ctx = this.#options.getContext();
@@ -154,6 +164,7 @@ export class ManagedResumeCoordinator {
 			request.input.request, request.expectedLaunch.candidateRunId, source, snapshot.ctx,
 			snapshot.parentSessionId, snapshot.parentSessionFile, {
 				artifactDir: this.#options.artifactDir,
+				resolveContract: this.#options.resolveContract,
 				resolveCapabilityCeiling: this.#options.resolveCapabilityCeiling,
 			},
 		);

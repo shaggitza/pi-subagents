@@ -39,7 +39,6 @@ import { registerMainWatchdog } from "../watchdog/register-main.ts";
 import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
-import { registerManagedDispatchPreflightBridge } from "./managed-dispatch-preflight.ts";
 import { ManagedDispatchProvider } from "./managed-dispatch-provider.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
@@ -395,13 +394,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		getContext: () => state.lastUiContext,
 		execute: (id, params, signal, onUpdate, ctx) => executor.execute(id, params, signal, onUpdate, ctx),
 	});
-	const managedPreflightBridgeDispose = registerManagedDispatchPreflightBridge({
-		events: pi.events,
-		getContext: () => state.lastUiContext,
-		getSessionGeneration: () => managedSessionGeneration,
-		artifactDir: config.artifactDir,
-	});
-
 	function effectiveParallelTaskCount(tasks: Array<{ count?: unknown }> | undefined): number {
 		if (!tasks || tasks.length === 0) return 0;
 		return tasks.reduce((total, task) => {
@@ -517,7 +509,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		pi.events.on(SUBAGENT_CONTROL_EVENT, controlEventHandler),
 		pi.events.on(SUBAGENT_STEERING_NOTICE_EVENT, steeringNoticeHandler),
 		rpcBridge.dispose,
-		managedPreflightBridgeDispose,
 	];
 	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
 

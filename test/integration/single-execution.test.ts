@@ -589,6 +589,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			assert.equal(first.success, true);
 			assert.equal(first.data.state, "recovering");
 			assert.equal(first.data.methods.spawn, false);
+			assert.equal(first.data.methods.resume, false);
 			let value = first;
 			for (let attempt = 0; attempt < 20 && value.data.state !== "ready"; attempt++) {
 				await new Promise((resolve) => setTimeout(resolve, 10));
@@ -599,7 +600,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			}
 			assert.equal(value.data.state, "ready");
 			assert.equal(value.data.methods.spawn, true);
-			assert.equal(value.data.methods.resume, false);
+			assert.equal(value.data.methods.resume, true);
 			assert.equal(value.data.lifecycle.managedTerminalCorrelation, true);
 		} finally {
 			for (const handler of runtimeHandlers.get("session_shutdown") ?? []) await handler({}, ctx);
