@@ -55,10 +55,25 @@ function mutationBase(method: string, input: unknown, overrides: Record<string, 
 	};
 }
 
+function initialExecutorRequest() {
+	return {
+		agent: "worker",
+		task: "inspect",
+		context: "fresh",
+		async: true,
+		clarify: false,
+		cwd: "/repo",
+		model: "provider/model",
+		artifacts: false,
+		output: false,
+		sessionDir: "/private/sessions/operation-1",
+	};
+}
+
 function spawnRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return mutationBase(
 		"spawn",
-		{ agent: "worker", profile: profile(), task: "inspect" },
+		{ profile: profile(), request: initialExecutorRequest() },
 		{ expectedLaunch: expectedLaunch(), ...overrides },
 	);
 }
@@ -66,7 +81,12 @@ function spawnRequest(overrides: Record<string, unknown> = {}): Record<string, u
 function resumeRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return mutationBase(
 		"resume",
-		{ profile: profile(), sourceRunId: "source-1", index: 0, task: "continue" },
+		{
+			profile: profile(),
+			sourceRunId: "source-1",
+			index: 0,
+			request: { action: "resume", id: "source-1", index: 0, message: "continue" },
+		},
 		{ expectedLaunch: expectedLaunch(), ...overrides },
 	);
 }
@@ -310,7 +330,7 @@ describe("managed-dispatch public protocol foundation", () => {
 			requestId: "preflight-1",
 			method: "preflight",
 			consumerId: assertManagedConsumerId("pi-signal"),
-			input: { kind: "spawn", agent: "worker", task: "inspect", profile: profile() },
+			input: { kind: "spawn", profile: profile(), request: initialExecutorRequest() },
 		};
 		const result: ManagedPreflightResultV1 = {
 			version: 1,
@@ -329,20 +349,46 @@ describe("managed-dispatch public protocol foundation", () => {
 		const first = spawnRequest();
 		const requestIdChanged = spawnRequest({ requestId: "transport-retry" });
 		const inputReordered = spawnRequest({
-			input: { task: "inspect", profile: { content: { retries: 2, flags: [true, null] }, root: "/repo", version: 1 }, agent: "worker" },
+			input: {
+				request: {
+					sessionDir: "/private/sessions/operation-1",
+					output: false,
+					artifacts: false,
+					model: "provider/model",
+					cwd: "/repo",
+					clarify: false,
+					async: true,
+					context: "fresh",
+					task: "inspect",
+					agent: "worker",
+				},
+				profile: { content: { retries: 2, flags: [true, null] }, root: "/repo", version: 1 },
+			},
 		});
 		const operationChanged = spawnRequest({
 			managed: { version: 1, consumerId: "pi-signal", operationId: operationId(8) },
 		});
-		assert.equal(computeManagedRequestDigest(first), "470dfda22ce2b6cd17d20407ab0203d2d458315bf7db7ae8fa6b7e2b8ef842a4");
+		assert.equal(computeManagedRequestDigest(first), "512706c65aaadf8231134c49a636822513387572e385179e269074d12f40f4a7");
 		assert.equal(computeManagedRequestDigest(first), computeManagedRequestDigest(requestIdChanged));
 		assert.equal(computeManagedRequestDigest(first), computeManagedRequestDigest(inputReordered));
 		assert.notEqual(computeManagedRequestDigest(first), computeManagedRequestDigest(operationChanged));
+		assert.notEqual(
+			computeManagedRequestDigest(first),
+			computeManagedRequestDigest(
+				spawnRequest({ input: { profile: profile(), request: { ...initialExecutorRequest(), model: "provider/other" } } }),
+			),
+		);
+		assert.notEqual(
+			computeManagedRequestDigest(first),
+			computeManagedRequestDigest(
+				spawnRequest({ input: { profile: profile(), request: { ...initialExecutorRequest(), sessionDir: "/private/sessions/other" } } }),
+			),
+		);
 		assert.match(computeManagedRequestDigest(first), /^[a-f0-9]{64}$/);
 	});
 
 	it("uses a contract-valid resume input and exact contracts for every mutation method", () => {
-		assert.equal(computeManagedRequestDigest(resumeRequest()), "e1eed2a3898d9eb9986ec3871e1536ff21d2e7bb7349ac01970040ab43bd24dd");
+		assert.equal(computeManagedRequestDigest(resumeRequest()), "24fa1e90fad32de9478f753eb9e11e0785feebefcf638ee1b6eb0f847662818d");
 		for (const method of ["steer", "interrupt", "stop", "retire"] as const) {
 			assert.match(computeManagedRequestDigest(controlRequest(method)), /^[a-f0-9]{64}$/);
 		}
@@ -379,18 +425,19 @@ describe("managed-dispatch public protocol foundation", () => {
 			spawnRequest({ method: "status" }),
 			spawnRequest({ managed: { version: 2, consumerId: "pi-signal", operationId: operationId() } }),
 			spawnRequest({ managed: { version: 1, consumerId: "pi-signal", operationId: operationId(), extra: true } }),
-			spawnRequest({ input: { agent: "worker", task: "inspect" } }),
-			spawnRequest({ input: { agent: "worker", task: "inspect", profile: { root: "/repo", content: {} } } }),
-			spawnRequest({ input: { agent: "worker", task: "inspect", profile: { version: 1, root: "/repo", content: {}, extra: true } } }),
-			spawnRequest({ input: { agent: "worker", task: "inspect", profile: { version: 1, root: "/repo", content: undefined } } }),
-			spawnRequest({ input: { agent: "worker", task: "inspect", profile: profile(), contractDigest: "b".repeat(64) } }),
-			spawnRequest({ input: { agent: "worker/unsafe", task: "inspect", profile: profile() } }),
-			spawnRequest({ input: { agent: "worker", task: "x".repeat(65_537), profile: profile() } }),
-			spawnRequest({ input: { agent: "worker", task: "inspect", profile: { ...profile(), root: "/repo\nother" } } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: -1 } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: 1_000_001 } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source/unsafe", index: 0 } }),
-			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: 0, task: undefined } }),
+			spawnRequest({ input: { profile: profile() } }),
+			spawnRequest({ input: { profile: { root: "/repo", content: {} }, request: {} } }),
+			spawnRequest({ input: { profile: { version: 1, root: "/repo", content: {}, extra: true }, request: {} } }),
+			spawnRequest({ input: { profile: { version: 1, root: "/repo", content: undefined }, request: {} } }),
+			spawnRequest({ input: { profile: profile(), request: {}, contractDigest: "b".repeat(64) } }),
+			spawnRequest({ input: { profile: profile(), request: null } }),
+			spawnRequest({ input: { profile: profile(), request: [] } }),
+			spawnRequest({ input: { profile: profile(), request: undefined } }),
+			spawnRequest({ input: { profile: { ...profile(), root: "/repo\nother" }, request: {} } }),
+			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: -1, request: {} } }),
+			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: 1_000_001, request: {} } }),
+			resumeRequest({ input: { profile: profile(), sourceRunId: "source/unsafe", index: 0, request: {} } }),
+			resumeRequest({ input: { profile: profile(), sourceRunId: "source-1", index: 0 } }),
 			controlRequest("steer", { input: { target: { consumerId: "pi-signal", operationId: operationId() }, message: "" } }),
 			controlRequest("interrupt", { input: { target: { consumerId: "other-consumer", operationId: operationId() } } }),
 			controlRequest("interrupt", { input: { target: { consumerId: "pi-signal", operationId: operationId(), runId: "run-1" } } }),

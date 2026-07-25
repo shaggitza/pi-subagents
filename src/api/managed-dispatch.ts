@@ -25,7 +25,8 @@ export interface ManagedJsonLimits {
 }
 
 export type JsonPrimitive = null | boolean | number | string;
-export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+export type JsonObject = { readonly [key: string]: JsonValue };
+export type JsonValue = JsonPrimitive | readonly JsonValue[] | JsonObject;
 
 export type ManagedConsumerId = string & { readonly __managedConsumerId: unique symbol };
 export type ManagedOperationId = string & { readonly __managedOperationId: unique symbol };
@@ -76,15 +77,16 @@ export interface ManagedMutationContextV1 {
 
 export interface ManagedSpawnInputV1 {
 	profile: ManagedProfileSnapshotV1;
-	agent: string;
-	task: string;
+	/** Exact ordinary single-agent execution request; the future host provider validates its schema. */
+	request: JsonObject;
 }
 
 export interface ManagedResumeInputV1 {
 	profile: ManagedProfileSnapshotV1;
 	sourceRunId: string;
 	index: number;
-	task?: string;
+	/** Exact ordinary resume request; the future host provider validates source/index equality. */
+	request: JsonObject;
 }
 
 export interface ManagedPreflightRequestV1 {
@@ -630,31 +632,35 @@ function normalizeTarget(value: unknown, expectedConsumerId?: ManagedConsumerId)
 		: { consumerId, runId: assertSafeIdentifier(record.runId, "Managed target runId") };
 }
 
+function normalizeExecutorRequest(value: unknown, label: string): JsonObject {
+	const normalized = canonicalizeManagedJson(value).normalized;
+	if (normalized === null || typeof normalized !== "object" || Array.isArray(normalized)) {
+		throw new TypeError(`${label} must be a plain JSON object.`);
+	}
+	return normalized as JsonObject;
+}
+
 function normalizeSpawnInput(value: unknown): JsonValue {
 	if (!value || typeof value !== "object") throw new TypeError("Managed spawn input must be an object.");
-	const input = assertExactKeys(value, ["profile", "agent", "task"], "Managed spawn input");
+	const input = assertExactKeys(value, ["profile", "request"], "Managed spawn input");
 	return {
 		profile: normalizeProfileSnapshot(input.profile),
-		agent: assertSafeIdentifier(input.agent, "Managed spawn agent"),
-		task: assertBoundedText(input.task, "Managed spawn task", 65_536),
+		request: normalizeExecutorRequest(input.request, "Managed spawn executor request"),
 	};
 }
 
 function normalizeResumeInput(value: unknown): JsonValue {
 	if (!value || typeof value !== "object") throw new TypeError("Managed resume input must be an object.");
-	const input = assertObjectKeys(value, ["profile", "sourceRunId", "index"], ["task"], "Managed resume input");
+	const input = assertExactKeys(value, ["profile", "sourceRunId", "index", "request"], "Managed resume input");
 	if (!Number.isSafeInteger(input.index) || (input.index as number) < 0 || (input.index as number) > 1_000_000) {
 		throw new TypeError("Managed resume index must be an integer between 0 and 1000000.");
 	}
-	const normalized: Record<string, JsonValue> = {
+	return {
 		profile: normalizeProfileSnapshot(input.profile),
 		sourceRunId: assertSafeIdentifier(input.sourceRunId, "Managed resume sourceRunId"),
 		index: input.index as number,
+		request: normalizeExecutorRequest(input.request, "Managed resume executor request"),
 	};
-	if (Object.prototype.hasOwnProperty.call(input, "task")) {
-		normalized.task = assertBoundedText(input.task, "Managed resume task", 65_536);
-	}
-	return normalized;
 }
 
 function normalizeControlInput(
