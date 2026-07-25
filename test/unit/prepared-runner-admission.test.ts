@@ -38,6 +38,9 @@ describe("prepared runner admission", () => {
 		const accepted = readPreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "accepted");
 		assert.equal(accepted?.state, "accepted");
 		assert.equal(accepted?.runnerProcessInstanceId, ready?.runnerProcessInstanceId);
+		writePreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "committed", 123, "runner-1", 300);
+		const committed = readPreparedRunnerAdmissionEvidence(paths.evidencePath, admission, "committed");
+		assert.equal(committed?.state, "committed");
 	});
 
 	it("fails closed for changed identity, state, controls, and unsafe descriptors", () => {

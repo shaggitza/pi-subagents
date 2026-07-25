@@ -662,6 +662,16 @@ function spawnRunner(
 				terminateRunnerBeforeProceed(proc.pid);
 				return { error: "Prepared runner-accepted admission failed closed." };
 			}
+			const committed = waitForPreparedRunnerAdmission(
+				preparedAdmissionPaths.evidencePath,
+				admission,
+				"committed",
+				RUNNER_STARTUP_TIMEOUT_MS,
+			);
+			if (!committed.ok) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: committed.error };
+			}
 		}
 		return { pid: proc.pid };
 	} catch (error) {

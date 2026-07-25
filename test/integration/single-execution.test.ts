@@ -1189,7 +1189,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(fs.existsSync(resultReservationPath), false, "runner must release the candidate-bound result reservation after publication");
 		assert.equal(fs.existsSync(configPath), false, "runner must consume the candidate-bound transient config");
 		const retainedAdmission = JSON.parse(fs.readFileSync(admissionPaths.evidencePath, "utf8")) as PreparedRunnerAdmissionEvidenceV1;
-		assert.equal(retainedAdmission.state, "accepted");
+		assert.equal(retainedAdmission.state, "committed");
 		assert.equal(retainedAdmission.dispatchIdentityDigest, PREPARED_TEST_DISPATCH_DIGEST);
 		assert.equal(fs.existsSync(admissionPaths.proceedPath), false);
 		assert.equal(fs.existsSync(admissionPaths.commitPath), false);

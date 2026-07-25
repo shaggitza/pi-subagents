@@ -4103,6 +4103,13 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 				config.runnerProcessInstanceId,
 			);
 			await waitForPreparedAdmissionControl(admissionPaths.commitPath, config.preparedRunnerAdmission, "commit");
+			writePreparedRunnerAdmissionEvidence(
+				admissionPaths.evidencePath,
+				config.preparedRunnerAdmission,
+				"committed",
+				process.pid,
+				config.runnerProcessInstanceId,
+			);
 			for (const controlPath of [admissionPaths.proceedPath, admissionPaths.commitPath]) {
 				try {
 					fs.rmSync(controlPath, { force: true });

@@ -13,7 +13,7 @@ export interface PreparedRunnerAdmissionV1 {
 }
 
 export interface PreparedRunnerAdmissionEvidenceV1 extends PreparedRunnerAdmissionV1 {
-	state: "ready" | "accepted";
+	state: "ready" | "accepted" | "committed";
 	pid: number;
 	runnerProcessInstanceId: string;
 	observedAt: number;
@@ -114,7 +114,7 @@ export function readPreparedRunnerAdmissionEvidence(
 		throw new Error("Prepared runner admission evidence identity changed.");
 	}
 	if (
-		(record.state !== "ready" && record.state !== "accepted")
+		(record.state !== "ready" && record.state !== "accepted" && record.state !== "committed")
 		|| typeof record.pid !== "number"
 		|| !Number.isSafeInteger(record.pid)
 		|| record.pid <= 0
