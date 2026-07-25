@@ -28,7 +28,7 @@ import { resolveWatchPath } from "../../shared/utils.ts";
  */
 export const INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
 
-export type ControlChannelFs = Pick<typeof fs, "mkdirSync" | "existsSync" | "rmSync" | "watch" | "readdirSync" | "readFileSync" | "realpathSync">;
+export type ControlChannelFs = Pick<typeof fs, "mkdirSync" | "existsSync" | "rmSync" | "renameSync" | "watch" | "readdirSync" | "readFileSync" | "realpathSync">;
 export type ControlChannelTimers = { setInterval: typeof setInterval; clearInterval: typeof clearInterval };
 type KillFn = (pid: number, signal?: NodeJS.Signals | 0) => unknown;
 
@@ -89,10 +89,69 @@ const STEER_ACKS_DIR = "steer-acks";
 const STEER_INBOX_CLOSED_FILE = "steer-inbox-closed.json";
 const MAX_STEER_MESSAGE_BYTES = 128 * 1024;
 const MAX_STEER_REQUEST_ID_LENGTH = 256;
+const MANAGED_REQUESTS_DIR = "managed-requests";
+const MANAGED_CONSUMED_DIR = "managed-consumed";
+const MANAGED_ACKS_DIR = "managed-acks";
+const MANAGED_OPERATION_ID = /^[A-Za-z0-9_-]{43}$/;
+const MANAGED_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._~:-]{0,255}$/;
+const MAX_MANAGED_STEER_MESSAGE_BYTES = 65_536;
+
+export type ManagedControlMethod = "steer" | "interrupt" | "stop";
+
+export type ManagedControlRequest = {
+	version: 1;
+	commandId: string;
+	method: ManagedControlMethod;
+	runId: string;
+	requestedAt: number;
+	targetIndex: 0;
+	message?: string;
+};
+
+export interface ManagedControlAck {
+	version: 1;
+	commandId: string;
+	method: ManagedControlMethod;
+	runId: string;
+	acknowledgedAt: number;
+	outcome: "acknowledged" | "failed";
+	reason?: string;
+}
+
+export type ManagedControlTransportState = "absent" | "published" | "consumed" | "acknowledged" | "failed" | "corrupt";
 
 /** Control inbox directory inside an async run dir. */
 export function controlInboxDir(asyncDir: string): string {
 	return path.join(asyncDir, "control");
+}
+
+export function managedControlRequestsDir(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), MANAGED_REQUESTS_DIR);
+}
+
+export function managedControlConsumedDir(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), MANAGED_CONSUMED_DIR);
+}
+
+export function managedControlAcksDir(asyncDir: string): string {
+	return path.join(controlInboxDir(asyncDir), MANAGED_ACKS_DIR);
+}
+
+function managedControlFileName(commandId: string): string {
+	if (!MANAGED_OPERATION_ID.test(commandId)) throw new Error("managed control commandId is invalid.");
+	return `${commandId}.json`;
+}
+
+export function managedControlRequestPath(asyncDir: string, commandId: string): string {
+	return path.join(managedControlRequestsDir(asyncDir), managedControlFileName(commandId));
+}
+
+export function managedControlConsumedPath(asyncDir: string, commandId: string): string {
+	return path.join(managedControlConsumedDir(asyncDir), managedControlFileName(commandId));
+}
+
+export function managedControlAckPath(asyncDir: string, commandId: string): string {
+	return path.join(managedControlAcksDir(asyncDir), managedControlFileName(commandId));
 }
 
 /** Path of the portable interrupt request file. */
@@ -252,6 +311,166 @@ export function requestAsyncStop(
 	const request: StopRequest = { ...payload, ts: payload.ts ?? deps.now?.() ?? Date.now(), type: "stop" };
 	writeAtomicJson(requestPath, request);
 	return requestPath;
+}
+
+function fsyncControlDirectory(directory: string): void {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(directory, "r");
+		fs.fsyncSync(descriptor);
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+}
+
+function writeExclusiveManagedJson(filePath: string, value: unknown): string {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(filePath, "wx", 0o600);
+		fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`, "utf8");
+		fs.fsyncSync(descriptor);
+		fs.closeSync(descriptor);
+		descriptor = undefined;
+		fsyncControlDirectory(path.dirname(filePath));
+		return filePath;
+	} catch (error) {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+		throw error;
+	}
+}
+
+function parseManagedControlRequest(raw: unknown): ManagedControlRequest | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const input = raw as Partial<ManagedControlRequest>;
+	const keys = Object.keys(input).sort();
+	const expected = input.method === "steer"
+		? ["commandId", "message", "method", "requestedAt", "runId", "targetIndex", "version"]
+		: ["commandId", "method", "requestedAt", "runId", "targetIndex", "version"];
+	if (keys.join("\0") !== expected.sort().join("\0")) return undefined;
+	if (input.version !== 1 || !MANAGED_OPERATION_ID.test(input.commandId ?? "")
+		|| (input.method !== "steer" && input.method !== "interrupt" && input.method !== "stop")
+		|| !MANAGED_RUN_ID.test(input.runId ?? "") || input.targetIndex !== 0
+		|| !Number.isSafeInteger(input.requestedAt) || (input.requestedAt ?? 0) <= 0) return undefined;
+	if (input.method === "steer" && (typeof input.message !== "string" || !input.message.trim()
+		|| Buffer.byteLength(input.message, "utf8") > MAX_MANAGED_STEER_MESSAGE_BYTES || input.message.includes("\0"))) return undefined;
+	return {
+		version: 1,
+		commandId: input.commandId!,
+		method: input.method,
+		runId: input.runId!,
+		requestedAt: input.requestedAt!,
+		targetIndex: 0,
+		...(input.method === "steer" ? { message: input.message! } : {}),
+	};
+}
+
+function parseManagedControlAck(raw: unknown): ManagedControlAck | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const input = raw as Partial<ManagedControlAck>;
+	const expected = input.reason === undefined
+		? ["acknowledgedAt", "commandId", "method", "outcome", "runId", "version"]
+		: ["acknowledgedAt", "commandId", "method", "outcome", "reason", "runId", "version"];
+	if (Object.keys(input).sort().join("\0") !== expected.sort().join("\0")) return undefined;
+	if (input.version !== 1 || !MANAGED_OPERATION_ID.test(input.commandId ?? "")
+		|| (input.method !== "steer" && input.method !== "interrupt" && input.method !== "stop")
+		|| !MANAGED_RUN_ID.test(input.runId ?? "") || !Number.isSafeInteger(input.acknowledgedAt) || (input.acknowledgedAt ?? 0) <= 0
+		|| (input.outcome !== "acknowledged" && input.outcome !== "failed")
+		|| (input.reason !== undefined && (typeof input.reason !== "string" || !input.reason || input.reason.length > 512))) return undefined;
+	return input as ManagedControlAck;
+}
+
+/** Publishes one immutable managed command. EEXIST is an explicit replay signal. */
+export function publishManagedControlRequest(
+	asyncDir: string,
+	input: Omit<ManagedControlRequest, "version" | "requestedAt" | "targetIndex"> & { requestedAt?: number },
+	deps: { now?: () => number } = {},
+): string {
+	const request = parseManagedControlRequest({
+		version: 1,
+		commandId: input.commandId,
+		method: input.method,
+		runId: input.runId,
+		requestedAt: input.requestedAt ?? deps.now?.() ?? Date.now(),
+		targetIndex: 0,
+		...(input.method === "steer" ? { message: input.message } : {}),
+	});
+	if (!request) throw new Error("managed control request is malformed or exceeds transport limits.");
+	return writeExclusiveManagedJson(managedControlRequestPath(asyncDir, request.commandId), request);
+}
+
+export function writeManagedControlAck(asyncDir: string, ack: ManagedControlAck): string {
+	const parsed = parseManagedControlAck(ack);
+	if (!parsed) throw new Error("managed control acknowledgment is malformed.");
+	return writeExclusiveManagedJson(managedControlAckPath(asyncDir, parsed.commandId), parsed);
+}
+
+function readBoundedRegularJson(filePath: string): unknown {
+	const stats = fs.lstatSync(filePath);
+	if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 131_072) throw new Error("managed control sidecar is not a bounded regular file.");
+	return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+export function readManagedControlAck(asyncDir: string, commandId: string): ManagedControlAck | undefined {
+	try { return parseManagedControlAck(readBoundedRegularJson(managedControlAckPath(asyncDir, commandId))); } catch { return undefined; }
+}
+
+export function inspectManagedControlTransport(asyncDir: string, commandId: string): ManagedControlTransportState {
+	const ackPath = managedControlAckPath(asyncDir, commandId);
+	if (fs.existsSync(ackPath)) {
+		const ack = readManagedControlAck(asyncDir, commandId);
+		return !ack ? "corrupt" : ack.outcome === "acknowledged" ? "acknowledged" : "failed";
+	}
+	const requestPath = managedControlRequestPath(asyncDir, commandId);
+	if (fs.existsSync(requestPath)) {
+		try { return parseManagedControlRequest(readBoundedRegularJson(requestPath)) ? "published" : "corrupt"; } catch { return "corrupt"; }
+	}
+	const consumedPath = managedControlConsumedPath(asyncDir, commandId);
+	if (fs.existsSync(consumedPath)) {
+		try { return parseManagedControlRequest(readBoundedRegularJson(consumedPath)) ? "consumed" : "corrupt"; } catch { return "corrupt"; }
+	}
+	return "absent";
+}
+
+/** Claims requests by durable rename before callback. A crash can lose the ack, never repeat the callback. */
+export function consumeManagedControlRequests(
+	asyncDir: string,
+	onRequest: (request: ManagedControlRequest) => { outcome: "acknowledged" | "failed"; reason?: string },
+	fsImpl: Pick<typeof fs, "existsSync" | "mkdirSync" | "renameSync" | "readdirSync" | "readFileSync"> = fs,
+): void {
+	const requestsDir = managedControlRequestsDir(asyncDir);
+	if (!fsImpl.existsSync(requestsDir)) return;
+	fsImpl.mkdirSync(managedControlConsumedDir(asyncDir), { recursive: true, mode: 0o700 });
+	for (const entry of fsImpl.readdirSync(requestsDir).filter((name) => MANAGED_OPERATION_ID.test(name.slice(0, -5)) && name.endsWith(".json")).sort()) {
+		const commandId = entry.slice(0, -5);
+		const requestPath = path.join(requestsDir, entry);
+		const consumedPath = managedControlConsumedPath(asyncDir, commandId);
+		try {
+			fsImpl.renameSync(requestPath, consumedPath);
+			if (fsImpl === fs) {
+				fsyncControlDirectory(requestsDir);
+				fsyncControlDirectory(managedControlConsumedDir(asyncDir));
+			}
+		} catch { continue; }
+		let request: ManagedControlRequest | undefined;
+		try { request = parseManagedControlRequest(JSON.parse(fsImpl.readFileSync(consumedPath, "utf8"))); } catch { request = undefined; }
+		if (!request || request.commandId !== commandId) continue;
+		let result: { outcome: "acknowledged" | "failed"; reason?: string };
+		try { result = onRequest(request); } catch { result = { outcome: "failed", reason: "runner rejected managed command" }; }
+		try {
+			writeManagedControlAck(asyncDir, {
+				version: 1,
+				commandId,
+				method: request.method,
+				runId: request.runId,
+				acknowledgedAt: Date.now(),
+				outcome: result.outcome,
+				...(result.reason ? { reason: result.reason.slice(0, 512) } : {}),
+			});
+		} catch {
+			// The consumed tombstone is authoritative: never execute again after an ack failure.
+		}
+	}
 }
 
 export function requestAsyncSteer(
@@ -521,6 +740,7 @@ export function watchAsyncControlInbox(
 		onSteer?: (request: SteerRequest) => void;
 		onSteerCapability?: (capability: SteerCapability) => void;
 		onSteerAck?: (ack: SteerAck) => void;
+		onManagedControl?: (request: ManagedControlRequest) => { outcome: "acknowledged" | "failed"; reason?: string };
 		pollIntervalMs?: number;
 		fs?: ControlChannelFs;
 		timers?: ControlChannelTimers;
@@ -545,6 +765,7 @@ export function watchAsyncControlInbox(
 			for (const request of consumeSteerRequests(asyncDir, fsImpl)) opts.onSteer?.(request);
 			for (const capability of consumeSteerCapabilities(asyncDir, fsImpl)) opts.onSteerCapability?.(capability);
 			for (const ack of consumeSteerAcks(asyncDir, fsImpl)) opts.onSteerAck?.(ack);
+			if (opts.onManagedControl) consumeManagedControlRequests(asyncDir, opts.onManagedControl, fsImpl);
 		} catch {
 			// Never let inbox errors crash the runner.
 		}

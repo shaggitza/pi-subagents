@@ -54,6 +54,18 @@ export interface ManagedOperationJournalRecordV1 {
 	terminalEvidence?: ManagedOperationTerminalEvidenceV1;
 	/** Durable marker that the process owning the live close observer was lost. */
 	observerLost?: true;
+	/** Control-command authority. Raw steer content is intentionally never persisted here. */
+	targetOperationId?: string;
+	targetRunId?: string;
+	actorOperationId?: string;
+	actorRequestDigest?: string;
+	actorRunId?: string;
+	controlRequestPath?: string;
+	controlAckPath?: string;
+	controlOutcome?: "acknowledged" | "failed" | "unknown";
+	retirementAcknowledgedUncertain?: true;
+	/** Launch tombstone correlation retained after logical retirement. */
+	retiredByOperationId?: string;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -109,8 +121,8 @@ const states = (...values: ManagedOperationJournalStateV1[]): ReadonlySet<Manage
 
 const TRANSITIONS: Readonly<Record<ManagedOperationJournalStateV1, ReadonlySet<ManagedOperationJournalStateV1>>> = Object.freeze({
 	claimed: states("prepared", "failed-before-launch", "retired"),
-	prepared: states("dispatching", "failed-before-launch", "retired"),
-	dispatching: states("runner-ready", "uncertain"),
+	prepared: states("dispatching", "terminal", "failed-before-launch", "retired"),
+	dispatching: states("runner-ready", "accepted", "terminal", "uncertain"),
 	"runner-ready": states("accepted", "uncertain"),
 	accepted: states("terminal", "uncertain", "reconciling"),
 	terminal: states("retired"),
@@ -352,7 +364,9 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 		"version", "parentSessionIdentityDigest", "consumerId", "operationId", "requestDigest", "method", "state",
 		"expectedLaunch", "runId", "sourceRunId", "sourceOperationId", "sourceRequestDigest", "sourceTerminalProofDigest",
 		"sourceCanonicalSessionId", "sourceRecoveryDescriptorDigest", "runnerProcessInstanceId", "runnerAdmissionTokenDigest",
-		"runnerSessionLeaseTokenDigest", "runnerCanonicalSessionId", "terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "observerLost", "createdAt", "updatedAt",
+		"runnerSessionLeaseTokenDigest", "runnerCanonicalSessionId", "terminalAsyncDir", "canonicalSessionFile", "terminalEvidence", "observerLost",
+		"targetOperationId", "targetRunId", "actorOperationId", "actorRequestDigest", "actorRunId", "controlRequestPath", "controlAckPath", "controlOutcome",
+		"retirementAcknowledgedUncertain", "retiredByOperationId", "createdAt", "updatedAt",
 	]);
 	if (Object.keys(record).some((key) => !allowed.has(key))) throw new ManagedOperationJournalError("corrupt", "Managed operation record has unknown fields.");
 	if (record.version !== MANAGED_OPERATION_JOURNAL_VERSION) throw new ManagedOperationJournalError("corrupt", "Managed operation record version is unsupported.");
@@ -398,74 +412,111 @@ function parseRecordUnchecked(value: unknown): ManagedOperationJournalRecordV1 {
 		if (record.observerLost !== true) throw new ManagedOperationJournalError("corrupt", "Managed observer-loss marker is corrupt.");
 		parsed.observerLost = true;
 	}
+	if (record.targetOperationId !== undefined) parsed.targetOperationId = assertManagedOperationId(record.targetOperationId);
+	if (record.targetRunId !== undefined) parsed.targetRunId = assertRunId(record.targetRunId, "Managed target run id");
+	if (record.actorOperationId !== undefined) parsed.actorOperationId = assertManagedOperationId(record.actorOperationId);
+	if (record.actorRequestDigest !== undefined) parsed.actorRequestDigest = assertDigest(record.actorRequestDigest, "Managed actor request digest");
+	if (record.actorRunId !== undefined) parsed.actorRunId = assertRunId(record.actorRunId, "Managed actor run id");
+	if (record.controlRequestPath !== undefined) parsed.controlRequestPath = assertAbsolutePath(record.controlRequestPath, "Managed control request path");
+	if (record.controlAckPath !== undefined) parsed.controlAckPath = assertAbsolutePath(record.controlAckPath, "Managed control ack path");
+	if (record.controlOutcome !== undefined) {
+		if (record.controlOutcome !== "acknowledged" && record.controlOutcome !== "failed" && record.controlOutcome !== "unknown") {
+			throw new ManagedOperationJournalError("corrupt", "Managed control outcome is corrupt.");
+		}
+		parsed.controlOutcome = record.controlOutcome;
+	}
+	if (record.retirementAcknowledgedUncertain !== undefined) {
+		if (record.retirementAcknowledgedUncertain !== true) throw new ManagedOperationJournalError("corrupt", "Managed retirement acknowledgment is corrupt.");
+		parsed.retirementAcknowledgedUncertain = true;
+	}
+	if (record.retiredByOperationId !== undefined) parsed.retiredByOperationId = assertManagedOperationId(record.retiredByOperationId);
 	const launchMethod = parsed.method === "spawn" || parsed.method === "resume";
-	if (launchMethod && !parsed.expectedLaunch) {
-		throw new ManagedOperationJournalError("corrupt", "Managed launch operation lacks expected launch identity.");
+	const controlFields = [parsed.targetOperationId, parsed.targetRunId, parsed.actorOperationId, parsed.actorRequestDigest, parsed.actorRunId, parsed.controlRequestPath, parsed.controlAckPath, parsed.controlOutcome, parsed.retirementAcknowledgedUncertain];
+	if (launchMethod) {
+		if (!parsed.expectedLaunch || controlFields.some((field) => field !== undefined)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed launch operation authority is corrupt.");
+		}
+		if (parsed.expectedLaunch.parentSessionIdentityDigest !== parsed.parentSessionIdentityDigest
+			|| (parsed.runId && parsed.runId !== parsed.expectedLaunch.candidateRunId)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed launch identity differs from its namespace or candidate.");
+		}
+		if (parsed.method === "resume" ? !parsed.sourceRunId : parsed.sourceRunId !== undefined) {
+			throw new ManagedOperationJournalError("corrupt", "Managed source run identity is inconsistent with the operation method.");
+		}
+		const resumeSourceFields = [parsed.sourceOperationId, parsed.sourceRequestDigest, parsed.sourceTerminalProofDigest, parsed.sourceCanonicalSessionId, parsed.sourceRecoveryDescriptorDigest];
+		const hasCompleteResumeSource = resumeSourceFields.every((field) => field !== undefined);
+		const hasAnyResumeSource = resumeSourceFields.some((field) => field !== undefined);
+		const resumeSourceRequired = parsed.method === "resume" && !["claimed", "failed-before-launch", "retired"].includes(parsed.state);
+		const resumeSourceOptional = parsed.method === "resume" && (parsed.state === "failed-before-launch" || parsed.state === "retired");
+		if ((parsed.method !== "resume" && hasAnyResumeSource) || (resumeSourceRequired && !hasCompleteResumeSource)
+			|| (!resumeSourceRequired && !resumeSourceOptional && hasAnyResumeSource) || (resumeSourceOptional && hasAnyResumeSource && !hasCompleteResumeSource)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed resume source correlation is inconsistent with the operation state.");
+		}
+		const hasLeaseDigest = parsed.runnerSessionLeaseTokenDigest !== undefined;
+		const hasRunnerCanonical = parsed.runnerCanonicalSessionId !== undefined;
+		if (hasLeaseDigest !== hasRunnerCanonical || (parsed.method !== "resume" && hasLeaseDigest)
+			|| (hasRunnerCanonical && parsed.sourceCanonicalSessionId !== parsed.runnerCanonicalSessionId)
+			|| (parsed.method === "resume" && ["runner-ready", "accepted", "terminal"].includes(parsed.state) && !hasLeaseDigest)
+			|| (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasLeaseDigest)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed resume lease correlation is inconsistent.");
+		}
+		const runRequired = ["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(parsed.state);
+		const runForbidden = ["claimed", "prepared", "failed-before-launch"].includes(parsed.state);
+		if ((runRequired && !parsed.runId) || (runForbidden && parsed.runId)) throw new ManagedOperationJournalError("corrupt", "Managed run identity is inconsistent with the operation state.");
+		const hasRunnerInstance = parsed.runnerProcessInstanceId !== undefined;
+		const hasAdmissionToken = parsed.runnerAdmissionTokenDigest !== undefined;
+		if (hasRunnerInstance !== hasAdmissionToken
+			|| (["runner-ready", "accepted", "terminal"].includes(parsed.state) && !hasRunnerInstance)
+			|| (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasRunnerInstance)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is inconsistent.");
+		}
+		const pathsRequired = ["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(parsed.state);
+		const pathsForbidden = ["claimed", "prepared", "failed-before-launch"].includes(parsed.state);
+		const hasBothPaths = parsed.terminalAsyncDir !== undefined && parsed.canonicalSessionFile !== undefined;
+		if ((pathsRequired && !hasBothPaths) || (pathsForbidden && (parsed.terminalAsyncDir !== undefined || parsed.canonicalSessionFile !== undefined))) {
+			throw new ManagedOperationJournalError("corrupt", "Managed terminal recovery paths are inconsistent with the operation state.");
+		}
+		if (parsed.state === "terminal" && !parsed.terminalEvidence
+			|| parsed.state !== "terminal" && parsed.state !== "retired" && parsed.terminalEvidence !== undefined) {
+			throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is inconsistent with the operation state.");
+		}
+		if ((parsed.state === "retired") !== (parsed.retiredByOperationId !== undefined)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed retirement tombstone correlation is inconsistent.");
+		}
+	} else {
+		if (parsed.expectedLaunch || parsed.runId || parsed.sourceRunId || parsed.sourceOperationId || parsed.sourceRequestDigest
+			|| parsed.sourceTerminalProofDigest || parsed.sourceCanonicalSessionId || parsed.sourceRecoveryDescriptorDigest
+			|| parsed.runnerProcessInstanceId || parsed.runnerAdmissionTokenDigest || parsed.runnerSessionLeaseTokenDigest
+			|| parsed.runnerCanonicalSessionId || parsed.terminalAsyncDir || parsed.canonicalSessionFile || parsed.terminalEvidence
+			|| parsed.observerLost || parsed.retiredByOperationId) {
+			throw new ManagedOperationJournalError("corrupt", "Managed command contains launch-only authority.");
+		}
+		if ((parsed.targetOperationId === undefined) === (parsed.targetRunId === undefined)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed command target authority is incomplete.");
+		}
+		const hasActor = parsed.actorOperationId !== undefined && parsed.actorRequestDigest !== undefined
+			&& (parsed.method === "retire" || parsed.actorRunId !== undefined);
+		const anyActor = parsed.actorOperationId !== undefined || parsed.actorRequestDigest !== undefined || parsed.actorRunId !== undefined;
+		if ((parsed.state === "claimed" && anyActor) || (parsed.state !== "claimed" && !hasActor)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed command actor authority is inconsistent with its state.");
+		}
+		const transportMethod = parsed.method === "steer" || parsed.method === "interrupt" || parsed.method === "stop";
+		const hasPaths = parsed.controlRequestPath !== undefined && parsed.controlAckPath !== undefined;
+		if (transportMethod) {
+			if ((["dispatching", "accepted", "terminal", "uncertain"].includes(parsed.state) && !hasPaths)
+				|| (["claimed", "prepared"].includes(parsed.state) && (parsed.controlRequestPath !== undefined || parsed.controlAckPath !== undefined))
+				|| ((parsed.state === "terminal") !== (parsed.controlOutcome === "acknowledged" || parsed.controlOutcome === "failed"))
+				|| (parsed.state === "uncertain" && parsed.controlOutcome !== "unknown")
+				|| (!["terminal", "uncertain"].includes(parsed.state) && parsed.controlOutcome !== undefined)) {
+				throw new ManagedOperationJournalError("corrupt", "Managed control transport correlation is inconsistent.");
+			}
+		} else if (parsed.controlRequestPath || parsed.controlAckPath || parsed.controlOutcome
+			|| (parsed.retirementAcknowledgedUncertain && parsed.method !== "retire")
+			|| !["claimed", "prepared", "terminal"].includes(parsed.state)) {
+			throw new ManagedOperationJournalError("corrupt", "Managed retirement command state is inconsistent.");
+		}
 	}
-	if (!launchMethod && parsed.expectedLaunch) {
-		throw new ManagedOperationJournalError("corrupt", "Managed control operation contains launch identity.");
-	}
-	if (parsed.expectedLaunch?.parentSessionIdentityDigest !== undefined
-		&& parsed.expectedLaunch.parentSessionIdentityDigest !== parsed.parentSessionIdentityDigest) {
-		throw new ManagedOperationJournalError("corrupt", "Managed launch parent identity differs from its namespace.");
-	}
-	if (parsed.runId && parsed.expectedLaunch && parsed.runId !== parsed.expectedLaunch.candidateRunId) {
-		throw new ManagedOperationJournalError("corrupt", "Managed run identity differs from its preflight candidate.");
-	}
-	if (parsed.method === "resume" ? !parsed.sourceRunId : parsed.sourceRunId !== undefined) {
-		throw new ManagedOperationJournalError("corrupt", "Managed source run identity is inconsistent with the operation method.");
-	}
-	const resumeSourceFields = [parsed.sourceOperationId, parsed.sourceRequestDigest, parsed.sourceTerminalProofDigest, parsed.sourceCanonicalSessionId, parsed.sourceRecoveryDescriptorDigest];
-	const hasCompleteResumeSource = resumeSourceFields.every((field) => field !== undefined);
-	const hasAnyResumeSource = resumeSourceFields.some((field) => field !== undefined);
-	const resumeSourceRequired = parsed.method === "resume" && !["claimed", "failed-before-launch"].includes(parsed.state);
-	const resumeSourceOptional = parsed.method === "resume" && parsed.state === "failed-before-launch";
-	if ((parsed.method !== "resume" && hasAnyResumeSource) || (resumeSourceRequired && !hasCompleteResumeSource)
-		|| (!resumeSourceRequired && !resumeSourceOptional && hasAnyResumeSource) || (resumeSourceOptional && hasAnyResumeSource && !hasCompleteResumeSource)) {
-		throw new ManagedOperationJournalError("corrupt", "Managed resume source correlation is inconsistent with the operation state.");
-	}
-	const hasLeaseDigest = parsed.runnerSessionLeaseTokenDigest !== undefined;
-	const hasRunnerCanonical = parsed.runnerCanonicalSessionId !== undefined;
-	if (hasLeaseDigest !== hasRunnerCanonical || (parsed.method !== "resume" && hasLeaseDigest)) {
-		throw new ManagedOperationJournalError("corrupt", "Managed resume lease correlation is incomplete.");
-	}
-	if (hasRunnerCanonical && parsed.sourceCanonicalSessionId !== parsed.runnerCanonicalSessionId) {
-		throw new ManagedOperationJournalError("corrupt", "Managed resume runner canonical session differs from its source.");
-	}
-	if (parsed.method === "resume" && ["runner-ready", "accepted", "terminal"].includes(parsed.state) && !hasLeaseDigest) {
-		throw new ManagedOperationJournalError("corrupt", "Managed resume runner lease correlation is missing.");
-	}
-	if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasLeaseDigest) {
-		throw new ManagedOperationJournalError("corrupt", "Managed resume runner lease correlation is premature.");
-	}
-	if (parsed.updatedAt < parsed.createdAt) {
-		throw new ManagedOperationJournalError("corrupt", "Managed operation chronology is invalid.");
-	}
-	const runRequired = ["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(parsed.state);
-	const runForbidden = ["claimed", "prepared", "failed-before-launch"].includes(parsed.state);
-	if ((runRequired && !parsed.runId) || (runForbidden && parsed.runId)) {
-		throw new ManagedOperationJournalError("corrupt", "Managed run identity is inconsistent with the operation state.");
-	}
-	const hasRunnerInstance = parsed.runnerProcessInstanceId !== undefined;
-	const hasAdmissionToken = parsed.runnerAdmissionTokenDigest !== undefined;
-	if (hasRunnerInstance !== hasAdmissionToken) {
-		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is incomplete.");
-	}
-	if (["runner-ready", "accepted", "terminal"].includes(parsed.state) && !hasRunnerInstance) {
-		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is missing.");
-	}
-	if (["claimed", "prepared", "dispatching", "failed-before-launch"].includes(parsed.state) && hasRunnerInstance) {
-		throw new ManagedOperationJournalError("corrupt", "Managed runner admission correlation is premature.");
-	}
-	const pathsRequired = ["dispatching", "runner-ready", "accepted", "terminal", "uncertain", "reconciling"].includes(parsed.state);
-	const pathsForbidden = ["claimed", "prepared", "failed-before-launch"].includes(parsed.state);
-	const hasBothPaths = parsed.terminalAsyncDir !== undefined && parsed.canonicalSessionFile !== undefined;
-	if ((pathsRequired && !hasBothPaths) || (pathsForbidden && (parsed.terminalAsyncDir !== undefined || parsed.canonicalSessionFile !== undefined))) {
-		throw new ManagedOperationJournalError("corrupt", "Managed terminal recovery paths are inconsistent with the operation state.");
-	}
-	if ((parsed.state === "terminal") !== (parsed.terminalEvidence !== undefined)) {
-		throw new ManagedOperationJournalError("corrupt", "Managed terminal evidence is inconsistent with the operation state.");
-	}
+	if (parsed.updatedAt < parsed.createdAt) throw new ManagedOperationJournalError("corrupt", "Managed operation chronology is invalid.");
 	return Object.freeze(parsed);
 }
 
@@ -619,6 +670,11 @@ export class ManagedOperationJournal {
 				state: "claimed",
 				...(expectedLaunch ? { expectedLaunch } : {}),
 				...(parsedRequest.method === "resume" ? { sourceRunId: parsedRequest.input.sourceRunId } : {}),
+				...(parsedRequest.method !== "spawn" && parsedRequest.method !== "resume"
+					? ("operationId" in parsedRequest.input.target
+						? { targetOperationId: parsedRequest.input.target.operationId }
+						: { targetRunId: parsedRequest.input.target.runId })
+					: {}),
 				createdAt: timestamp,
 				updatedAt: timestamp,
 			};
@@ -658,6 +714,108 @@ export class ManagedOperationJournal {
 			throw new ManagedOperationJournalError("operation_conflict", "Managed operation identity is already bound to different semantics.");
 		}
 		return { created: false, replayed: true, record: existing };
+	}
+
+	#updateControlCommand(
+		parentSessionIdentityDigest: string,
+		consumerIdInput: string,
+		operationIdInput: string,
+		requestDigestInput: string,
+		nextState: ManagedOperationJournalStateV1,
+		patch: Partial<Pick<ManagedOperationJournalRecordV1,
+			"actorOperationId" | "actorRequestDigest" | "actorRunId" | "controlRequestPath" | "controlAckPath" | "controlOutcome" | "retirementAcknowledgedUncertain">>,
+	): Readonly<ManagedOperationJournalRecordV1> {
+		this.#assertOpen();
+		const sessionDigest = assertDigest(parentSessionIdentityDigest, "Managed parent-session identity digest");
+		const consumerId = assertManagedConsumerId(consumerIdInput);
+		const operationId = assertManagedOperationId(operationIdInput);
+		const requestDigest = assertDigest(requestDigestInput, "Managed request digest");
+		const directory = this.#existingOperationDirectory(sessionDigest, consumerId, operationId);
+		if (!directory) throw new ManagedOperationJournalError("not_found", "Managed command was not found.");
+		const existing = this.#readOperationRecord(directory, sessionDigest, consumerId, operationId);
+		if (existing.method === "spawn" || existing.method === "resume") throw new ManagedOperationJournalError("invalid_state", "Managed launch is not a command record.");
+		if (existing.requestDigest !== requestDigest) throw new ManagedOperationJournalError("operation_conflict", "Managed request digest does not match the durable command.");
+		for (const key of ["actorOperationId", "actorRequestDigest", "actorRunId", "controlRequestPath", "controlAckPath", "retirementAcknowledgedUncertain"] as const) {
+			if (existing[key] !== undefined && patch[key] !== undefined && existing[key] !== patch[key]) {
+				throw new ManagedOperationJournalError("operation_conflict", `Managed command ${key} is immutable.`);
+			}
+		}
+		if (existing.state === nextState) return existing;
+		if (!TRANSITIONS[existing.state].has(nextState)) throw new ManagedOperationJournalError("invalid_state", `Managed command cannot transition from ${existing.state} to ${nextState}.`);
+		const updated = parseRecord({ ...existing, ...patch, state: nextState, updatedAt: Math.max(existing.updatedAt, this.#now()) });
+		writeJsonDurable(path.join(directory, RECORD_FILE), updated);
+		return updated;
+	}
+
+	prepareControl(
+		parentSessionIdentityDigest: string,
+		consumerId: string,
+		operationId: string,
+		requestDigest: string,
+		actor: { operationId: string; requestDigest: string; runId?: string },
+		options: { acknowledgeUncertain?: boolean } = {},
+	): Readonly<ManagedOperationJournalRecordV1> {
+		return this.#updateControlCommand(parentSessionIdentityDigest, consumerId, operationId, requestDigest, "prepared", {
+			actorOperationId: assertManagedOperationId(actor.operationId),
+			actorRequestDigest: assertDigest(actor.requestDigest, "Managed actor request digest"),
+			...(actor.runId !== undefined ? { actorRunId: assertRunId(actor.runId, "Managed actor run id") } : {}),
+			...(options.acknowledgeUncertain ? { retirementAcknowledgedUncertain: true as const } : {}),
+		});
+	}
+
+	beginControlDispatch(parent: string, consumer: string, operation: string, digest: string, paths: { requestPath: string; ackPath: string }): Readonly<ManagedOperationJournalRecordV1> {
+		return this.#updateControlCommand(parent, consumer, operation, digest, "dispatching", {
+			controlRequestPath: assertAbsolutePath(paths.requestPath, "Managed control request path"),
+			controlAckPath: assertAbsolutePath(paths.ackPath, "Managed control ack path"),
+		});
+	}
+
+	acceptControl(parent: string, consumer: string, operation: string, digest: string): Readonly<ManagedOperationJournalRecordV1> {
+		return this.#updateControlCommand(parent, consumer, operation, digest, "accepted", {});
+	}
+
+	completeControl(parent: string, consumer: string, operation: string, digest: string, outcome: "acknowledged" | "failed"): Readonly<ManagedOperationJournalRecordV1> {
+		return this.#updateControlCommand(parent, consumer, operation, digest, "terminal", { controlOutcome: outcome });
+	}
+
+	markControlUncertain(parent: string, consumer: string, operation: string, digest: string): Readonly<ManagedOperationJournalRecordV1> {
+		return this.#updateControlCommand(parent, consumer, operation, digest, "uncertain", { controlOutcome: "unknown" });
+	}
+
+	completeRetirement(
+		parentSessionIdentityDigest: string,
+		consumerIdInput: string,
+		commandOperationIdInput: string,
+		commandRequestDigest: string,
+	): { command: Readonly<ManagedOperationJournalRecordV1>; actor: Readonly<ManagedOperationJournalRecordV1> } {
+		const parent = assertDigest(parentSessionIdentityDigest, "Managed parent-session identity digest");
+		const consumer = assertManagedConsumerId(consumerIdInput);
+		const commandId = assertManagedOperationId(commandOperationIdInput);
+		const command = this.read(parent, consumer, commandId);
+		if (!command || command.method !== "retire" || command.requestDigest !== commandRequestDigest || command.state !== "prepared"
+			|| !command.actorOperationId || !command.actorRequestDigest) {
+			throw new ManagedOperationJournalError("invalid_state", "Managed retirement intent is incomplete.");
+		}
+		const actorDirectory = this.#existingOperationDirectory(parent, consumer, command.actorOperationId);
+		if (!actorDirectory) throw new ManagedOperationJournalError("not_found", "Managed retirement actor was not found.");
+		let actor = this.#readOperationRecord(actorDirectory, parent, consumer, command.actorOperationId);
+		if ((actor.method !== "spawn" && actor.method !== "resume") || actor.requestDigest !== command.actorRequestDigest || actor.runId !== command.actorRunId) {
+			throw new ManagedOperationJournalError("operation_conflict", "Managed retirement actor authority changed.");
+		}
+		if (actor.state === "retired") {
+			if (actor.retiredByOperationId !== commandId) throw new ManagedOperationJournalError("retired", "Managed actor was retired by another command.");
+		} else {
+			if (actor.state === "uncertain" && !command.retirementAcknowledgedUncertain) {
+				throw new ManagedOperationJournalError("operation_uncertain", "Managed uncertain retirement requires explicit acknowledgment.");
+			}
+			if (actor.state !== "terminal" && actor.state !== "failed-before-launch" && actor.state !== "uncertain") {
+				throw new ManagedOperationJournalError("invalid_state", "Active managed actors cannot be retired.");
+			}
+			actor = parseRecord({ ...actor, state: "retired", retiredByOperationId: commandId, updatedAt: Math.max(actor.updatedAt, this.#now()) });
+			writeJsonDurable(path.join(actorDirectory, RECORD_FILE), actor);
+		}
+		const completed = this.#updateControlCommand(parent, consumer, commandId, commandRequestDigest, "terminal", {});
+		return { command: completed, actor };
 	}
 
 	transition(
@@ -701,6 +859,9 @@ export class ManagedOperationJournal {
 			throw error;
 		}
 		if (existing.requestDigest !== requestDigest) throw new ManagedOperationJournalError("operation_conflict", "Managed request digest does not match the durable operation.");
+		if (existing.method !== "spawn" && existing.method !== "resume") {
+			throw new ManagedOperationJournalError("invalid_state", "Managed commands require method-aware command transitions.");
+		}
 		const patchedRunId = patch.runId !== undefined ? assertRunId(patch.runId, "Managed run id") : undefined;
 		const patchedSourceRunId = patch.sourceRunId !== undefined ? assertRunId(patch.sourceRunId, "Managed source run id") : undefined;
 		const patchedSourceOperationId = patch.sourceOperationId !== undefined ? assertManagedOperationId(patch.sourceOperationId) : undefined;

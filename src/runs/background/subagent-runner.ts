@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, enqueueStepSteer, steerAcksDir, steerCapabilityPath, stepSteerInboxDir, watchAsyncControlInbox, type SteerAck, type SteerCapability, type SteerRequest } from "./control-channel.ts";
+import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, enqueueStepSteer, steerAcksDir, steerCapabilityPath, stepSteerInboxDir, watchAsyncControlInbox, type ManagedControlRequest, type SteerAck, type SteerCapability, type SteerRequest } from "./control-channel.ts";
 import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, injectSingleOutputInstruction, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -2194,12 +2194,13 @@ async function runSubagent(
 	};
 	const recordSteeringLifecycle = (request: SteerRequest, targets: Array<{ index: number; state: SteeringTargetState; reason?: string }>): void => {
 		const lifecycle = steeringStatus(statusPayload);
-		recordSteeringRequest(lifecycle, { id: request.id, requestedAt: request.ts, source: request.source, message: request.message, targets });
+		const observableMessage = request.source === "managed-v1" ? "[managed steer command]" : request.message;
+		recordSteeringRequest(lifecycle, { id: request.id, requestedAt: request.ts, source: request.source, message: observableMessage, targets });
 		for (const target of targets) {
 			const step = statusPayload.steps[target.index];
 			if (!step) continue;
 			step.steering ??= createSteeringStatus();
-			recordSteeringRequest(step.steering, { id: request.id, requestedAt: request.ts, source: request.source, message: request.message, targets: [target] });
+			recordSteeringRequest(step.steering, { id: request.id, requestedAt: request.ts, source: request.source, message: observableMessage, targets: [target] });
 		}
 	};
 	const updateSteeringLifecycleTarget = (
@@ -2729,6 +2730,24 @@ async function runSubagent(
 			}
 		},
 		onSteerAck: consumeSteerAck,
+		onManagedControl: (request: ManagedControlRequest) => {
+			if (request.runId !== id) return { outcome: "failed", reason: "managed run identity mismatch" };
+			if (request.method === "steer") {
+				if (statusPayload.state !== "running") return { outcome: "failed", reason: "managed actor is not running" };
+				deliverSteerRequest({ type: "steer", id: request.commandId, ts: request.requestedAt, message: request.message!, targetIndex: 0, source: "managed-v1" });
+				return { outcome: "acknowledged" };
+			}
+			if (request.method === "interrupt") {
+				if (statusPayload.state !== "running") return { outcome: "failed", reason: "managed actor is not running" };
+				interruptRunner();
+				return { outcome: "acknowledged" };
+			}
+			if (statusPayload.state !== "running" && statusPayload.state !== "queued") {
+				return { outcome: "failed", reason: "managed actor is not active" };
+			}
+			stopRunner();
+			return { outcome: "acknowledged" };
+		},
 	});
 	if (config.deadlineAt !== undefined) {
 		const remainingMs = Math.max(0, config.deadlineAt - Date.now());

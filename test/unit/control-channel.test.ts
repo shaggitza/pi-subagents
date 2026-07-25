@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
 	closeSteerInbox,
+	consumeManagedControlRequests,
 	consumeInterruptRequest,
 	consumeSteerAcks,
 	consumeSteerCapabilities,
@@ -13,6 +14,12 @@ import {
 	deliverInterruptRequest,
 	enqueueStepSteer,
 	interruptRequestPath,
+	inspectManagedControlTransport,
+	managedControlAckPath,
+	managedControlConsumedPath,
+	managedControlRequestPath,
+	publishManagedControlRequest,
+	readManagedControlAck,
 	requestAsyncInterrupt,
 	requestAsyncSteer,
 	requestAsyncStop,
@@ -20,6 +27,7 @@ import {
 	steerAcksDir,
 	steerInboxClosedPath,
 	steerCapabilityPath,
+	writeManagedControlAck,
 	writeSteerAck,
 	writeSteerCapability,
 	stopRequestPath,
@@ -195,6 +203,58 @@ describe("control channel: request file", () => {
 			assert.throws(() => requestAsyncSteer(asyncDir, { message: "ok", targetIndexes: "bad" as unknown as number[] }), /targetIndexes/);
 			assert.throws(() => requestAsyncSteer(asyncDir, { message: "x".repeat(128 * 1024 + 1) }), /exceeds/);
 			assert.throws(() => requestAsyncSteer(asyncDir, { message: "ok", id: "contains whitespace" }), /malformed/);
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("publishes exclusive managed sidecars and consumes a command once with a durable ack", () => {
+		const asyncDir = tmpAsyncDir("pi-control-managed-");
+		const commandId = Buffer.alloc(32, 4).toString("base64url");
+		try {
+			const requestPath = publishManagedControlRequest(asyncDir, {
+				commandId,
+				method: "steer",
+				runId: "managed-run",
+				message: "private steering text",
+				requestedAt: 100,
+			});
+			assert.equal(requestPath, managedControlRequestPath(asyncDir, commandId));
+			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "published");
+			assert.throws(() => publishManagedControlRequest(asyncDir, {
+				commandId, method: "steer", runId: "managed-run", message: "different", requestedAt: 101,
+			}), (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST");
+			const delivered: string[] = [];
+			consumeManagedControlRequests(asyncDir, (request) => {
+				delivered.push(request.message!);
+				return { outcome: "acknowledged" };
+			});
+			consumeManagedControlRequests(asyncDir, () => {
+				throw new Error("must not execute twice");
+			});
+			assert.deepEqual(delivered, ["private steering text"]);
+			assert.equal(fs.existsSync(managedControlRequestPath(asyncDir, commandId)), false);
+			assert.equal(fs.existsSync(managedControlConsumedPath(asyncDir, commandId)), true);
+			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "acknowledged");
+			assert.equal(readManagedControlAck(asyncDir, commandId)?.runId, "managed-run");
+		} finally {
+			cleanup(asyncDir);
+		}
+	});
+
+	it("fails closed after consume-before-ack and keeps acknowledgments immutable", () => {
+		const asyncDir = tmpAsyncDir("pi-control-managed-gap-");
+		const commandId = Buffer.alloc(32, 5).toString("base64url");
+		try {
+			publishManagedControlRequest(asyncDir, { commandId, method: "interrupt", runId: "managed-run", requestedAt: 100 });
+			fs.mkdirSync(path.dirname(managedControlConsumedPath(asyncDir, commandId)), { recursive: true });
+			fs.renameSync(managedControlRequestPath(asyncDir, commandId), managedControlConsumedPath(asyncDir, commandId));
+			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "consumed");
+			const ack = { version: 1 as const, commandId, method: "interrupt" as const, runId: "managed-run", acknowledgedAt: 200, outcome: "failed" as const, reason: "not active" };
+			writeManagedControlAck(asyncDir, ack);
+			assert.equal(managedControlAckPath(asyncDir, commandId), path.join(asyncDir, "control", "managed-acks", `${commandId}.json`));
+			assert.equal(inspectManagedControlTransport(asyncDir, commandId), "failed");
+			assert.throws(() => writeManagedControlAck(asyncDir, ack), (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST");
 		} finally {
 			cleanup(asyncDir);
 		}
