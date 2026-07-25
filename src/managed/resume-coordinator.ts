@@ -336,16 +336,30 @@ export class ManagedResumeCoordinator {
 	}
 
 	reconcileAfterObserverLoss(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {
+		const acceptedBeforeRecovery = record.state === "accepted";
 		const reconciled = this.#reconcile(record);
-		if (reconciled.state !== "accepted") return reconciled;
-		return this.#options.journal.transition(
-			reconciled.parentSessionIdentityDigest,
-			reconciled.consumerId,
-			reconciled.operationId,
-			reconciled.requestDigest,
-			"uncertain",
-			{ observerLost: true },
-		);
+		if (!acceptedBeforeRecovery || reconciled.state === "terminal") return reconciled;
+		if (reconciled.state === "accepted") {
+			return this.#options.journal.transition(
+				reconciled.parentSessionIdentityDigest,
+				reconciled.consumerId,
+				reconciled.operationId,
+				reconciled.requestDigest,
+				"uncertain",
+				{ observerLost: true },
+			);
+		}
+		if (reconciled.state === "uncertain" && !reconciled.observerLost) {
+			return this.#options.journal.transition(
+				reconciled.parentSessionIdentityDigest,
+				reconciled.consumerId,
+				reconciled.operationId,
+				reconciled.requestDigest,
+				"uncertain",
+				{ observerLost: true },
+			);
+		}
+		return reconciled;
 	}
 
 	#reconcile(record: Readonly<ManagedOperationJournalRecordV1>): Readonly<ManagedOperationJournalRecordV1> {

@@ -171,8 +171,16 @@ describe("unregistered managed resume coordinator", () => {
 		const reopened = coordinator(journal, { executePreparedResume: (async () => { calls.value++; return { content: [], details: { mode: "single", results: [] } }; }) as ManagedResumeExecutor["executePreparedResume"] });
 		assert.equal((await reopened.dispatchResume(resumeRequest(source.runId, runId, "reopened"))).state, "accepted");
 		assert.equal(calls.value, 1, "reopened accepted admission must not execute again");
+		const admissionPath = preparedRunnerAdmissionPaths(path.join(ASYNC_DIR, runId)).evidencePath;
+		const committedAdmission = JSON.parse(fs.readFileSync(admissionPath, "utf8")) as Record<string, unknown>;
+		fs.writeFileSync(admissionPath, JSON.stringify({ ...committedAdmission, state: "accepted" }));
 		const observerLost = reopened.reconcileAfterObserverLoss(journal.read(parentDigest, "pi-signal", resumeOperationId)!);
 		assert.equal(observerLost.state, "uncertain");
+		assert.equal(observerLost.observerLost, true, "observer loss must remain durable across a late commit");
+		fs.writeFileSync(admissionPath, JSON.stringify(committedAdmission));
+		const afterLateCommit = reopened.reconcileExisting(journal.read(parentDigest, "pi-signal", resumeOperationId)!);
+		assert.equal(afterLateCommit.state, "uncertain");
+		assert.equal(afterLateCommit.observerLost, true);
 		assert.equal(calls.value, 1, "observer-loss reconciliation must not execute again");
 		fs.writeFileSync(path.join(ASYNC_DIR, runId, "process-terminal.json"), JSON.stringify({ version: 1, state: "unknown", runId, runnerProcessInstanceId: "resume-runner", reason: "observer-unavailable" }));
 		assert.equal((await reopened.dispatchResume(resumeRequest(source.runId, runId, "unknown-1"))).state, "uncertain");

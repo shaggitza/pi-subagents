@@ -806,6 +806,15 @@ export class ManagedOperationJournal {
 			if (patchedRunId !== undefined && existing.runId === undefined) {
 				throw new ManagedOperationJournalError("invalid_state", "Managed run identity was not durably bound with the state transition.");
 			}
+			if (patchedObserverLost && !existing.observerLost) {
+				const marked = parseRecord({
+					...existing,
+					observerLost: true,
+					updatedAt: Math.max(existing.updatedAt, this.#now()),
+				});
+				writeJsonDurable(recordPath, marked);
+				return marked;
+			}
 			return existing;
 		}
 		const effectiveRunId = existing.runId ?? patchedRunId;
