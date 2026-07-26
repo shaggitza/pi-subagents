@@ -63,7 +63,7 @@ test("managed-dispatch public runtime is host-peer and UI independent", async ()
 	const entryPoint = path.join(projectRoot, "src", "api", "managed-dispatch.ts");
 	const source = fs.readFileSync(entryPoint, "utf-8");
 	const specifiers = extractStaticImportSpecifiers(source);
-	assert.deepEqual(specifiers.sort(), ["node:crypto", "node:util"]);
+	assert.deepEqual(specifiers.sort(), ["node:crypto", "node:fs", "node:path", "node:util"]);
 	assert.equal(specifiers.some((specifier) => matchingHostPeerPackage(specifier) !== undefined), false);
 
 	const api = await import("pi-subagents/managed-dispatch");

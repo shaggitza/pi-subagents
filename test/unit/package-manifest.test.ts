@@ -84,6 +84,8 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(typeof managedDispatch.createManagedOperationId, "function");
 	assert.equal(typeof managedDispatch.parseManagedReadRequestV1, "function");
 	assert.equal(typeof managedDispatch.projectManagedChildCapabilityV1, "function");
+	assert.equal(typeof managedDispatch.computeManagedExtensionSetDigest, "function");
+	assert.equal(typeof managedDispatch.parseManagedChildCapabilityV1, "function");
 });
 
 test("public fork metadata and legacy installer remain fork-owned", () => {

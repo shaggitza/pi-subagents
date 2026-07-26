@@ -490,7 +490,10 @@ export class ManagedDispatchProvider {
 				host: { version: 1, hostId: loadOrCreateManagedDispatchHostId(this.#options.hostIdPath) },
 				profile: resolved.profile,
 				profileIdentityDigest: resolved.profileIdentityDigest,
-				childCapability: projectManagedChildCapabilityV1(resolved.contract.launchContract.tools),
+				childCapability: projectManagedChildCapabilityV1(
+					resolved.contract.launchContract.tools,
+					resolved.contract.launchContract.roots.cwd,
+				),
 				parentSessionIdentityDigest: resolved.contract.parentSessionIdentityDigest,
 				candidateRunId,
 				contractDigest: resolved.contract.digest,

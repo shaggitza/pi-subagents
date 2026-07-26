@@ -40,9 +40,15 @@ test("plain Node imports managed-dispatch from a packed dependency install", () 
 			"--input-type=module",
 			"--eval",
 			[
+				'import { writeFileSync } from "node:fs";',
 				'import * as api from "pi-subagents/managed-dispatch";',
 				'if (api.SUBAGENT_MANAGED_DISPATCH_VERSION !== 1) throw new Error("wrong version");',
 				'if (typeof api.computeManagedRequestDigest !== "function") throw new Error("missing runtime export");',
+				'if (typeof api.computeManagedExtensionSetDigest !== "function") throw new Error("missing extension digest export");',
+				'if (typeof api.parseManagedChildCapabilityV1 !== "function") throw new Error("missing capability parser export");',
+				'if (api.computeManagedExtensionSetDigest([]) !== null) throw new Error("wrong empty extension digest");',
+				'writeFileSync("shipped-bridge.js", "export default function bridge() {}\\n");',
+				'if (!/^[a-f0-9]{64}$/.test(api.computeManagedExtensionSetDigest(["shipped-bridge.js"]))) throw new Error("wrong extension digest");',
 				'console.log(import.meta.resolve("pi-subagents/managed-dispatch"));',
 			].join("\n"),
 		], consumer);

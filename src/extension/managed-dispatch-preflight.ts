@@ -333,7 +333,7 @@ export async function performManagedSpawnPreflightV1(
 			},
 			profile: resolved.profile,
 			profileIdentityDigest: resolved.profileIdentityDigest,
-			childCapability: projectManagedChildCapabilityV1(resolved.contract.tools),
+			childCapability: projectManagedChildCapabilityV1(resolved.contract.tools, resolved.contract.roots.cwd),
 			parentSessionIdentityDigest: resolved.contract.parentSessionIdentityDigest,
 			candidateRunId,
 			contractDigest: resolved.contract.digest,

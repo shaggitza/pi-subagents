@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT,
+	computeManagedExtensionSetDigest,
 	managedDispatchReplyEvent,
 	type JsonObject,
 	type ManagedPreflightReplyV1,
@@ -40,6 +41,8 @@ let temporary = "";
 
 beforeEach(() => {
 	temporary = fs.mkdtempSync(path.join(os.tmpdir(), "managed-preflight-"));
+	fs.writeFileSync(path.join(temporary, "private-runtime-extension.ts"), "export const runtime = true;\n");
+	fs.writeFileSync(path.join(temporary, "private-configured-extension.ts"), "export const configured = true;\n");
 });
 
 afterEach(() => {
@@ -128,8 +131,8 @@ function contract(input: SubagentLaunchContractInput): SubagentLaunchContract {
 			mcp: [],
 			effectiveMcpTools: [],
 			toolExtensionPaths: [],
-			runtimeExtensions: [],
-			configuredExtensions: [],
+			runtimeExtensions: ["private-runtime-extension.ts"],
+			configuredExtensions: ["private-configured-extension.ts"],
 			extensionArgs: [],
 			disableAmbientExtensions: true,
 			fanoutAuthorized: false,
@@ -234,8 +237,10 @@ describe("managed dispatch preflight bridge", () => {
 		assert.deepEqual(result.ok && result.childCapability, {
 			version: 1,
 			effectiveToolCount: 1,
-			runtimeExtensionCount: 0,
-			configuredExtensionCount: 0,
+			runtimeExtensionCount: 1,
+			configuredExtensionCount: 1,
+			configuredExtensionSetDigest: computeManagedExtensionSetDigest(["private-configured-extension.ts"], temporary),
+			runtimeExtensionSetDigest: computeManagedExtensionSetDigest(["private-runtime-extension.ts"], temporary),
 			disableAmbientExtensions: true,
 			fanoutAuthorized: false,
 		});

@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, computeManagedRequestDigest, managedDispatchReplyEvent } from "../../src/api/managed-dispatch.ts";
+import { SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT, computeManagedExtensionSetDigest, computeManagedRequestDigest, managedDispatchReplyEvent } from "../../src/api/managed-dispatch.ts";
 import { computeParentSessionIdentityDigest, type SubagentLaunchContract } from "../../src/api/preflight.ts";
 import { ManagedDispatchProvider } from "../../src/extension/managed-dispatch-provider.ts";
 import { ManagedOperationJournal } from "../../src/managed/operation-journal.ts";
@@ -27,6 +27,8 @@ let generation = 1;
 
 beforeEach(() => {
 	temporary = fs.mkdtempSync(path.join(os.tmpdir(), "managed-provider-"));
+	fs.writeFileSync(path.join(temporary, "private-runtime-extension.ts"), "export const runtime = true;\n");
+	fs.writeFileSync(path.join(temporary, "private-configured-extension.ts"), "export const configured = true;\n");
 	generation = 1;
 });
 
@@ -109,7 +111,7 @@ function resolved(runId: string, payload: Record<string, unknown>) {
 		inheritProjectContext: false,
 		inheritSkills: false,
 		skills: { requested: [], resolved: [], missing: [] },
-		tools: { requestedBuiltin: [], declaredBuiltin: [], effectiveAllowlist: [], explicitAllowlist: true, requiredChildTools: [], internalTools: [], mcp: [], effectiveMcpTools: [], toolExtensionPaths: [], runtimeExtensions: [], configuredExtensions: [], extensionArgs: [], disableAmbientExtensions: true, fanoutAuthorized: false },
+		tools: { requestedBuiltin: [], declaredBuiltin: [], effectiveAllowlist: [], explicitAllowlist: true, requiredChildTools: [], internalTools: [], mcp: [], effectiveMcpTools: [], toolExtensionPaths: [], runtimeExtensions: ["private-runtime-extension.ts"], configuredExtensions: ["private-configured-extension.ts"], extensionArgs: [], disableAmbientExtensions: true, fanoutAuthorized: false },
 		roots: {
 			cwd: temporary,
 			sessionRoot,
@@ -304,7 +306,7 @@ function resolvedResume(runId: string, source: Readonly<ManagedResumeSourceV1>):
 		inheritProjectContext: false,
 		inheritSkills: false,
 		skills: { requested: [], resolved: [], missing: [] },
-		tools: { requestedBuiltin: [], declaredBuiltin: [], effectiveAllowlist: [], explicitAllowlist: true, requiredChildTools: [], internalTools: [], mcp: [], effectiveMcpTools: [], toolExtensionPaths: [], runtimeExtensions: [], configuredExtensions: [], extensionArgs: [], disableAmbientExtensions: true, fanoutAuthorized: false },
+		tools: { requestedBuiltin: [], declaredBuiltin: [], effectiveAllowlist: [], explicitAllowlist: true, requiredChildTools: [], internalTools: [], mcp: [], effectiveMcpTools: [], toolExtensionPaths: [], runtimeExtensions: ["private-runtime-extension.ts"], configuredExtensions: ["private-configured-extension.ts"], extensionArgs: [], disableAmbientExtensions: true, fanoutAuthorized: false },
 		roots: {
 			cwd: temporary,
 			sessionRoot: path.dirname(path.dirname(source.canonicalSessionFile)),
@@ -383,12 +385,14 @@ describe("managed dispatch provider", () => {
 		assert.deepEqual(preflight.childCapability, {
 			version: 1,
 			effectiveToolCount: 0,
-			runtimeExtensionCount: 0,
-			configuredExtensionCount: 0,
+			runtimeExtensionCount: 1,
+			configuredExtensionCount: 1,
+			configuredExtensionSetDigest: computeManagedExtensionSetDigest(["private-configured-extension.ts"], temporary),
+			runtimeExtensionSetDigest: computeManagedExtensionSetDigest(["private-runtime-extension.ts"], temporary),
 			disableAmbientExtensions: true,
 			fanoutAuthorized: false,
 		});
-		assert.deepEqual(Object.keys(preflight.childCapability), ["version", "effectiveToolCount", "runtimeExtensionCount", "configuredExtensionCount", "disableAmbientExtensions", "fanoutAuthorized"]);
+		assert.deepEqual(Object.keys(preflight.childCapability), ["version", "effectiveToolCount", "runtimeExtensionCount", "configuredExtensionCount", "configuredExtensionSetDigest", "runtimeExtensionSetDigest", "disableAmbientExtensions", "fanoutAuthorized"]);
 		assert.doesNotMatch(JSON.stringify(preflight.childCapability), /opaque|worker|session-provider|pi-signal|path|prompt|task/i);
 		assert.equal(preflightReplies, 1, "the consolidated provider must be the only preflight responder");
 		const invalid = await bus.request({ version: 1, requestId: "cap-invalid", method: "capabilities", extra: true }) as any;
@@ -591,12 +595,14 @@ describe("managed dispatch provider", () => {
 		assert.deepEqual(preflight.childCapability, {
 			version: 1,
 			effectiveToolCount: 0,
-			runtimeExtensionCount: 0,
-			configuredExtensionCount: 0,
+			runtimeExtensionCount: 1,
+			configuredExtensionCount: 1,
+			configuredExtensionSetDigest: computeManagedExtensionSetDigest(["private-configured-extension.ts"], temporary),
+			runtimeExtensionSetDigest: computeManagedExtensionSetDigest(["private-runtime-extension.ts"], temporary),
 			disableAmbientExtensions: true,
 			fanoutAuthorized: false,
 		});
-		assert.deepEqual(Object.keys(preflight.childCapability), ["version", "effectiveToolCount", "runtimeExtensionCount", "configuredExtensionCount", "disableAmbientExtensions", "fanoutAuthorized"]);
+		assert.deepEqual(Object.keys(preflight.childCapability), ["version", "effectiveToolCount", "runtimeExtensionCount", "configuredExtensionCount", "configuredExtensionSetDigest", "runtimeExtensionSetDigest", "disableAmbientExtensions", "fanoutAuthorized"]);
 		assert.doesNotMatch(JSON.stringify(preflight.childCapability), /continue|worker|provider-source|pi-signal|path|prompt|task/i);
 		const resume = {
 			version: 1,

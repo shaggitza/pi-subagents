@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
 	MANAGED_CONSUMER_ID_MAX_LENGTH,
@@ -13,11 +16,13 @@ import {
 	assertManagedOperationId,
 	assertManagedResumeExecutorRequestV1,
 	canonicalizeManagedJson,
+	computeManagedExtensionSetDigest,
 	computeManagedProfileContentDigest,
 	computeManagedProfileIdentityDigest,
 	computeManagedRequestDigest,
 	createManagedOperationId,
 	managedDispatchReplyEvent,
+	parseManagedChildCapabilityV1,
 	parseManagedMutationRequestV1,
 	parseManagedPreflightRequestV1,
 	parseManagedReadRequestV1,
@@ -348,41 +353,113 @@ describe("managed-dispatch public protocol foundation", () => {
 		assert.throws(() => computeManagedProfileIdentityDigest({ ...identityA, root: { ...identityA.root, realPath: "/repo\nother" } }));
 	});
 
-	it("projects an exact bounded child capability without private launch material", () => {
-		const childCapability = projectManagedChildCapabilityV1({
-			requestedBuiltin: ["private-requested-tool"],
-			declaredBuiltin: ["read", "shared-name"],
-			effectiveAllowlist: ["read", "shared-name", "private-mcp-tool", "structured_output"],
-			explicitAllowlist: true,
-			requiredChildTools: ["read"],
-			internalTools: ["structured_output"],
-			mcp: [],
-			effectiveMcpTools: ["private-mcp-tool", "shared-name"],
-			toolExtensionPaths: ["/private/tool-extension.ts"],
-			runtimeExtensions: ["/private/runtime-a.ts", "/private/runtime-b.ts"],
-			configuredExtensions: ["/private/configured.ts"],
-			extensionArgs: ["--extension", "/private/configured.ts"],
-			disableAmbientExtensions: true,
-			fanoutAuthorized: false,
-		});
-		assert.deepEqual(childCapability, {
-			version: 1,
-			effectiveToolCount: 3,
-			runtimeExtensionCount: 2,
-			configuredExtensionCount: 1,
-			disableAmbientExtensions: true,
-			fanoutAuthorized: false,
-		});
-		assert.equal(Object.isFrozen(childCapability), true);
-		assert.deepEqual(Object.keys(childCapability), [
-			"version",
-			"effectiveToolCount",
-			"runtimeExtensionCount",
-			"configuredExtensionCount",
-			"disableAmbientExtensions",
-			"fanoutAuthorized",
-		]);
-		assert.doesNotMatch(JSON.stringify(childCapability), /private|read|shared|structured|extension\.ts/);
+	it("hashes bounded no-follow extension content as an order-independent domain-separated set", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-extension-set-"));
+		try {
+			const first = path.join(root, "private-bridge.ts");
+			const second = path.join(root, "private-support.ts");
+			fs.writeFileSync(first, "export const bridge = 1;\n");
+			fs.writeFileSync(second, "export const support = 2;\n");
+			const digest = computeManagedExtensionSetDigest([first, second]);
+			assert.match(digest ?? "", /^[a-f0-9]{64}$/);
+			assert.equal(computeManagedExtensionSetDigest([second, first]), digest);
+			assert.equal(computeManagedExtensionSetDigest(["private-bridge.ts", "private-support.ts"], root), digest);
+			assert.equal(computeManagedExtensionSetDigest([]), null);
+			assert.notEqual(computeManagedExtensionSetDigest([first]), digest);
+			fs.writeFileSync(second, "export const support = 3;\n");
+			assert.notEqual(computeManagedExtensionSetDigest([first, second]), digest);
+			const symlink = path.join(root, "bridge-link.ts");
+			fs.symlinkSync(first, symlink);
+			assert.throws(() => computeManagedExtensionSetDigest([symlink]), /no-follow regular file|safely attested/);
+			assert.throws(() => computeManagedExtensionSetDigest([root]), /no-follow regular file/);
+			const oversized = path.join(root, "oversized.ts");
+			fs.writeFileSync(oversized, "");
+			fs.truncateSync(oversized, 16 * 1024 * 1024 + 1);
+			assert.throws(() => computeManagedExtensionSetDigest([oversized]), /byte limit/);
+			assert.throws(() => computeManagedExtensionSetDigest(new Array(129).fill(first)), /file-count limit/);
+			assert.throws(() => computeManagedExtensionSetDigest(Object.assign([first], { privateName: true }) as never), /custom fields/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("projects and strictly parses exact bounded child capability without private launch material", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-child-capability-"));
+		try {
+			for (const [name, content] of [["runtime-a.ts", "runtime a"], ["runtime-b.ts", "runtime b"], ["configured.ts", "configured"]]) {
+				fs.writeFileSync(path.join(root, name), content);
+			}
+			const childCapability = projectManagedChildCapabilityV1({
+				requestedBuiltin: ["private-requested-tool"],
+				declaredBuiltin: ["read", "shared-name"],
+				effectiveAllowlist: ["read", "shared-name", "private-mcp-tool", "structured_output"],
+				explicitAllowlist: true,
+				requiredChildTools: ["read"],
+				internalTools: ["structured_output"],
+				mcp: [],
+				effectiveMcpTools: ["private-mcp-tool", "shared-name"],
+				toolExtensionPaths: ["private-tool-extension.ts"],
+				runtimeExtensions: ["runtime-a.ts", "runtime-b.ts"],
+				configuredExtensions: ["configured.ts"],
+				extensionArgs: ["--extension", "configured.ts"],
+				disableAmbientExtensions: true,
+				fanoutAuthorized: false,
+			}, root);
+			assert.deepEqual(childCapability, {
+				version: 1,
+				effectiveToolCount: 3,
+				runtimeExtensionCount: 2,
+				configuredExtensionCount: 1,
+				configuredExtensionSetDigest: computeManagedExtensionSetDigest(["configured.ts"], root),
+				runtimeExtensionSetDigest: computeManagedExtensionSetDigest(["runtime-b.ts", "runtime-a.ts"], root),
+				disableAmbientExtensions: true,
+				fanoutAuthorized: false,
+			});
+			assert.equal(Object.isFrozen(childCapability), true);
+			const parsedCapability = parseManagedChildCapabilityV1({ ...childCapability });
+			assert.notEqual(parsedCapability, childCapability);
+			assert.deepEqual(parsedCapability, childCapability);
+			assert.deepEqual(Object.keys(childCapability), [
+				"version",
+				"effectiveToolCount",
+				"runtimeExtensionCount",
+				"configuredExtensionCount",
+				"configuredExtensionSetDigest",
+				"runtimeExtensionSetDigest",
+				"disableAmbientExtensions",
+				"fanoutAuthorized",
+			]);
+			assert.doesNotMatch(JSON.stringify(childCapability), /private|read|shared|structured|extension\.ts/);
+			for (const invalid of [
+				{ ...childCapability, extra: true },
+				{ ...childCapability, configuredExtensionSetDigest: "A".repeat(64) },
+				{ ...childCapability, runtimeExtensionSetDigest: null },
+				{ ...childCapability, configuredExtensionCount: 0 },
+				{ ...childCapability, effectiveToolCount: -1 },
+				{ ...childCapability, fanoutAuthorized: 0 },
+			]) assert.throws(() => parseManagedChildCapabilityV1(invalid));
+			assert.deepEqual(parseManagedChildCapabilityV1({
+				version: 1,
+				effectiveToolCount: 0,
+				runtimeExtensionCount: 0,
+				configuredExtensionCount: 0,
+				configuredExtensionSetDigest: null,
+				runtimeExtensionSetDigest: null,
+				disableAmbientExtensions: true,
+				fanoutAuthorized: false,
+			}), {
+				version: 1,
+				effectiveToolCount: 0,
+				runtimeExtensionCount: 0,
+				configuredExtensionCount: 0,
+				configuredExtensionSetDigest: null,
+				runtimeExtensionSetDigest: null,
+				disableAmbientExtensions: true,
+				fanoutAuthorized: false,
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("exports preflight-to-launch binding vocabulary", () => {
@@ -399,7 +476,7 @@ describe("managed-dispatch public protocol foundation", () => {
 			host: { version: 1, hostId: "host-1" },
 			profile: { version: 1, contentDigest: "c".repeat(64), root: { version: 1, realPath: "/repo" } },
 			profileIdentityDigest: "a".repeat(64),
-			childCapability: { version: 1, effectiveToolCount: 0, runtimeExtensionCount: 1, configuredExtensionCount: 0, disableAmbientExtensions: true, fanoutAuthorized: false },
+			childCapability: { version: 1, effectiveToolCount: 0, runtimeExtensionCount: 1, configuredExtensionCount: 0, configuredExtensionSetDigest: null, runtimeExtensionSetDigest: "f".repeat(64), disableAmbientExtensions: true, fanoutAuthorized: false },
 			parentSessionIdentityDigest: "e".repeat(64),
 			candidateRunId: "candidate-1",
 			contractDigest: "b".repeat(64),
@@ -582,6 +659,35 @@ describe("managed-dispatch public protocol foundation", () => {
 			undefined,
 		);
 		assert.deepEqual(publicApi.SUBAGENT_MANAGED_DISPATCH_REQUIREMENTS_V1, SUBAGENT_MANAGED_DISPATCH_REQUIREMENTS_V1);
+		assert.equal(typeof publicApi.computeManagedExtensionSetDigest, "function");
+		assert.equal(typeof publicApi.parseManagedChildCapabilityV1, "function");
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "managed-runtime-companion-"));
+		try {
+			const bridge = path.join(root, "bridge.js");
+			fs.writeFileSync(bridge, "export default function bridge() {}\n");
+			assert.equal(publicApi.computeManagedExtensionSetDigest([bridge]), computeManagedExtensionSetDigest([bridge]));
+			assert.deepEqual(publicApi.parseManagedChildCapabilityV1({
+				version: 1,
+				effectiveToolCount: 0,
+				runtimeExtensionCount: 0,
+				configuredExtensionCount: 1,
+				configuredExtensionSetDigest: computeManagedExtensionSetDigest([bridge]),
+				runtimeExtensionSetDigest: null,
+				disableAmbientExtensions: true,
+				fanoutAuthorized: false,
+			}), {
+				version: 1,
+				effectiveToolCount: 0,
+				runtimeExtensionCount: 0,
+				configuredExtensionCount: 1,
+				configuredExtensionSetDigest: computeManagedExtensionSetDigest([bridge]),
+				runtimeExtensionSetDigest: null,
+				disableAmbientExtensions: true,
+				fanoutAuthorized: false,
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 		assert.equal(publicApi.computeManagedRequestDigest(spawnRequest()), computeManagedRequestDigest(spawnRequest()));
 	});
 });

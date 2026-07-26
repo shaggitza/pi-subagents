@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { types as utilTypes } from "node:util";
 import type { SubagentLaunchContractTools } from "./preflight.ts";
 
@@ -116,13 +118,106 @@ export interface ManagedChildCapabilityV1 {
 	readonly effectiveToolCount: number;
 	readonly runtimeExtensionCount: number;
 	readonly configuredExtensionCount: number;
+	readonly configuredExtensionSetDigest: string | null;
+	readonly runtimeExtensionSetDigest: string | null;
 	readonly disableAmbientExtensions: boolean;
 	readonly fanoutAuthorized: boolean;
 }
 
-/** Projects counts and booleans only; tool/extension names and paths never cross this boundary. */
+const MANAGED_EXTENSION_SET_MAX_FILES = 128;
+const MANAGED_EXTENSION_FILE_MAX_BYTES = 16 * 1024 * 1024;
+const MANAGED_EXTENSION_SET_MAX_BYTES = 64 * 1024 * 1024;
+const EXTENSION_CONTENT_DOMAIN = "pi-subagents/managed-dispatch/v1/extension-content";
+const EXTENSION_SET_DOMAIN = "pi-subagents/managed-dispatch/v1/extension-set";
+
+function hashManagedExtensionFile(filePath: string, maxBytes: number): { digest: string; bytes: number } {
+	const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+	let descriptor: number | undefined;
+	try {
+		const pathStats = fs.lstatSync(filePath, { bigint: true });
+		if (!pathStats.isFile()) throw new TypeError("Managed extension path must identify a no-follow regular file.");
+		descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+		const initial = fs.fstatSync(descriptor, { bigint: true });
+		if (!initial.isFile() || initial.dev !== pathStats.dev || initial.ino !== pathStats.ino
+			|| initial.size < 0n || initial.size > BigInt(Math.min(MANAGED_EXTENSION_FILE_MAX_BYTES, maxBytes))) {
+			throw new TypeError("Managed extension file is unavailable, replaced, or exceeds the per-file byte limit.");
+		}
+		const expectedBytes = Number(initial.size);
+		const digest = createHash("sha256").update(EXTENSION_CONTENT_DOMAIN, "utf8").update("\0", "utf8");
+		const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, expectedBytes)));
+		let bytes = 0;
+		while (bytes < expectedBytes) {
+			const bytesRead = fs.readSync(descriptor, buffer, 0, Math.min(buffer.length, expectedBytes - bytes), null);
+			if (bytesRead === 0) throw new TypeError("Managed extension file changed while it was being attested.");
+			digest.update(buffer.subarray(0, bytesRead));
+			bytes += bytesRead;
+		}
+		if (fs.readSync(descriptor, buffer, 0, 1, null) !== 0) {
+			throw new TypeError("Managed extension file changed while it was being attested.");
+		}
+		const final = fs.fstatSync(descriptor, { bigint: true });
+		if (!final.isFile() || final.dev !== initial.dev || final.ino !== initial.ino || final.size !== initial.size
+			|| final.mtimeNs !== initial.mtimeNs || final.ctimeNs !== initial.ctimeNs) {
+			throw new TypeError("Managed extension file changed while it was being attested.");
+		}
+		return { digest: digest.digest("hex"), bytes };
+	} catch (error) {
+		if (error instanceof TypeError) throw error;
+		throw new TypeError("Managed extension file cannot be safely attested.");
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+}
+
+/**
+ * Computes the privacy-safe digest used by managed child capability preflight.
+ * Paths are resolved against `cwd`, opened no-follow, and hashed only when they
+ * are bounded regular files. Empty extension sets deliberately project as null.
+ */
+export function computeManagedExtensionSetDigest(
+	extensionFilePaths: readonly string[],
+	cwd: string = process.cwd(),
+): string | null {
+	if (!Array.isArray(extensionFilePaths) || utilTypes.isProxy(extensionFilePaths)
+		|| Object.getPrototypeOf(extensionFilePaths) !== Array.prototype) {
+		throw new TypeError("Managed extension paths must be a plain array.");
+	}
+	const ownKeys = Reflect.ownKeys(extensionFilePaths);
+	if (ownKeys.some((key) => typeof key === "symbol" || (key !== "length" && !/^(0|[1-9][0-9]*)$/.test(key)))) {
+		throw new TypeError("Managed extension paths must not contain custom fields.");
+	}
+	if (extensionFilePaths.length === 0) return null;
+	if (extensionFilePaths.length > MANAGED_EXTENSION_SET_MAX_FILES) {
+		throw new TypeError("Managed extension set exceeds the file-count limit.");
+	}
+	if (typeof cwd !== "string" || !path.isAbsolute(cwd) || path.resolve(cwd) !== cwd) {
+		throw new TypeError("Managed extension cwd must be an absolute normalized path.");
+	}
+	const digests: string[] = [];
+	let totalBytes = 0;
+	for (let index = 0; index < extensionFilePaths.length; index++) {
+		const descriptor = Object.getOwnPropertyDescriptor(extensionFilePaths, String(index));
+		if (!descriptor?.enumerable || !("value" in descriptor) || typeof descriptor.value !== "string"
+			|| descriptor.value.length === 0 || descriptor.value.includes("\0")) {
+			throw new TypeError("Managed extension paths must contain non-empty string data entries.");
+		}
+		const attested = hashManagedExtensionFile(
+			path.resolve(cwd, descriptor.value),
+			MANAGED_EXTENSION_SET_MAX_BYTES - totalBytes,
+		);
+		totalBytes += attested.bytes;
+		digests.push(attested.digest);
+	}
+	digests.sort();
+	const setHash = createHash("sha256").update(EXTENSION_SET_DOMAIN, "utf8").update("\0", "utf8");
+	for (const digest of digests) setHash.update(digest, "ascii").update("\0", "utf8");
+	return setHash.digest("hex");
+}
+
+/** Projects bounded counts, booleans, and content-set digests without exposing private launch material. */
 export function projectManagedChildCapabilityV1(
 	tools: Readonly<SubagentLaunchContractTools>,
+	extensionCwd: string = process.cwd(),
 ): Readonly<ManagedChildCapabilityV1> {
 	const effectiveTools = new Set([...tools.declaredBuiltin, ...tools.effectiveMcpTools]);
 	return Object.freeze({
@@ -130,8 +225,55 @@ export function projectManagedChildCapabilityV1(
 		effectiveToolCount: effectiveTools.size,
 		runtimeExtensionCount: tools.runtimeExtensions.length,
 		configuredExtensionCount: tools.configuredExtensions.length,
+		configuredExtensionSetDigest: computeManagedExtensionSetDigest(tools.configuredExtensions, extensionCwd),
+		runtimeExtensionSetDigest: computeManagedExtensionSetDigest(tools.runtimeExtensions, extensionCwd),
 		disableAmbientExtensions: tools.disableAmbientExtensions,
 		fanoutAuthorized: tools.fanoutAuthorized,
+	});
+}
+
+/** Strictly validates the fixed privacy-safe managed child capability projection. */
+export function parseManagedChildCapabilityV1(value: unknown): Readonly<ManagedChildCapabilityV1> {
+	if (!value || typeof value !== "object") throw new TypeError("Managed child capability must be an object.");
+	const capability = assertExactKeys(value, [
+		"version",
+		"effectiveToolCount",
+		"runtimeExtensionCount",
+		"configuredExtensionCount",
+		"configuredExtensionSetDigest",
+		"runtimeExtensionSetDigest",
+		"disableAmbientExtensions",
+		"fanoutAuthorized",
+	], "Managed child capability");
+	assertVersion(capability.version, "Managed child capability");
+	const count = (name: "effectiveToolCount" | "runtimeExtensionCount" | "configuredExtensionCount"): number => {
+		const candidate = capability[name];
+		if (!Number.isSafeInteger(candidate) || (candidate as number) < 0) {
+			throw new TypeError(`Managed child capability ${name} must be a non-negative safe integer.`);
+		}
+		return candidate as number;
+	};
+	const effectiveToolCount = count("effectiveToolCount");
+	const runtimeExtensionCount = count("runtimeExtensionCount");
+	const configuredExtensionCount = count("configuredExtensionCount");
+	const extensionDigest = (name: "configuredExtensionSetDigest" | "runtimeExtensionSetDigest", extensionCount: number): string | null => {
+		const candidate = capability[name];
+		if (candidate === null && extensionCount === 0) return null;
+		if (extensionCount > 0) return assertDigest(candidate, `Managed child capability ${name}`);
+		throw new TypeError(`Managed child capability ${name} must be null exactly when its extension count is zero.`);
+	};
+	if (typeof capability.disableAmbientExtensions !== "boolean" || typeof capability.fanoutAuthorized !== "boolean") {
+		throw new TypeError("Managed child capability flags must be booleans.");
+	}
+	return Object.freeze({
+		version: SUBAGENT_MANAGED_DISPATCH_VERSION,
+		effectiveToolCount,
+		runtimeExtensionCount,
+		configuredExtensionCount,
+		configuredExtensionSetDigest: extensionDigest("configuredExtensionSetDigest", configuredExtensionCount),
+		runtimeExtensionSetDigest: extensionDigest("runtimeExtensionSetDigest", runtimeExtensionCount),
+		disableAmbientExtensions: capability.disableAmbientExtensions,
+		fanoutAuthorized: capability.fanoutAuthorized,
 	});
 }
 
