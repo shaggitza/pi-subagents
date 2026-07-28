@@ -124,7 +124,12 @@ export function assertManagedSpawnParams(request: JsonObject): SubagentParamsLik
 	if (params.action !== undefined || params.tasks !== undefined || params.chain !== undefined) {
 		throw new TypeError("Managed spawn requires ordinary single-agent execution mode.");
 	}
-	if (typeof params.agent !== "string" || !params.agent || typeof params.task !== "string" || !params.task) {
+	if (
+		typeof params.agent !== "string" ||
+		!params.agent ||
+		typeof params.task !== "string" ||
+		!params.task.trim()
+	) {
 		throw new TypeError("Managed spawn requires a non-empty agent and task.");
 	}
 	if (params.async !== true || params.clarify !== false || params.context !== "fresh") {

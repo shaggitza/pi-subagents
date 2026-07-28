@@ -413,9 +413,15 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			structuredOutput: Boolean(input.outputSchema),
 			capabilityCeiling: input.capabilityCeiling,
 			inheritedCapabilityCeiling: input.inheritedCapabilityCeiling,
+			configuredRuntimeOnly: input.identityMode === "managed-v1",
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		diagnostics.push({ code: "denied_required_tool", severity: "error", message });
+		return { ok: false, code: "denied_required_tool", message, diagnostics };
+	}
+	if (input.identityMode === "managed-v1" && toolPlan.fanoutAuthorized) {
+		const message = "Managed execution does not authorize child fanout.";
 		diagnostics.push({ code: "denied_required_tool", severity: "error", message });
 		return { ok: false, code: "denied_required_tool", message, diagnostics };
 	}

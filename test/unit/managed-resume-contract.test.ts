@@ -148,11 +148,11 @@ describe("managed resume launch contract", () => {
 		assert.deepEqual(captured?.managedAgentConfig?.memory, { scope: "project", path: "MEMORY.md" });
 	});
 
-	it("changes contract and profile identity when durable source proof identity changes", async () => {
+	it("changes the operation contract but retains role profile identity when source proof changes", async () => {
 		const first = await resolveManagedResumeLaunchV1(request, "candidate-resume", source(), context(), "parent", path.join(temporary, "parent.jsonl"), { resolveContract: resolver });
 		const changed = await resolveManagedResumeLaunchV1(request, "candidate-resume", source({ sourceTerminalProofDigest: "9".repeat(64) }), context(), "parent", path.join(temporary, "parent.jsonl"), { resolveContract: resolver });
 		assert.notEqual(changed.contract.digest, first.contract.digest);
-		assert.notEqual(changed.profileIdentityDigest, first.profileIdentityDigest);
+		assert.equal(changed.profileIdentityDigest, first.profileIdentityDigest);
 	});
 
 	it("rejects alternate source selectors before contract resolution", async () => {

@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import {
 	MANAGED_CONSUMER_ID_MAX_LENGTH,
 	MANAGED_OPERATION_ID_ENCODED_LENGTH,
+	MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX,
 	MANAGED_REQUEST_ID_MAX_LENGTH,
 	SUBAGENT_MANAGED_DISPATCH_REPLY_EVENT_PREFIX,
 	SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT,
@@ -21,6 +22,8 @@ import {
 	computeManagedProfileIdentityDigest,
 	computeManagedRequestDigest,
 	createManagedOperationId,
+	decodeManagedOpaqueTaskTransportV1,
+	encodeManagedOpaqueTaskTransportV1,
 	managedDispatchReplyEvent,
 	parseManagedChildCapabilityV1,
 	parseManagedMutationRequestV1,
@@ -135,6 +138,22 @@ describe("managed-dispatch public protocol foundation", () => {
 		assert.equal(Object.isFrozen(SUBAGENT_MANAGED_DISPATCH_REQUIREMENTS_V1), true);
 		const vocabulary = JSON.stringify(SUBAGENT_MANAGED_DISPATCH_REQUIREMENTS_V1);
 		assert.doesNotMatch(vocabulary, /available|durable|exactlyOnce/);
+	});
+
+	it("round-trips exact opaque tasks through a trim-stable canonical stdin envelope", () => {
+		for (const task of ["claim", " leading", "trailing ", "\n\t", "@file", "--flag", "\ud800"]) {
+			const encoded = encodeManagedOpaqueTaskTransportV1(task);
+			assert.ok(encoded.startsWith(MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX));
+			assert.equal(encoded.trim(), encoded);
+			assert.equal(decodeManagedOpaqueTaskTransportV1(encoded), task);
+		}
+		assert.equal(decodeManagedOpaqueTaskTransportV1("ordinary input"), undefined);
+		for (const invalid of [
+			MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX,
+			`${MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX}%%%`,
+			`${MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX}${Buffer.from("null").toString("base64url")}`,
+		])
+			assert.throws(() => decodeManagedOpaqueTaskTransportV1(invalid), /invalid|canonical/);
 	});
 
 	it("generates and asserts canonical 32-byte operation IDs", () => {

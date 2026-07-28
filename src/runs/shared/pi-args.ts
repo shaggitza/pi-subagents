@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { encodeManagedOpaqueTaskTransportV1 } from "../../api/managed-dispatch.ts";
 import { encodeNestedPathEnv, parseNestedPathEnv, type NestedPathEntry } from "./nested-path.ts";
 import { resolveMcpDirectToolSelections, type ResolvedMcpDirectToolSelection } from "./mcp-direct-tool-allowlist.ts";
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
@@ -85,10 +86,14 @@ export interface BuildPiArgsInput {
 	childWatchdog?: ChildWatchdogConfig;
 	waitToolEnabled?: boolean;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Host-only managed execution mode: load exactly the configured extensions as runtime. */
+	configuredRuntimeOnly?: boolean;
 }
 
 export interface BuildPiArgsResult {
 	args: string[];
+	/** Exact print-mode stdin used only by host-authorized configured-runtime execution. */
+	stdin?: string;
 	env: Record<string, string | undefined>;
 	tempDir?: string;
 	toolDiagnosticPath?: string;
@@ -122,6 +127,8 @@ export interface ResolvePiLaunchToolPlanInput {
 	structuredOutput?: boolean;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Host-only managed execution mode: omit ordinary prompt/fanout runtime extensions. */
+	configuredRuntimeOnly?: boolean;
 }
 
 export interface PiLaunchToolPlan {
@@ -169,14 +176,18 @@ export function resolvePiLaunchToolPlan(input: ResolvePiLaunchToolPlanInput): Pi
 		...(input.mcpDirectTools?.length ? effectiveMcpTools : []),
 		...internalTools,
 	])] : [];
-	const runtimeExtensions = fanoutAuthorized
-		? [PROMPT_RUNTIME_EXTENSION_PATH, FANOUT_CHILD_EXTENSION_PATH]
-		: [PROMPT_RUNTIME_EXTENSION_PATH];
-	const disableAmbientExtensions = capabilityCeiling?.denyExtensions === true || input.extensions !== undefined;
 	const configuredExtensions = capabilityCeiling?.denyExtensions ? [] : [...toolExtensionPaths, ...(input.extensions ?? []), ...(input.subagentOnlyExtensions ?? [])];
-	const extensionArgs = disableAmbientExtensions
-		? [...new Set([...runtimeExtensions, ...configuredExtensions])]
-		: [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.subagentOnlyExtensions ?? [])])];
+	const runtimeExtensions = input.configuredRuntimeOnly
+		? [...configuredExtensions]
+		: fanoutAuthorized
+			? [PROMPT_RUNTIME_EXTENSION_PATH, FANOUT_CHILD_EXTENSION_PATH]
+			: [PROMPT_RUNTIME_EXTENSION_PATH];
+	const disableAmbientExtensions = input.configuredRuntimeOnly === true || capabilityCeiling?.denyExtensions === true || input.extensions !== undefined;
+	const extensionArgs = input.configuredRuntimeOnly
+		? [...new Set(configuredExtensions)]
+		: disableAmbientExtensions
+			? [...new Set([...runtimeExtensions, ...configuredExtensions])]
+			: [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.subagentOnlyExtensions ?? [])])];
 	const requestedToolNames = input.tools !== undefined
 		? [...new Set([...requestedBuiltinTools, ...resolvedMcpSelections.map((selection) => selection.name)])]
 		: undefined;
@@ -243,6 +254,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		structuredOutput: input.structuredOutput,
 		capabilityCeiling: input.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
+		configuredRuntimeOnly: input.configuredRuntimeOnly,
 	});
 	if (toolPlan.explicitToolAllowlist) {
 		args.push(toolPlan.effectiveToolAllowlist.length > 0 ? "--tools" : "--no-tools");
@@ -266,7 +278,12 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		args.push(input.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
 	}
 
-	if (input.task.length > TASK_ARG_LIMIT) {
+	let stdin: string | undefined;
+	if (input.configuredRuntimeOnly) {
+		// Pi interprets leading @/-- argv values and wraps @file contents. Piped
+		// print-mode stdin is the only exact opaque transport for managed tasks.
+		stdin = encodeManagedOpaqueTaskTransportV1(input.task);
+	} else if (input.task.length > TASK_ARG_LIMIT) {
 		if (!tempDir) {
 			tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
 		}
@@ -374,7 +391,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	env[SUBAGENT_PARENT_SESSION_ENV] = input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? "";
 
-	return { args, env, tempDir, toolDiagnosticPath, capabilityAudit: toolPlan.capabilityAudit };
+	return { args, ...(stdin !== undefined ? { stdin } : {}), env, tempDir, toolDiagnosticPath, capabilityAudit: toolPlan.capabilityAudit };
 }
 
 export const parseParentPathEnv = parseNestedPathEnv;

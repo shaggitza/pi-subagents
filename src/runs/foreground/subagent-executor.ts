@@ -2350,6 +2350,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			toolBudget: data.toolBudget,
 			configToolBudget: data.configToolBudget,
 			capabilityCeiling: data.capabilityCeiling,
+			...(data.preparedSpawn ? { configuredRuntimeOnly: true } : {}),
 		});
 	}
 
@@ -4641,7 +4642,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		};
 		const result = executeAsyncSingle(options.runId, {
 			agent: source.agent,
-			task: buildRevivedAsyncTask({ kind: "revive", runId: source.sourceRunId, state: "complete", agent: source.agent, index: 0, cwd: source.cwd, sessionFile: source.canonicalSessionFile, model: source.model, thinking: source.thinking, recoveryDescriptor: descriptor }, request.message),
+			// Prepared managed resume owns a closed opaque transport message. Pass it
+			// exactly so the sole configured child bridge can consume it before any
+			// model turn; ordinary human resume continues to use buildRevivedAsyncTask.
+			task: request.message,
 			goal: request.message,
 			agentConfig,
 			ctx: {
@@ -4671,11 +4675,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			outputMode: descriptor.outputMode,
 			...(descriptor.agentContract ? { agentContract: descriptor.agentContract } : {}),
 			...(descriptor.structuredOutputSchema ? { structuredOutputSchema: descriptor.structuredOutputSchema } : {}),
-			...(descriptor.skills ? { skills: [...descriptor.skills] } : {}),
+			...(agentConfig.skills ? { skills: [...agentConfig.skills] } : {}),
 			...(descriptor.acceptance !== undefined ? { acceptance: descriptor.acceptance } : {}),
 			...(descriptor.initialTurnBudget ? { turnBudget: descriptor.initialTurnBudget } : {}),
 			...(descriptor.initialToolBudget ? { toolBudget: descriptor.initialToolBudget } : {}),
 			capabilityCeiling: options.execution.capabilityCeiling,
+			configuredRuntimeOnly: true,
 			exclusiveRunPaths: true,
 			preparedResultReservation: resultReservation,
 			preparedRunnerAdmission: {

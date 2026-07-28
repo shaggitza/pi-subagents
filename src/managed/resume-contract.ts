@@ -1,14 +1,11 @@
 import { createHash } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "../agents/agents.ts";
+import { discoverAgents, type AgentConfig } from "../agents/agents.ts";
 import {
 	SUBAGENT_MANAGED_DISPATCH_VERSION,
 	assertManagedResumeExecutorRequestV1,
 	canonicalizeManagedJson,
-	computeManagedProfileContentDigest,
-	computeManagedProfileIdentityDigest,
 	type JsonObject,
 	type ManagedProfileIdentityV1,
 	type ManagedResumeExecutorRequestV1,
@@ -19,6 +16,7 @@ import {
 	type SubagentLaunchContractInput,
 	type SubagentLaunchContractResult,
 } from "../api/preflight.ts";
+import { deriveManagedSpawnProfile } from "../extension/managed-dispatch-preflight.ts";
 import { applySteeringRecoveryAgentConfig } from "../runs/background/async-resume.ts";
 import {
 	intersectSubagentCapabilityCeilings,
@@ -106,7 +104,21 @@ export async function resolveManagedResumeLaunchV1(
 		filePath: descriptor.agentFilePath ?? path.join(source.cwd, ".pi-subagents-managed-resume-agent"),
 	};
 	const recoveredAgent = applySteeringRecoveryAgentConfig(baseAgent, descriptor);
-	const agentConfig = Object.freeze(JSON.parse(JSON.stringify(recoveredAgent)) as AgentConfig);
+	const expectedAgentFile = descriptor.agentFilePath ? path.resolve(descriptor.agentFilePath) : undefined;
+	const currentAgents = discoverAgents(source.cwd, "both").agents.filter(
+		(agent) =>
+			agent.name === source.agent &&
+			expectedAgentFile !== undefined &&
+			path.resolve(agent.filePath) === expectedAgentFile,
+	);
+	if (currentAgents.length !== 1 && !options.resolveContract)
+		throw new TypeError("Managed resume current agent profile is unavailable or ambiguous.");
+	// Production resumes execute exactly the same current host profile that the
+	// launch contract attests. Test seams without discovery fall back to the
+	// retained recovery descriptor.
+	const agentConfig = Object.freeze(
+		JSON.parse(JSON.stringify(currentAgents[0] ?? recoveredAgent)) as AgentConfig,
+	);
 	const artifactConfig = Object.freeze({ ...(descriptor.artifactConfig ?? { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 0 }) } as ArtifactConfig);
 	if (artifactConfig.enabled && !descriptor.artifactsDir) throw new TypeError("Managed resume recovery descriptor lacks its artifact root.");
 	const currentCeiling = (options.resolveCapabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling)(parentSessionFile);
@@ -173,19 +185,6 @@ export async function resolveManagedResumeLaunchV1(
 		...base,
 		digest: hash("pi-subagents/managed-dispatch/v1/resume-contract", base),
 	});
-	const rootRealPath = fs.realpathSync(source.cwd);
-	const rootStats = fs.statSync(rootRealPath, { bigint: true });
-	if (!rootStats.isDirectory()) throw new TypeError("Managed resume profile root is not a directory.");
-	const profile: ManagedProfileIdentityV1 = {
-		version: 1,
-		contentDigest: computeManagedProfileContentDigest({
-			version: 1,
-			launchProfileDigest: hash("pi-subagents/managed-dispatch/v1/resume-profile", {
-				launchContractDigest: launchContract.digest,
-				source: base.source,
-			}),
-		}),
-		root: { version: 1, realPath: rootRealPath, device: String(rootStats.dev), inode: String(rootStats.ino) },
-	};
-	return Object.freeze({ request, source, execution, contract, profile, profileIdentityDigest: computeManagedProfileIdentityDigest(profile) });
+	const { profile, profileIdentityDigest } = deriveManagedSpawnProfile(launchContract);
+	return Object.freeze({ request, source, execution, contract, profile, profileIdentityDigest });
 }

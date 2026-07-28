@@ -445,6 +445,8 @@ function runPiStreaming(
 	stopMessage?: string,
 	registerTurnBudgetAbort?: (abort: ((message: string, state?: TurnBudgetState) => void) | undefined) => void,
 	onWriterProcess?: (writer: { state: "none" | "spawning" } | { state: "running"; pid: number }) => void,
+	finalStopGraceMs?: number,
+	stdinText?: string,
 ): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
 		const processInstanceId = randomUUID();
@@ -457,10 +459,16 @@ function runPiStreaming(
 		});
 		const child = spawn(spawnSpec.command, spawnSpec.args, {
 			cwd,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: [stdinText === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 			env: spawnEnv,
 			windowsHide: true,
 		});
+		if (stdinText !== undefined && child.stdin) {
+			child.stdin.on("error", () => {
+				// A child that exits before reading stdin is handled by close/error below.
+			});
+			child.stdin.end(stdinText, "utf8");
+		}
 		const stderrTail = createBoundedByteTail();
 		const rawStdoutTail = createBoundedByteTail();
 		const messages: Message[] = [];
@@ -603,7 +611,7 @@ function runPiStreaming(
 
 		// Guard both cases that can leave the parent waiting on `close` forever:
 		// a lingering stdio holder after `exit`, or a child that never exits.
-		const FINAL_STOP_GRACE_MS = 1000;
+		const FINAL_STOP_GRACE_MS = finalStopGraceMs ?? 1000;
 		const HARD_KILL_MS = 3000;
 		const TIMEOUT_HARD_KILL_MS = 3000;
 		let childExited = false;
@@ -799,32 +807,33 @@ function runPiStreaming(
 			clearStdioGuard();
 			stdoutReader.end();
 			stderrReader.end();
-			outputStream.end();
 			const stderr = stderrTail.text();
 			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
 			const finalError = error ?? assistantError;
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && (cleanTerminalAssistantStopReceived || agentSettledReceived) && !finalError;
-			resolve({
-				stderr,
-				exitCode: timedOut || stopped ? 1 : turnBudgetExceeded ? 1 : interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
-				messages,
-				usage,
-				model,
-				error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : interrupted || forcedDrainAfterFinalSuccess ? undefined : finalError,
-				protocolError,
-				finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput,
-				interrupted,
-				timedOut,
-				stopped,
-				turnBudget,
-				turnBudgetExceeded,
-				wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined,
-				observedMutationAttempt,
-				watchdog: childWatchdogState,
-				processInstanceId,
-				processCloseObservedAt,
-				processSignal: signal,
-			});
+			outputStream.end(() =>
+				resolve({
+					stderr,
+					exitCode: timedOut || stopped ? 1 : turnBudgetExceeded ? 1 : interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
+					messages,
+					usage,
+					model,
+					error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : interrupted || forcedDrainAfterFinalSuccess ? undefined : finalError,
+					protocolError,
+					finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput,
+					interrupted,
+					timedOut,
+					stopped,
+					turnBudget,
+					turnBudgetExceeded,
+					wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined,
+					observedMutationAttempt,
+					watchdog: childWatchdogState,
+					processInstanceId,
+					processCloseObservedAt,
+					processSignal: signal,
+				}),
+			);
 		});
 
 		child.on("error", (spawnError) => {
@@ -842,11 +851,12 @@ function runPiStreaming(
 			clearStdioGuard();
 			stdoutReader.end();
 			stderrReader.end();
-			outputStream.end();
 			const stderr = stderrTail.text();
 			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-			resolve({ stderr, exitCode: 1, messages, usage, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, timedOut, stopped, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, watchdog: childWatchdogState, processInstanceId });
+			outputStream.end(() =>
+				resolve({ stderr, exitCode: 1, messages, usage, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, timedOut, stopped, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, watchdog: childWatchdogState, processInstanceId }),
+			);
 		});
 	});
 }
@@ -1177,7 +1187,7 @@ async function runSingleStep(
 				childIndex: ctx.flatIndex,
 			})
 			: undefined;
-		const { args, env, tempDir, toolDiagnosticPath, capabilityAudit: attemptCapabilityAudit } = buildPiArgs({
+		const { args, stdin, env, tempDir, toolDiagnosticPath, capabilityAudit: attemptCapabilityAudit } = buildPiArgs({
 			parentSessionId: step.parentSessionId,
 			baseArgs: ["--mode", "json", "-p"],
 			task,
@@ -1195,6 +1205,7 @@ async function runSingleStep(
 			systemPromptMode: step.systemPromptMode,
 			mcpDirectTools: step.mcpDirectTools,
 			capabilityCeiling: step.capabilityCeiling ?? ctx.capabilityCeiling,
+			configuredRuntimeOnly: step.configuredRuntimeOnly,
 			cwd: step.cwd ?? ctx.cwd,
 			promptFileStem: step.agent,
 			intercomSessionName: ctx.childIntercomTarget,
@@ -1234,6 +1245,8 @@ async function runSingleStep(
 			ctx.stopMessage,
 			ctx.registerTurnBudgetAbort,
 			ctx.onWriterProcess,
+			step.configuredRuntimeOnly ? 5000 : undefined,
+			stdin,
 		);
 		if (run.processCloseObservedAt !== undefined) {
 			writerProcesses.push({
@@ -4005,6 +4018,7 @@ async function runSubagent(
 		if (config.preparedResultReservation) assertPreparedResultReservation(config.preparedResultReservation);
 		writeAtomicJson(resultPath, {
 			lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
+			...(config.managedProcessTerminalBinding ? { suppressParentNotification: true } : {}),
 			id,
 			agent: agentName,
 			mode: resultMode,
@@ -4274,10 +4288,13 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 }
 
 function startConfiguredSubagent(config: SubagentRunConfig): void {
-	runConfiguredSubagent(config).catch((runErr) => {
-		console.error("Subagent runner error:", runErr);
-		process.exit(1);
-	});
+	runConfiguredSubagent(config).then(
+		() => process.exit(0),
+		(runErr) => {
+			console.error("Subagent runner error:", runErr);
+			process.exit(1);
+		},
+	);
 }
 
 const configArg = process.argv[2];
@@ -4285,10 +4302,12 @@ if (configArg) {
 	try {
 		const configJson = fs.readFileSync(configArg, "utf-8");
 		const config = JSON.parse(configJson) as SubagentRunConfig;
-		try {
-			fs.unlinkSync(configArg);
-		} catch {
-			// Temp config cleanup is best effort.
+		if (process.env.PI_SUBAGENT_INTERNAL_TEST_PRESERVE_RUNNER_CONFIG !== "1") {
+			try {
+				fs.unlinkSync(configArg);
+			} catch {
+				// Temp config cleanup is best effort.
+			}
 		}
 		startConfiguredSubagent(config);
 	} catch (err) {

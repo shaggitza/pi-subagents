@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { decodeManagedOpaqueTaskTransportV1 } from "../../src/api/managed-dispatch.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/shared/tool-budget.ts";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts";
@@ -25,6 +26,7 @@ import {
 	SUBAGENT_RUN_ID_ENV,
 	applyThinkingSuffix,
 	buildPiArgs,
+	cleanupTempDir,
 } from "../../src/runs/shared/pi-args.ts";
 
 const originalEnv = {
@@ -249,6 +251,43 @@ describe("buildPiArgs session wiring", () => {
 			autoFollowMaxAttempts: 3,
 			stalemateRepeats: 2,
 		});
+	});
+});
+
+describe("buildPiArgs managed runtime wiring", () => {
+	it("loads only host-configured extensions and pipes managed tasks without CLI interpretation", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-args-managed-runtime-"));
+		tempRoots.push(root);
+		const bridge = path.join(root, "trusted-bridge.ts");
+		fs.writeFileSync(bridge, "export default function () {}\n", "utf8");
+		for (const task of [
+			"managed",
+			"@host-secret",
+			"--extension=untrusted.ts",
+			" \nmanaged with exact surrounding whitespace\t ",
+			" ".repeat(9_000),
+		]) {
+			const { args, stdin, tempDir } = buildPiArgs({
+				baseArgs: ["--mode", "json", "-p"],
+				task,
+				sessionEnabled: false,
+				inheritProjectContext: false,
+				inheritSkills: false,
+				tools: [],
+				extensions: [bridge],
+				configuredRuntimeOnly: true,
+			});
+
+			assert.ok(args.includes("--no-tools"));
+			assert.ok(args.includes("--no-extensions"));
+			assert.equal(args.filter((value) => value === bridge).length, 1);
+			assert.equal(args.some((value) => value.includes("subagent-prompt-runtime")), false);
+			assert.equal(args.some((value) => value.includes("fanout-child")), false);
+			assert.equal(args.includes(task), false);
+			assert.equal(args.some((value) => value.includes("task.md")), false);
+			assert.equal(decodeManagedOpaqueTaskTransportV1(stdin), task);
+			cleanupTempDir(tempDir);
+		}
 	});
 });
 

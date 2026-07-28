@@ -6,6 +6,28 @@ import { types as utilTypes } from "node:util";
 export const SUBAGENT_MANAGED_DISPATCH_VERSION = 1;
 export const SUBAGENT_MANAGED_DISPATCH_REQUEST_EVENT = "subagents:managed-dispatch:v1:request";
 export const SUBAGENT_MANAGED_DISPATCH_REPLY_EVENT_PREFIX = "subagents:managed-dispatch:v1:reply:";
+export const MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX = "[pi-subagents managed opaque task v1]\n";
+/** Encodes an exact managed task so Pi's print-mode stdin trimming cannot alter it. */
+export function encodeManagedOpaqueTaskTransportV1(task) {
+    if (typeof task !== "string") throw new TypeError("Managed opaque task must be a string.");
+    return `${MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX}${Buffer.from(JSON.stringify(task), "utf8").toString("base64url")}`;
+}
+/** Decodes the canonical managed stdin envelope, or returns undefined for unrelated input. */
+export function decodeManagedOpaqueTaskTransportV1(input) {
+    if (typeof input !== "string" || !input.startsWith(MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX)) return undefined;
+    const payload = input.slice(MANAGED_OPAQUE_TASK_TRANSPORT_PREFIX.length);
+    if (!payload || !/^[A-Za-z0-9_-]+$/u.test(payload)) throw new TypeError("Managed opaque task transport is invalid.");
+    const serialized = Buffer.from(payload, "base64url").toString("utf8");
+    if (Buffer.from(serialized, "utf8").toString("base64url") !== payload) throw new TypeError("Managed opaque task transport is not canonical.");
+    let task;
+    try {
+        task = JSON.parse(serialized);
+    } catch {
+        throw new TypeError("Managed opaque task transport is invalid.");
+    }
+    if (typeof task !== "string" || encodeManagedOpaqueTaskTransportV1(task) !== input) throw new TypeError("Managed opaque task transport is not canonical.");
+    return task;
+}
 export const MANAGED_CONSUMER_ID_MAX_LENGTH = 64;
 export const MANAGED_OPERATION_ID_ENCODED_LENGTH = 43;
 export const MANAGED_REQUEST_ID_MAX_LENGTH = 128;

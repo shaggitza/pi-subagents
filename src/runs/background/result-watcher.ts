@@ -54,6 +54,7 @@ type ResultFileChild = {
 };
 
 type ResultFileData = CompletionNotification & {
+	suppressParentNotification?: boolean;
 	runId?: string;
 	mode?: string;
 	results?: ResultFileChild[];
@@ -139,6 +140,17 @@ export function createResultWatcher(
 			if (!ownsSession(data.sessionId, epoch)) return;
 
 			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
+			if (data.suppressParentNotification === true) {
+				try {
+					fsApi.unlinkSync(resultPath);
+				} catch (error) {
+					if (!isNotFound(error)) {
+						console.error(`Failed to remove managed subagent result '${resultPath}'; will retry:`, error);
+						scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					}
+				}
+				return;
+			}
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(data.nestedChildren, resultPath, "nestedChildren"));
 			if (!nestedChildren?.length && !hasExplicitNestedChildren) {

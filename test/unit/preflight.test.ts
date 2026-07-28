@@ -283,6 +283,34 @@ Project prompt.
 		}
 	});
 
+	it("uses exactly the configured extension set as the managed child runtime", async () => {
+		const cwd = path.join(tempDir, "managed-runtime-repo");
+		const bridge = path.join(cwd, "trusted-bridge.ts");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.writeFileSync(bridge, "export default function () {}\n", "utf8");
+		writeAgent(
+			path.join(cwd, ".pi", "agents", "managed-worker.md"),
+			`---\nname: managed-worker\ndescription: managed worker\ntools:\nextensions: ${bridge}\nsystemPromptMode: replace\ninheritProjectContext: false\ninheritSkills: false\n---\nManaged prompt.\n`,
+		);
+		const result = await resolveSubagentLaunchContract({
+			agent: "managed-worker",
+			cwd,
+			task: "managed task",
+			runId: "managed-runtime-run",
+			identityMode: "managed-v1",
+			parentSessionId: "parent-session",
+			sessionRoot: path.join(tempDir, "managed-runtime-sessions"),
+		});
+
+		assert.equal(result.ok, true);
+		assert.deepEqual(result.contract.tools.effectiveAllowlist, []);
+		assert.deepEqual(result.contract.tools.configuredExtensions, [bridge]);
+		assert.deepEqual(result.contract.tools.runtimeExtensions, [bridge]);
+		assert.deepEqual(result.contract.tools.extensionArgs, [bridge]);
+		assert.equal(result.contract.tools.disableAmbientExtensions, true);
+		assert.equal(result.contract.tools.fanoutAuthorized, false);
+	});
+
 	it("rejects same-path inode and file-kind substitution at the final managed fence", async () => {
 		const cwd = path.join(tempDir, "fenced-repo");
 		fs.mkdirSync(cwd, { recursive: true });

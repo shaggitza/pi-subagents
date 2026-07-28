@@ -49,6 +49,8 @@ export interface RunnerSubagentStep {
 	gateOn?: import("../../shared/types.ts").ChainGateLayer;
 	toolBudget?: import("../../shared/types.ts").ResolvedToolBudget;
 	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
+	/** Host-authored managed mode; never accepted from a model-visible request. */
+	configuredRuntimeOnly?: boolean;
 	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
 }
 

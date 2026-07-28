@@ -230,6 +230,8 @@ interface AsyncSingleParams {
 	toolBudget?: ResolvedToolBudget;
 	configToolBudget?: ResolvedToolBudget;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Host-only managed execution mode; persisted into the private runner config. */
+	configuredRuntimeOnly?: boolean;
 }
 
 interface AsyncExecutionResult {
@@ -481,6 +483,11 @@ function terminateRunnerBeforeProceed(pid: number): void {
 	}
 }
 
+// Detached runners are unref'd so ordinary background work does not pin Pi, but
+// their close observer must remain strongly reachable until it publishes the
+// durable process-terminal proof.
+const runnerTerminalObservers = new Map<string, ReturnType<typeof spawn>>();
+
 function spawnRunner(
 	cfg: object,
 	suffix: string,
@@ -566,11 +573,17 @@ function spawnRunner(
 		});
 		closeFd(stdoutFd);
 		closeFd(stderrFd);
+		runnerTerminalObservers.set(runnerProcessInstanceId, proc);
 		proc.on("error", (error) => {
 			console.error(`[pi-subagents] async spawn failed: ${error.message}`);
 		});
 		proc.once("close", (exitCode, signal) => {
-			const launch = launchConfig as { asyncDir?: unknown; id?: unknown; managedProcessTerminalBinding?: ManagedProcessTerminalBindingV1; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
+			const releaseObserver = () => {
+				if (runnerTerminalObservers.get(runnerProcessInstanceId) === proc)
+					runnerTerminalObservers.delete(runnerProcessInstanceId);
+			};
+			try {
+				const launch = launchConfig as { asyncDir?: unknown; id?: unknown; managedProcessTerminalBinding?: ManagedProcessTerminalBindingV1; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
 			const asyncDir = launch.asyncDir;
 			const runId = launch.id;
 			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
@@ -635,6 +648,9 @@ function spawnRunner(
 				}
 			}
 			onProcessTerminal?.(persisted);
+			} finally {
+				releaseObserver();
+			}
 		});
 		if (typeof proc.pid !== "number") {
 			return { error: `async runner did not produce a pid for cwd: ${cwd}` };
@@ -1483,8 +1499,9 @@ export function executeAsyncSingle(
 					{
 						parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
+						...(params.configuredRuntimeOnly ? { configuredRuntimeOnly: true } : {}),
 						agent,
-						task: taskWithOutputInstruction,
+						task: params.configuredRuntimeOnly ? task : taskWithOutputInstruction,
 						...(params.context ? { context: params.context } : {}),
 						cwd: runnerCwd,
 						model,
@@ -1508,7 +1525,7 @@ export function executeAsyncSingle(
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
 						waitToolEnabled: params.waitToolEnabled,
 						...(params.agentContract ? { agentContract: params.agentContract } : {}),
-						effectiveAcceptance: resolvedAcceptance,
+						effectiveAcceptance: params.configuredRuntimeOnly ? undefined : resolvedAcceptance,
 						...(structuredOutput ? { structuredOutput } : {}),
 						...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),

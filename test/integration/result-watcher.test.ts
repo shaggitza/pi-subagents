@@ -71,6 +71,40 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("removes managed result handoffs without notifying or exposing private output", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-managed-"));
+		const resultPath = path.join(resultsDir, "managed-run.json");
+		const emitted: string[] = [];
+		let delivered = 0;
+		const state = createState();
+		state.currentSessionId = "session-managed";
+		fs.writeFileSync(resultPath, JSON.stringify({
+			id: "managed-run",
+			sessionId: "session-managed",
+			suppressParentNotification: true,
+			success: true,
+			summary: "private managed output",
+			sessionFile: "/private/managed/session.jsonl",
+		}), "utf-8");
+		const watcher = createResultWatcher(
+			{ events: { on: () => () => {}, emit: (event: string) => emitted.push(event) } },
+			state,
+			resultsDir,
+			60_000,
+			{ notifier: { async deliver() { delivered += 1; return true; } } },
+		);
+		try {
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			assert.equal(fs.existsSync(resultPath), false);
+			assert.equal(delivered, 0);
+			assert.deepEqual(emitted, []);
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("delivers result files only to the exact owning session when another watcher shares the same repo", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-scope-"));
 		const createPi = () => {
